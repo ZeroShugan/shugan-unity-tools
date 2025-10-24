@@ -1,14 +1,11 @@
 {
   "name": "com.zeroshugan.shugan-unity-tools",
   "displayName": "Shugan Unity Tools",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "unity": "2022.3",
   "description": "Unity tools and scripts for VRChat avatars by ZeroShugan",
   "author": {
     "name": "ZeroShugan",
     "url": "https://github.com/ZeroShugan"
-  },
-  "vpmDependencies": {
-    "com.vrchat.avatars": "3.5.0"
   }
 }
