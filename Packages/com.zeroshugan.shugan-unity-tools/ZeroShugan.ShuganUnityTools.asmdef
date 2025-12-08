@@ -1,0 +1,23 @@
+{
+  "name": "ZeroShugan.ShuganUnityTools",
+  "rootNamespace": "ZeroShugan.ShuganUnityTools",
+  "references": [],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": true,
+  "precompiledReferences": [
+    "VRCSDKBase.dll",
+    "VRCSDK3A.dll"
+  ],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [
+    {
+      "name": "com.vrchat.avatars",
+      "expression": "",
+      "define": "VRCHAT_SDK_INSTALLED"
+    }
+  ],
+  "noEngineReferences": false
+}
