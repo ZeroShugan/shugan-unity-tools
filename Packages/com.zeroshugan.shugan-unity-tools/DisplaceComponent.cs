@@ -161,6 +161,32 @@ public class DisplaceComponent : MonoBehaviour
     // Static flag to track if we've processed all components in the scene (including inactive ones)
     private static bool hasProcessedAllInScene = false;
 
+    /// <summary>
+    /// Safe wrapper to log to DisplaceComponentLogger if it exists (Editor-only)
+    /// Uses reflection to avoid compilation errors since logger is in Editor folder
+    /// </summary>
+    private static void SafeLog(string message)
+    {
+        #if UNITY_EDITOR
+        try
+        {
+            var loggerType = System.Type.GetType("DisplaceComponentLogger");
+            if (loggerType != null)
+            {
+                var logMethod = loggerType.GetMethod("Log", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                if (logMethod != null)
+                {
+                    logMethod.Invoke(null, new object[] { message });
+                }
+            }
+        }
+        catch
+        {
+            // Silently fail if logger not available
+        }
+        #endif
+    }
+
     #if UNITY_EDITOR
     private void OnEnable()
     {
@@ -1383,25 +1409,30 @@ public class DisplaceComponent : MonoBehaviour
                     {
                         valueToFill = mapping.textValue;
                         Debug.Log($"[DisplaceComponent]   Processing string field (text value): {mapping.targetComponent.GetType().Name}.{mapping.fieldPath} -> \"{valueToFill}\"");
+                        SafeLog($"    String field (text): {mapping.targetComponent.GetType().Name}.{mapping.fieldPath} = \"{valueToFill}\"");
                     }
                     // Priority 2: Use search path if text value is empty but search path is not
                     else if (!string.IsNullOrEmpty(mapping.searchPath))
                     {
                         Debug.Log($"[DisplaceComponent]   Processing string field (search path): {mapping.targetComponent.GetType().Name}.{mapping.fieldPath} -> searching for '{mapping.searchPath}'");
+                        SafeLog($"    String field (search): {mapping.targetComponent.GetType().Name}.{mapping.fieldPath} searching '{mapping.searchPath}'");
 
                         valueToFill = FindObjectPathByName(mapping.searchPath);
 
                         if (valueToFill == null)
                         {
                             Debug.LogWarning($"[DisplaceComponent]   ✗ Failed to find object: {mapping.searchPath}");
+                            SafeLog($"      ✗ FAILED to find object: {mapping.searchPath}");
                             continue;
                         }
 
                         Debug.Log($"[DisplaceComponent]   Found path: \"{valueToFill}\"");
+                        SafeLog($"      Found path: \"{valueToFill}\"");
                     }
                     else
                     {
                         Debug.LogWarning($"[DisplaceComponent]   ⚠ Both textValue and searchPath are empty, skipping");
+                        SafeLog($"    ⚠ Both textValue and searchPath empty, skipping");
                         continue;
                     }
 
@@ -1419,7 +1450,7 @@ public class DisplaceComponent : MonoBehaviour
                     {
                         // In edit mode, use SerializedProperty
                         property.stringValue = valueToFill;
-                        so.ApplyModifiedProperties();
+                        so.ApplyModifiedPropertiesWithoutUndo();  // VRCFury pattern for prefab compatibility
 
                         // Mark the component dirty to ensure Unity/VRCFury detects the change
                         #if UNITY_EDITOR
@@ -1441,6 +1472,9 @@ public class DisplaceComponent : MonoBehaviour
                     Debug.Log($"[DisplaceComponent]     Component full path: {GetFullPath(mapping.targetComponent.transform)}");
                     Debug.Log($"[DisplaceComponent]     Application.isPlaying: {Application.isPlaying}");
 
+                    SafeLog($"    Object field: {mapping.targetComponent.GetType().Name}.{mapping.fieldPath}");
+                    SafeLog($"      Component on: {mapping.targetComponent.gameObject.name}");
+
                     // Store original value
                     FieldFillState state = new FieldFillState();
                     state.targetComponent = mapping.targetComponent;
@@ -1461,25 +1495,33 @@ public class DisplaceComponent : MonoBehaviour
                     if (!string.IsNullOrEmpty(mapping.searchObjectName))
                     {
                         Debug.Log($"[DisplaceComponent]     Using search by name: '{mapping.searchObjectName}'");
+                        SafeLog($"      Searching for object: '{mapping.searchObjectName}'");
+
                         targetTransform = FindObjectByName(mapping.searchObjectName);
                         if (targetTransform == null)
                         {
                             Debug.LogWarning($"[DisplaceComponent]   ✗ Object not found by name: {mapping.searchObjectName}");
+                            SafeLog($"      ✗ Object NOT FOUND: '{mapping.searchObjectName}'");
                             continue;
                         }
                         Debug.Log($"[DisplaceComponent]     Found object: {targetTransform.name} at path: {GetFullPath(targetTransform)}");
+                        SafeLog($"      Found: {targetTransform.name}");
                     }
                     // Priority 2: Use targetBone as fallback
                     else
                     {
                         Debug.Log($"[DisplaceComponent]     Using humanoid bone: {mapping.targetBone}");
+                        SafeLog($"      Using bone: {mapping.targetBone}");
+
                         targetTransform = GetBoneTransform(mapping.targetBone);
                         if (targetTransform == null)
                         {
                             Debug.LogWarning($"[DisplaceComponent]   ✗ Bone transform not found: {mapping.targetBone}");
+                            SafeLog($"      ✗ Bone NOT FOUND: {mapping.targetBone}");
                             continue;
                         }
                         Debug.Log($"[DisplaceComponent]     Found bone: {targetTransform.name} at path: {GetFullPath(targetTransform)}");
+                        SafeLog($"      Found bone: {targetTransform.name}");
                     }
 
                     // Determine the field type and set appropriate value
@@ -1537,7 +1579,7 @@ public class DisplaceComponent : MonoBehaviour
                         // In edit mode, use SerializedProperty
                         property.objectReferenceValue = valueToSet;
                         state.filledValue = valueToSet;
-                        so.ApplyModifiedProperties();
+                        so.ApplyModifiedPropertiesWithoutUndo();  // VRCFury pattern for prefab compatibility
 
                         // Mark the component dirty to ensure Unity/VRCFury detects the change
                         #if UNITY_EDITOR
