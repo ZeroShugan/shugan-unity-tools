@@ -75,9 +75,9 @@ namespace ZeroShugan.ShuganUnityTools
             EditorGUILayout.Space(4);
             _pruneToMatchOriginal = EditorGUILayout.ToggleLeft(
                 new GUIContent("Prune extras to match original",
-                    "After swapping, delete any object the duplicate has that the original doesn't — " +
-                    "EXCEPT bones the new FBX added (e.g. AutoRig feet bones). Cleans up leaf/_end bones " +
-                    "you had deleted from your avatar. Never deletes a bone a mesh is weighted to."),
+                    "After swapping, delete every GameObject (bones included) the duplicate has that the " +
+                    "original doesn't — EXCEPT bones the new FBX added (AutoRig feet bones). Pure hierarchy " +
+                    "comparison: cleans up leaf/_end bones and anything else you'd deleted from your avatar."),
                 _pruneToMatchOriginal);
 
             EditorGUILayout.Space(8);
@@ -305,7 +305,7 @@ namespace ZeroShugan.ShuganUnityTools
         //       deleted it from their scene avatar (e.g. an _end / leaf bone)  -> prune it, OR
         //   (b) a name NOT in the OLD FBX               -> it's new this swap (added by the AutoRig
         //       Blender script)                          -> keep it.
-        // A bone a mesh is actually weighted to is never deleted (would break the mesh).
+        // This is a pure GameObject/hierarchy comparison — no weights, no mesh inspection.
         static void PruneToMatchOriginal(GameObject dup, GameObject original, GameObject oldFbx, StringBuilder log)
         {
             log.AppendLine();
@@ -318,33 +318,31 @@ namespace ZeroShugan.ShuganUnityTools
             var oldFbxNames = new HashSet<string>();
             foreach (var t in oldFbx.GetComponentsInChildren<Transform>(true)) oldFbxNames.Add(t.name);
 
-            // Deform bones in the duplicate — never delete these (would break meshes).
-            var deformBones = new HashSet<Transform>();
-            foreach (var smr in dup.GetComponentsInChildren<SkinnedMeshRenderer>(true))
-                if (smr.bones != null) foreach (var b in smr.bones) if (b != null) deformBones.Add(b);
-
             // Deepest-first so leaf / _end bones are removed before their parents.
             var all = dup.GetComponentsInChildren<Transform>(true)
                          .Where(t => t != dup.transform)
                          .OrderByDescending(Depth)
                          .ToList();
 
-            int deleted = 0, keptAutoRig = 0, keptSafety = 0;
+            int deleted = 0, keptAutoRig = 0, keptProtected = 0;
             foreach (var t in all)
             {
                 if (t == null) continue;
-                if (originalNames.Contains(t.name)) continue;          // part of the original → keep
-                if (!oldFbxNames.Contains(t.name)) { keptAutoRig++; continue; }  // new in FBX → AutoRig → keep
+                if (originalNames.Contains(t.name)) continue;          // present in the original → keep
+                if (!oldFbxNames.Contains(t.name)) { keptAutoRig++; continue; }  // new in FBX → AutoRig bone → keep
 
-                // Re-introduced object (in old FBX, the user had removed it). Prune — with safety guards.
-                if (deformBones.Contains(t)) { keptSafety++; log.AppendLine($"  - KEPT (mesh is weighted to it): {t.name}"); continue; }
-                if (t.childCount > 0)        { keptSafety++; log.AppendLine($"  - KEPT (still has children):   {t.name}"); continue; }
+                // Re-introduced object: present in the old FBX but the user deleted it from their
+                // scene avatar → delete it from the duplicate too (pure hierarchy match). Only guard:
+                // don't delete a node that still has KEPT children (deleting would destroy them too).
+                // Deepest-first means any deletable descendants are already gone, so a remaining child
+                // is something we keep (an original bone or an AutoRig bone).
+                if (t.childCount > 0) { keptProtected++; log.AppendLine($"  - KEPT (still has kept children): {t.name}"); continue; }
 
                 log.AppendLine($"  - deleted: {GetPath(t, dup.transform)}");
                 Undo.DestroyObjectImmediate(t.gameObject);
                 deleted++;
             }
-            log.AppendLine($"  - summary: deleted {deleted}, kept-AutoRig {keptAutoRig}, kept-for-safety {keptSafety}");
+            log.AppendLine($"  - summary: deleted {deleted}, kept-AutoRig {keptAutoRig}, kept-protected {keptProtected}");
         }
 
         static int Depth(Transform t)
