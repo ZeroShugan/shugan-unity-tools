@@ -27,6 +27,7 @@ namespace ZeroShugan.ShuganUnityTools
         GameObject _targetSceneObject;
         GameObject _newFbx;
         GameObject _oldFbx;
+        bool        _pruneToMatchOriginal = true;
         string      _status = "";
         MessageType _statusType = MessageType.None;
         Vector2     _scroll;
@@ -71,6 +72,14 @@ namespace ZeroShugan.ShuganUnityTools
                 new GUIContent("Old FBX to Replace", "The FBX the avatar currently uses."),
                 _oldFbx, typeof(GameObject), allowSceneObjects: false);
 
+            EditorGUILayout.Space(4);
+            _pruneToMatchOriginal = EditorGUILayout.ToggleLeft(
+                new GUIContent("Prune extras to match original",
+                    "After swapping, delete any object the duplicate has that the original doesn't — " +
+                    "EXCEPT bones the new FBX added (e.g. AutoRig feet bones). Cleans up leaf/_end bones " +
+                    "you had deleted from your avatar. Never deletes a bone a mesh is weighted to."),
+                _pruneToMatchOriginal);
+
             EditorGUILayout.Space(8);
 
             string err = ValidateInputs(_targetSceneObject, _newFbx, _oldFbx);
@@ -82,7 +91,7 @@ namespace ZeroShugan.ShuganUnityTools
             GUI.backgroundColor = ready ? new Color(0.4f, 0.8f, 0.4f) : Color.white;
             if (GUILayout.Button("▶  Swap FBX (duplicate)", GUILayout.Height(34)))
             {
-                var result = ExecuteSwap(_targetSceneObject, _newFbx, _oldFbx);
+                var result = ExecuteSwap(_targetSceneObject, _newFbx, _oldFbx, true, _pruneToMatchOriginal);
                 if (result != null)
                     SetStatus($"✓ Created '{result.name}'. Original untouched. See log in {LogsFolder}/.", MessageType.Info);
                 else
@@ -106,8 +115,11 @@ namespace ZeroShugan.ShuganUnityTools
         /// <summary>
         /// Duplicate-and-relink FBX swap. Returns the new duplicate GameObject (or null on failure).
         /// The original <paramref name="sceneAvatar"/> is never modified.
+        /// When <paramref name="pruneToMatchOriginal"/> is true, a final pass deletes objects the
+        /// duplicate has that the original lacks (e.g. leaf/_end bones the user removed from their
+        /// avatar) — but keeps the bones the new FBX added (AutoRig feet bones).
         /// </summary>
-        public static GameObject ExecuteSwap(GameObject sceneAvatar, GameObject newFbx, GameObject oldFbx, bool offset = true)
+        public static GameObject ExecuteSwap(GameObject sceneAvatar, GameObject newFbx, GameObject oldFbx, bool offset = true, bool pruneToMatchOriginal = true)
         {
             string err = ValidateInputs(sceneAvatar, newFbx, oldFbx);
             if (err != null) { Debug.LogError("[FBX Swapper (Test)] " + err); return null; }
@@ -166,6 +178,13 @@ namespace ZeroShugan.ShuganUnityTools
                 // Step 6 — graft new bones + rebuild SkinnedMeshRenderer bone arrays
                 GraftBonesAndFixArrays(dup, dupFbxPath, log);
                 log.AppendLine("- [OK] grafted new bones + rebuilt bone arrays");
+
+                // Step 7 — prune objects the original doesn't have (keeps AutoRig additions)
+                if (pruneToMatchOriginal)
+                {
+                    PruneToMatchOriginal(dup, sceneAvatar, oldFbx, log);
+                    log.AppendLine("- [OK] pruned re-introduced objects to match the original");
+                }
 
                 log.AppendLine();
                 log.AppendLine("## AFTER (produced duplicate)");
@@ -273,6 +292,66 @@ namespace ZeroShugan.ShuganUnityTools
             {
                 Object.DestroyImmediate(refRoot);
             }
+        }
+
+        // ─── Prune extras to match the original ──────────────────────────────────
+
+        // Make the duplicate's hierarchy match the original's: delete any object the duplicate has
+        // that the original lacks — EXCEPT bones the new FBX added (AutoRig feet bones).
+        //
+        // Why this is safe & name-independent: the duplicate is Instantiate(original) + grafted
+        // bones. So every "extra" came from the graft. Each extra is either
+        //   (a) a name that ALSO exists in the OLD FBX  -> it came from the model and the user had
+        //       deleted it from their scene avatar (e.g. an _end / leaf bone)  -> prune it, OR
+        //   (b) a name NOT in the OLD FBX               -> it's new this swap (added by the AutoRig
+        //       Blender script)                          -> keep it.
+        // A bone a mesh is actually weighted to is never deleted (would break the mesh).
+        static void PruneToMatchOriginal(GameObject dup, GameObject original, GameObject oldFbx, StringBuilder log)
+        {
+            log.AppendLine();
+            log.AppendLine("## PRUNE (match original; keep AutoRig additions)");
+
+            var originalNames = new HashSet<string>();
+            foreach (var t in original.GetComponentsInChildren<Transform>(true)) originalNames.Add(t.name);
+
+            // Names present in the source FBX (read straight off the prefab asset — no instantiate).
+            var oldFbxNames = new HashSet<string>();
+            foreach (var t in oldFbx.GetComponentsInChildren<Transform>(true)) oldFbxNames.Add(t.name);
+
+            // Deform bones in the duplicate — never delete these (would break meshes).
+            var deformBones = new HashSet<Transform>();
+            foreach (var smr in dup.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                if (smr.bones != null) foreach (var b in smr.bones) if (b != null) deformBones.Add(b);
+
+            // Deepest-first so leaf / _end bones are removed before their parents.
+            var all = dup.GetComponentsInChildren<Transform>(true)
+                         .Where(t => t != dup.transform)
+                         .OrderByDescending(Depth)
+                         .ToList();
+
+            int deleted = 0, keptAutoRig = 0, keptSafety = 0;
+            foreach (var t in all)
+            {
+                if (t == null) continue;
+                if (originalNames.Contains(t.name)) continue;          // part of the original → keep
+                if (!oldFbxNames.Contains(t.name)) { keptAutoRig++; continue; }  // new in FBX → AutoRig → keep
+
+                // Re-introduced object (in old FBX, the user had removed it). Prune — with safety guards.
+                if (deformBones.Contains(t)) { keptSafety++; log.AppendLine($"  - KEPT (mesh is weighted to it): {t.name}"); continue; }
+                if (t.childCount > 0)        { keptSafety++; log.AppendLine($"  - KEPT (still has children):   {t.name}"); continue; }
+
+                log.AppendLine($"  - deleted: {GetPath(t, dup.transform)}");
+                Undo.DestroyObjectImmediate(t.gameObject);
+                deleted++;
+            }
+            log.AppendLine($"  - summary: deleted {deleted}, kept-AutoRig {keptAutoRig}, kept-for-safety {keptSafety}");
+        }
+
+        static int Depth(Transform t)
+        {
+            int d = 0;
+            while (t.parent != null) { d++; t = t.parent; }
+            return d;
         }
 
         // ─── Snapshots & logging ─────────────────────────────────────────────────
