@@ -968,60 +968,141 @@ namespace ZeroShugan.ShuganUnityTools
         }
 
         // Count humanoid bone slots weighted to each mesh; pick the mesh with the highest count.
+        // Smart body-mesh detection: a weighted blend of several signals, each normalized across
+        // the candidate meshes so no single one dominates. The body is the mesh that is actually
+        // skinned to the whole humanoid skeleton (incl. extremities), is tall + wide (T/A-pose arm
+        // span), often has a material named "body", and is reasonably dense.
+        const float WBodyHumanoid   = 0.40f; // fraction of humanoid bones it is REALLY weighted to
+        const float WBodyExtremity  = 0.20f; // weighted to head + both hands + both feet
+        const float WBodyHeight     = 0.12f; // tallest bounds (full-height)
+        const float WBodyWidth      = 0.12f; // widest bounds (T-pose hand-to-hand span)
+        const float WBodyMaterial   = 0.10f; // a material named "...body..."
+        const float WBodyVerts      = 0.06f; // vertex count (minor tiebreak)
+
         int GuessBodyMeshIndex()
         {
-            if (_meshNames.Length == 0) return 0;
+            int n = _meshNames.Length;
+            if (n <= 1) return 0;
 
             var smrs = _avatarObject != null
                 ? _avatarObject.GetComponentsInChildren<SkinnedMeshRenderer>(true)
                 : new SkinnedMeshRenderer[0];
 
-            var humanoidNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (_avatarObject != null)
+            // Humanoid bone names, plus the key extremity bones (head / hands / feet).
+            var humanoidNames  = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var extremityNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var animator = _avatarObject != null ? _avatarObject.GetComponent<Animator>() : null;
+            if (animator != null && animator.isHuman)
             {
-                var animator = _avatarObject.GetComponent<Animator>();
-                if (animator != null && animator.isHuman)
+                foreach (HumanBodyBones hb in Enum.GetValues(typeof(HumanBodyBones)))
                 {
-                    foreach (HumanBodyBones hb in Enum.GetValues(typeof(HumanBodyBones)))
+                    if (hb == HumanBodyBones.LastBone) continue;
+                    var t = animator.GetBoneTransform(hb);
+                    if (t != null) humanoidNames.Add(t.name);
+                }
+                foreach (var hb in new[] { HumanBodyBones.Head, HumanBodyBones.LeftHand,
+                    HumanBodyBones.RightHand, HumanBodyBones.LeftFoot, HumanBodyBones.RightFoot })
+                {
+                    var t = animator.GetBoneTransform(hb);
+                    if (t != null) extremityNames.Add(t.name);
+                }
+            }
+
+            var humanoid  = new float[n];
+            var extremity = new float[n];
+            var heights   = new float[n];
+            var widths    = new float[n];
+            var bodyMat   = new float[n];
+            var verts     = new float[n];
+
+            for (int i = 0; i < n; i++)
+            {
+                var smr  = smrs.FirstOrDefault(s => s.sharedMesh != null &&
+                    string.Equals(s.sharedMesh.name, _meshNames[i], StringComparison.OrdinalIgnoreCase));
+                Mesh mesh = smr != null ? smr.sharedMesh : FindFbxMesh(_meshNames[i]);
+                if (mesh == null) continue;
+
+                verts[i]   = mesh.vertexCount;
+                var size   = mesh.bounds.size;
+                heights[i] = size.y;
+                widths[i]  = size.x;
+
+                if (smr != null)
+                {
+                    foreach (var m in smr.sharedMaterials)
+                        if (m != null && m.name.IndexOf("body", StringComparison.OrdinalIgnoreCase) >= 0)
+                        { bodyMat[i] = 1f; break; }
+
+                    if (humanoidNames.Count > 0)
                     {
-                        if (hb == HumanBodyBones.LastBone) continue;
-                        var t = animator.GetBoneTransform(hb);
-                        if (t != null) humanoidNames.Add(t.name);
+                        var used = UsedBoneNames(smr);
+                        humanoid[i]  = used.Count(humanoidNames.Contains);
+                        extremity[i] = extremityNames.Count(used.Contains);
                     }
                 }
             }
 
-            int bestIdx   = 0;
-            int bestScore = -1;
+            float hMax = Max(humanoid), eMax = Max(extremity), tMax = Max(heights),
+                  wMax = Max(widths),   vMax = Max(verts);
 
-            for (int i = 0; i < _meshNames.Length; i++)
+            int best = 0; float bestScore = -1f;
+            for (int i = 0; i < n; i++)
             {
-                var smr = smrs.FirstOrDefault(s =>
-                    s.sharedMesh != null &&
-                    string.Equals(s.sharedMesh.name, _meshNames[i], StringComparison.OrdinalIgnoreCase));
-
-                int score;
-                if (smr != null && smr.sharedMesh != null)
-                {
-                    score = humanoidNames.Count > 0
-                        ? smr.bones.Count(b => b != null && humanoidNames.Contains(b.name))
-                        : smr.sharedMesh.vertexCount;
-                }
-                else
-                {
-                    string fbxPath = AssetDatabase.GetAssetPath(_sourceFbxAsset);
-                    var mesh = AssetDatabase.LoadAllAssetsAtPath(fbxPath)
-                        .OfType<Mesh>()
-                        .FirstOrDefault(m => string.Equals(m.name, _meshNames[i],
-                            StringComparison.OrdinalIgnoreCase));
-                    score = mesh != null ? mesh.vertexCount : 0;
-                }
-
-                if (score > bestScore) { bestScore = score; bestIdx = i; }
+                float score =
+                    WBodyHumanoid  * Div(humanoid[i],  hMax) +
+                    WBodyExtremity * Div(extremity[i], eMax) +
+                    WBodyHeight    * Div(heights[i],   tMax) +
+                    WBodyWidth     * Div(widths[i],    wMax) +
+                    WBodyMaterial  * bodyMat[i] +
+                    WBodyVerts     * Div(verts[i],     vMax);
+                if (score > bestScore) { bestScore = score; best = i; }
             }
-
-            return bestIdx;
+            return best;
         }
+
+        // Distinct bone names a mesh is ACTUALLY weighted to (weight > ~0), not just listed in bones[].
+        static HashSet<string> UsedBoneNames(SkinnedMeshRenderer smr)
+        {
+            var set = new HashSet<string>();
+            var bones = smr.bones;
+            var mesh  = smr.sharedMesh;
+            if (bones == null || mesh == null) return set;
+            try
+            {
+                var bw = mesh.boneWeights;
+                if (bw == null || bw.Length == 0)
+                {
+                    foreach (var b in bones) if (b != null) set.Add(b.name); // no weight data → fall back
+                    return set;
+                }
+                var used = new HashSet<int>();
+                foreach (var w in bw)
+                {
+                    if (w.weight0 > 0.0001f) used.Add(w.boneIndex0);
+                    if (w.weight1 > 0.0001f) used.Add(w.boneIndex1);
+                    if (w.weight2 > 0.0001f) used.Add(w.boneIndex2);
+                    if (w.weight3 > 0.0001f) used.Add(w.boneIndex3);
+                }
+                foreach (int idx in used)
+                    if (idx >= 0 && idx < bones.Length && bones[idx] != null) set.Add(bones[idx].name);
+            }
+            catch
+            {
+                foreach (var b in bones) if (b != null) set.Add(b.name); // mesh not readable → fall back
+            }
+            return set;
+        }
+
+        Mesh FindFbxMesh(string meshName)
+        {
+            if (_sourceFbxAsset == null) return null;
+            return AssetDatabase.LoadAllAssetsAtPath(AssetDatabase.GetAssetPath(_sourceFbxAsset))
+                .OfType<Mesh>()
+                .FirstOrDefault(m => string.Equals(m.name, meshName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        static float Max(float[] a) { float m = 0f; foreach (float v in a) if (v > m) m = v; return m; }
+        static float Div(float a, float max) => max > 0f ? a / max : 0f;
 
         void RefreshMeshNames()
         {
