@@ -535,17 +535,21 @@ namespace ZeroShugan.ShuganUnityTools
 
         public static string BuildAutoRigFeetScript(
             string sourceFbxPath, string targetName, string exportPath,
-            string autoRigScriptPath, bool headless, float stepDelay)
+            string autoRigScriptPath, bool headless, float stepDelay,
+            string[] garmentNames = null, string backupJsonPath = null)
         {
             string d        = stepDelay.ToString("F1", CultureInfo.InvariantCulture);
             string pySrc    = sourceFbxPath.Replace("\\", "/");
-            string pyExport = exportPath.Replace("\\", "/");
             string pyScript = autoRigScriptPath.Replace("\\", "/");
             string delay    = headless ? "" : $"time.sleep({d})\n";
+            string garmentBlock = BuildGarmentSelectionPython(garmentNames);
+            string backupEnv = string.IsNullOrEmpty(backupJsonPath) ? ""
+                : $"os.environ['SHUGAN_RIG_BACKUP_JSON'] = '{backupJsonPath.Replace("\\", "/")}'\n";
+            string exportBlock = FbxExportPython(exportPath);
 
             return
 $@"import bpy, sys, time, os, importlib.util
-
+{backupEnv}
 def load_script(path):
     spec = importlib.util.spec_from_file_location('blender_script', path)
     mod  = importlib.util.module_from_spec(spec)
@@ -581,29 +585,37 @@ bpy.ops.object.select_all(action='DESELECT')
 bpy.context.view_layer.objects.active = obj
 obj.select_set(True)
 print('[BlenderBridge] Selected: ' + obj.name)
-{delay}
+{garmentBlock}{delay}
 # ── Run user script ────────────────────────────────────────────────────────────
 _script_basename = os.path.basename('{pyScript}')
 print('[BlenderBridge] Running script: ' + _script_basename)
 load_script('{pyScript}')
 print('[BlenderBridge] Script complete: ' + _script_basename)
 {delay}
-# ── Export as FBX  (preset: fbx_to_Unity__no_modifier) ────────────────────────
+{exportBlock}
+{delay}sys.exit(0)
+";
+        }
+
+        // The FBX export call shared by the AutoRig run and the Restore round-trip
+        // (preset: fbx_to_Unity__no_modifier — MESH + ARMATURE only).
+        static string FbxExportPython(string exportPath)
+        {
+            string pyExport = exportPath.Replace("\\", "/");
+            return
+$@"# ── Export as FBX  (preset: fbx_to_Unity__no_modifier) ────────────────────────
 print('[BlenderBridge] Exporting to: {pyExport}')
 bpy.ops.export_scene.fbx(
     filepath='{pyExport}',
-    # objects
     use_selection=False,
     use_visible=False,
     use_active_collection=False,
     object_types={{'MESH', 'ARMATURE'}},
-    # scale / transform
     global_scale=1.0,
     apply_unit_scale=True,
     apply_scale_options='FBX_SCALE_UNITS',
     use_space_transform=True,
     bake_space_transform=False,
-    # mesh
     use_mesh_modifiers=False,
     use_mesh_modifiers_render=True,
     mesh_smooth_type='OFF',
@@ -614,24 +626,112 @@ bpy.ops.export_scene.fbx(
     use_tspace=False,
     use_triangles=False,
     use_custom_props=False,
-    # armature
     add_leaf_bones=False,
     primary_bone_axis='Y',
     secondary_bone_axis='X',
     use_armature_deform_only=False,
     armature_nodetype='NULL',
-    # animation
     bake_anim=False,
-    # paths / axes
     path_mode='AUTO',
     embed_textures=False,
     batch_mode='OFF',
     axis_forward='-Z',
     axis_up='Y',
 )
-print('[BlenderBridge] Export done.')
+print('[BlenderBridge] Export done.')";
+        }
+
+        // Builds the Restore round-trip: import the (current) FBX, select the body, run the paid
+        // script's restore_main() with the chosen backup JSON, then export back over the FBX.
+        public static string BuildRestoreFeetScript(
+            string sourceFbxPath, string targetName, string exportPath,
+            string restoreScriptPath, string jsonPath, bool headless, float stepDelay)
+        {
+            string d        = stepDelay.ToString("F1", CultureInfo.InvariantCulture);
+            string pySrc    = sourceFbxPath.Replace("\\", "/");
+            string pyScript = restoreScriptPath.Replace("\\", "/");
+            string pyJson   = jsonPath.Replace("\\", "/");
+            string delay    = headless ? "" : $"time.sleep({d})\n";
+            string exportBlock = FbxExportPython(exportPath);
+
+            return
+$@"import bpy, sys, time, os, importlib.util
+os.environ['SHUGAN_RIG_RESTORE_JSON'] = '{pyJson}'
+
+def load_and_run(path, func):
+    spec = importlib.util.spec_from_file_location('blender_script', path)
+    mod  = importlib.util.module_from_spec(spec)
+    mod.__file__ = path
+    spec.loader.exec_module(mod)
+    fn = getattr(mod, func, None)
+    if fn is not None:
+        fn()
+
+# ── Clean default scene objects ────────────────────────────────────────────────
+for _name in ['Cube', 'Light', 'Camera']:
+    _obj = bpy.data.objects.get(_name)
+    if _obj:
+        bpy.data.objects.remove(_obj, do_unlink=True)
+print('[BlenderBridge] Default scene objects removed.')
+
+# ── Import FBX ────────────────────────────────────────────────────────────────
+print('[BlenderBridge] Importing: {pySrc}')
+bpy.ops.import_scene.fbx(filepath='{pySrc}')
+{delay}
+# ── Select target object ───────────────────────────────────────────────────────
+target_name = '{targetName}'
+obj = bpy.data.objects.get(target_name)
+if obj is None:
+    for o in bpy.data.objects:
+        if target_name.lower() in o.name.lower() and o.type == 'MESH':
+            obj = o
+            break
+if obj is None:
+    print('[BlenderBridge] ERROR: object not found: ' + target_name)
+    sys.exit(1)
+
+bpy.ops.object.select_all(action='DESELECT')
+bpy.context.view_layer.objects.active = obj
+obj.select_set(True)
+print('[BlenderBridge] Selected: ' + obj.name)
+{delay}
+# ── Run restore ────────────────────────────────────────────────────────────────
+print('[BlenderBridge] Running restore: ' + os.path.basename('{pyScript}'))
+load_and_run('{pyScript}', 'restore_main')
+print('[BlenderBridge] Restore complete.')
+{delay}
+{exportBlock}
 {delay}sys.exit(0)
 ";
+        }
+
+        // Python that selects extra garment meshes (socks / thigh-highs) ALONGSIDE the active body
+        // object, so the AutoRig script's end step transfers the body's toe + foot weights onto them.
+        // Returns "" when there are no garments (keeps the body-only path byte-for-byte unchanged).
+        static string BuildGarmentSelectionPython(string[] names)
+        {
+            if (names == null || names.Length == 0) return "";
+            var sb = new StringBuilder();
+            sb.Append("# ── Select garment meshes (toe-weight transfer targets) ─────────────────────────\n");
+            sb.Append("for _gname in ").Append(PyStrList(names)).Append(":\n");
+            sb.Append("    _gobj = bpy.data.objects.get(_gname)\n");
+            sb.Append("    if _gobj is None:\n");
+            sb.Append("        for o in bpy.data.objects:\n");
+            sb.Append("            if _gname.lower() in o.name.lower() and o.type == 'MESH' and o is not obj:\n");
+            sb.Append("                _gobj = o\n");
+            sb.Append("                break\n");
+            sb.Append("    if _gobj is not None and _gobj is not obj:\n");
+            sb.Append("        _gobj.select_set(True)\n");
+            sb.Append("        print('[BlenderBridge] Garment selected: ' + _gobj.name)\n");
+            sb.Append("    else:\n");
+            sb.Append("        print('[BlenderBridge] WARNING: garment not found: ' + _gname)\n");
+            return sb.ToString();
+        }
+
+        static string PyStrList(IEnumerable<string> items)
+        {
+            var parts = items.Select(s => "'" + s.Replace("\\", "\\\\").Replace("'", "\\'") + "'");
+            return "[" + string.Join(", ", parts) + "]";
         }
 
         // ─── FBX helpers ──────────────────────────────────────────────────────

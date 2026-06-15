@@ -12,7 +12,7 @@ namespace ZeroShugan.ShuganUnityTools
     {
         enum ExportMode { Duplicate, Replace }
         enum SwapMethod { Legacy, Experimental }
-        enum State      { Idle, BlenderRunning, FBXSwapping, AddingPrefabs, Done, Error }
+        enum State      { Idle, BlenderRunning, FBXSwapping, AddingPrefabs, Restoring, Done, Error }
 
         // ─── EditorPrefs ───────────────────────────────────────────────────────
         const string PrefFbxPath              = "ShuganTools_ARF_FbxPath";
@@ -23,6 +23,8 @@ namespace ZeroShugan.ShuganUnityTools
         const string PrefAdvanced             = "ShuganTools_ARF_Advanced";
         const string PrefAutoRigScriptPath    = "ShuganTools_ARF_AutoRigScriptPath";
         const string PrefSwapMethod           = "ShuganTools_ARF_SwapMethod";
+        const string PrefGarments             = "ShuganTools_ARF_Garments";
+        const string PrefBackupEnabled        = "ShuganTools_ARF_BackupEnabled";
 
         // ─── Paid-content paths (installed via Shugan store bundle) ───────────
         const string DefaultAutoRigScriptPath = "Assets/! Shugan/!_Lab/Script/shugan_autorig_feet.py";
@@ -49,6 +51,16 @@ namespace ZeroShugan.ShuganUnityTools
         int          _selectedMeshIndex = 0;
         bool         _fbxAutoDetected;
         bool         _alreadyRigged;
+
+        // ─── Garment meshes (toe-weight transfer targets) ─────────────────────
+        // Extra meshes from the source FBX (socks / thigh-highs / shoes) that the body's toe + foot
+        // weights are transferred onto in Blender. Stored as mesh names so they survive FBX reloads.
+        // Default empty (0 slots) — the user adds slots with the "+" button.
+        List<string> _garmentMeshNames = new List<string>();
+
+        // ─── Rig backup (JSON) ────────────────────────────────────────────────
+        bool _backupEnabled = true;   // capture a rig-only JSON backup before each run (Advanced)
+        int  _restoreIndex;            // selected backup in the Restore dropdown
 
         // ─── Export ────────────────────────────────────────────────────────────
         ExportMode _exportMode   = ExportMode.Duplicate;
@@ -120,6 +132,13 @@ namespace ZeroShugan.ShuganUnityTools
             _selectedMeshIndex = Mathf.Clamp(
                 EditorPrefs.GetInt(PrefMeshIndex, 0), 0, Mathf.Max(0, _meshNames.Length - 1));
 
+            string garments = EditorPrefs.GetString(PrefGarments, "");
+            _garmentMeshNames = string.IsNullOrEmpty(garments)
+                ? new List<string>()
+                : garments.Split('|').Where(s => !string.IsNullOrEmpty(s)).ToList();
+
+            _backupEnabled = EditorPrefs.GetBool(PrefBackupEnabled, true);
+
             if (_prefabsToAdd.Count == 0)
                 foreach (string p in DefaultPrefabPaths)
                     _prefabsToAdd.Add(AssetDatabase.LoadAssetAtPath<GameObject>(p));
@@ -166,6 +185,27 @@ namespace ZeroShugan.ShuganUnityTools
                     _blenderProcess = null;
                     AssetDatabase.Refresh();
                     _state = State.FBXSwapping;
+                }
+                Repaint();
+            }
+
+            if (_state == State.Restoring)
+            {
+                DrainOutputQueue();
+                float elapsed = (float)(now - _processStartTime);
+                float t       = Mathf.Clamp01(elapsed / EstimatedBlenderSec);
+                _displayProgress = (1f - Mathf.Pow(1f - t, 3f)) * 0.95f;
+
+                if (_blenderProcess != null && _blenderProcess.HasExited)
+                {
+                    _blenderProcess.Dispose();
+                    _blenderProcess = null;
+                    AssetDatabase.Refresh();
+                    _displayProgress  = 1f;
+                    _state            = State.Done;
+                    _currentStepLabel = "Restore done!";
+                    SetStatus("Restore complete — the FBX was reverted (feet rig removed).",
+                        MessageType.Info);
                 }
                 Repaint();
             }
@@ -448,7 +488,179 @@ namespace ZeroShugan.ShuganUnityTools
                     GUI.color = c;
                 }
             }
+
+            DrawGarmentSection();
+            DrawRestoreSection();
         }
+
+        // ─── Restore original rig (from JSON backup) ───────────────────────────
+
+        void DrawRestoreSection()
+        {
+            bool hasFbx = _sourceFbxAsset != null && IsValidFbx(_sourceFbxAsset);
+            if (!hasFbx) return;
+
+            string backupDir = Path.Combine(SourceFbxAbsDir(), "_Backups");
+            string fbxName   = Path.GetFileNameWithoutExtension(AssetDatabase.GetAssetPath(_sourceFbxAsset));
+            string[] jsons = Directory.Exists(backupDir)
+                ? Directory.GetFiles(backupDir, fbxName + "_rigbackup_*.json")
+                    .OrderByDescending(f => f).ToArray()
+                : new string[0];
+            if (jsons.Length == 0) return;  // nothing to restore
+
+            EditorGUILayout.Space(6);
+            GUILayout.Label("Restore Original Rig", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField(
+                "Re-import the FBX, remove the feet rig using a backup, and overwrite the FBX "
+                + "(keeps post-rig mesh edits).", EditorStyles.miniLabel);
+
+            _restoreIndex = Mathf.Clamp(_restoreIndex, 0, jsons.Length - 1);
+            string[] labels = jsons.Select(Path.GetFileName).ToArray();
+
+            EditorGUILayout.BeginHorizontal();
+            _restoreIndex = EditorGUILayout.Popup(_restoreIndex, labels);
+            bool busy = _state != State.Idle && _state != State.Done && _state != State.Error;
+            EditorGUI.BeginDisabledGroup(busy || !_depAutoRigScript || !_depBlender);
+            if (GUILayout.Button("Restore", GUILayout.Width(90)))
+                RunRestore(jsons[_restoreIndex]);
+            EditorGUI.EndDisabledGroup();
+            EditorGUILayout.EndHorizontal();
+        }
+
+        void RunRestore(string jsonPath)
+        {
+            string blenderPath = EditorPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
+            if (!File.Exists(blenderPath))
+            {
+                SetStatus("Blender not found — set its path in Advanced Settings.", MessageType.Error);
+                return;
+            }
+            string scriptPath = ResolveAutoRigScriptPath();
+            if (string.IsNullOrEmpty(scriptPath))
+            {
+                SetStatus("AutoRig_Feet.py not found — needed for the restore logic.", MessageType.Error);
+                return;
+            }
+            if (_meshNames.Length == 0)
+            {
+                SetStatus("No meshes in the FBX to restore.", MessageType.Error);
+                return;
+            }
+
+            string sourceFbxAbs = ToAbsPath(AssetDatabase.GetAssetPath(_sourceFbxAsset));
+            string targetMesh   = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
+
+            bool ok = EditorUtility.DisplayDialog(
+                "Restore original rig?",
+                "This imports the current FBX into Blender, removes the AutoRig Feet rig using:\n" +
+                Path.GetFileName(jsonPath) +
+                "\n\nand OVERWRITES the FBX:\n" + ToProjectRelative(sourceFbxAbs) +
+                "\n\nMesh edits made after rigging are kept; only the feet rig is removed.",
+                "Restore", "Cancel");
+            if (!ok) return;
+
+            _displayProgress  = 0f;
+            _currentStepLabel = "Restoring rig in Blender…";
+            lock (_outputLock) _outputQueue.Clear();
+
+            string pythonCode = BlenderBridge.BuildRestoreFeetScript(
+                sourceFbxAbs, targetMesh, sourceFbxAbs, scriptPath, jsonPath,
+                headless: true, stepDelay: 0f);
+
+            _blenderProcess = BlenderBridge.LaunchBlenderProcess(
+                blenderPath, pythonCode, headless: true, factoryStartup: true,
+                onOutputLine: line => { lock (_outputLock) _outputQueue.Enqueue(line); });
+
+            if (_blenderProcess == null)
+            {
+                SetError("Failed to launch Blender for restore.");
+                return;
+            }
+            _processStartTime = EditorApplication.timeSinceStartup;
+            _lastUpdateTime   = _processStartTime;
+            _state            = State.Restoring;
+            SetStatus("Restoring rig in Blender… Unity will refresh when it finishes.", MessageType.Info);
+        }
+
+        // ─── Garment meshes (toe-weight transfer targets) ──────────────────────
+
+        void DrawGarmentSection()
+        {
+            EditorGUILayout.Space(6);
+            GUILayout.Label("Transfer Toe Weights To (optional)", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField(
+                "Socks / thigh-highs / shoes from the same FBX that should follow the new toe bones.",
+                EditorStyles.miniLabel);
+
+            bool hasFbx = _sourceFbxAsset != null && IsValidFbx(_sourceFbxAsset);
+            string bodyMesh = _meshNames.Length > 0
+                ? _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)] : null;
+
+            // Garment choices = all FBX meshes except the body mesh.
+            string[] choices = hasFbx
+                ? _meshNames.Where(m => !string.Equals(m, bodyMesh, StringComparison.OrdinalIgnoreCase)).ToArray()
+                : new string[0];
+
+            EditorGUI.BeginDisabledGroup(!hasFbx);
+
+            for (int i = 0; i < _garmentMeshNames.Count; i++)
+            {
+                EditorGUILayout.BeginHorizontal();
+
+                int cur = Array.IndexOf(choices, _garmentMeshNames[i]);
+                EditorGUI.BeginChangeCheck();
+                int picked = EditorGUILayout.Popup(
+                    cur < 0 ? 0 : cur,
+                    choices.Length > 0 ? choices : new[] { "— no other meshes —" });
+                if (EditorGUI.EndChangeCheck() && choices.Length > 0)
+                {
+                    _garmentMeshNames[i] = choices[Mathf.Clamp(picked, 0, choices.Length - 1)];
+                    SaveGarments();
+                }
+
+                // Flag a stale name (mesh no longer in this FBX) or an accidental duplicate.
+                if (!string.IsNullOrEmpty(_garmentMeshNames[i]) && cur < 0)
+                {
+                    Color c = GUI.color; GUI.color = Color.yellow;
+                    GUILayout.Label("not in FBX", EditorStyles.miniLabel, GUILayout.Width(70));
+                    GUI.color = c;
+                }
+                else if (_garmentMeshNames.Take(i).Contains(_garmentMeshNames[i]))
+                {
+                    Color c = GUI.color; GUI.color = Color.yellow;
+                    GUILayout.Label("duplicate", EditorStyles.miniLabel, GUILayout.Width(70));
+                    GUI.color = c;
+                }
+
+                if (GUILayout.Button("×", GUILayout.Width(22)))
+                {
+                    _garmentMeshNames.RemoveAt(i);
+                    SaveGarments();
+                    i--;
+                    EditorGUILayout.EndHorizontal();
+                    continue;
+                }
+                EditorGUILayout.EndHorizontal();
+            }
+
+            if (GUILayout.Button("+ Add Garment Mesh", GUILayout.Height(22)))
+            {
+                // Default the new slot to the first not-yet-chosen garment mesh, else the first.
+                string next = choices.FirstOrDefault(m => !_garmentMeshNames.Contains(m))
+                              ?? (choices.Length > 0 ? choices[0] : "");
+                _garmentMeshNames.Add(next);
+                SaveGarments();
+            }
+
+            EditorGUI.EndDisabledGroup();
+
+            if (!hasFbx && _garmentMeshNames.Count > 0)
+                EditorGUILayout.HelpBox("Select an avatar / FBX first to pick garment meshes.",
+                    MessageType.Info);
+        }
+
+        void SaveGarments()
+            => EditorPrefs.SetString(PrefGarments, string.Join("|", _garmentMeshNames));
 
         // ─── Advanced section ──────────────────────────────────────────────────
 
@@ -564,6 +776,20 @@ namespace ZeroShugan.ShuganUnityTools
                     : "✗ Not found — install paid bundle or set a custom path",
                 EditorStyles.miniLabel);
             GUI.color = cs;
+
+            Separator();
+
+            // ── Backups ──────────────────────────────────────────────────────
+            GUILayout.Label("Backups", EditorStyles.boldLabel);
+            EditorGUI.BeginChangeCheck();
+            _backupEnabled = EditorGUILayout.ToggleLeft(
+                new GUIContent("Save rig backup (JSON)",
+                    "Before rigging, capture a rig-only JSON backup (bones/groups/weights the rig "
+                    + "changes) to the FBX's _Backups folder. Lets you later 'Restore original rig' "
+                    + "while keeping mesh edits made after rigging. Separate from the full FBX backup."),
+                _backupEnabled);
+            if (EditorGUI.EndChangeCheck())
+                EditorPrefs.SetBool(PrefBackupEnabled, _backupEnabled);
 
             Separator();
 
@@ -691,7 +917,7 @@ namespace ZeroShugan.ShuganUnityTools
         void DrawProgressBarIfActive()
         {
             bool show = _state == State.BlenderRunning || _state == State.FBXSwapping ||
-                        _state == State.AddingPrefabs  ||
+                        _state == State.AddingPrefabs  || _state == State.Restoring ||
                         (_displayProgress > 0f && _displayProgress < 1.01f &&
                          (_state == State.Done || _state == State.Error));
             if (!show) return;
@@ -749,10 +975,31 @@ namespace ZeroShugan.ShuganUnityTools
             _createdPrefabPath = null;
             lock (_outputLock) _outputQueue.Clear();
 
+            // Garment meshes to also select in Blender (body's toe + foot weights get transferred to
+            // them). Drop blanks, the body itself, and duplicates.
+            string[] garmentNames = _garmentMeshNames
+                .Where(g => !string.IsNullOrEmpty(g) &&
+                            !string.Equals(g, targetMesh, StringComparison.OrdinalIgnoreCase))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            // Rig-only JSON backup (captured in Blender BEFORE the rig runs) — pairs with the FBX
+            // backup but lets the user later strip just the rig while keeping post-rig mesh edits.
+            string backupJsonPath = null;
+            if (_backupEnabled)
+            {
+                string backupDir = Path.Combine(SourceFbxAbsDir(), "_Backups");
+                Directory.CreateDirectory(backupDir);
+                string fbxName = Path.GetFileNameWithoutExtension(AssetDatabase.GetAssetPath(_sourceFbxAsset));
+                string stamp   = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                backupJsonPath = Path.Combine(backupDir, $"{fbxName}_rigbackup_{stamp}.json");
+            }
+
             string sourceFbxAbs = ToAbsPath(AssetDatabase.GetAssetPath(_sourceFbxAsset));
             string pythonCode   = BlenderBridge.BuildAutoRigFeetScript(
                 sourceFbxAbs, targetMesh, _exportPath, scriptPath,
-                headless: true, stepDelay: 0f);
+                headless: true, stepDelay: 0f, garmentNames: garmentNames,
+                backupJsonPath: backupJsonPath);
 
             _blenderProcess = BlenderBridge.LaunchBlenderProcess(
                 blenderPath, pythonCode, headless: true, factoryStartup: true,
@@ -1361,6 +1608,7 @@ namespace ZeroShugan.ShuganUnityTools
                 case State.BlenderRunning: return "Blender Running…";
                 case State.FBXSwapping:   return "Swapping FBX…";
                 case State.AddingPrefabs: return "Adding Prefabs…";
+                case State.Restoring:     return "Restoring…";
                 default:                  return "Working…";
             }
         }
