@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text;
 using UnityEditor;
 using UnityEngine;
 
@@ -61,6 +62,10 @@ namespace ZeroShugan.ShuganUnityTools
         // ─── Rig backup (JSON) ────────────────────────────────────────────────
         bool _backupEnabled = true;   // capture a rig-only JSON backup before each run (Advanced)
         int  _restoreIndex;            // selected backup in the Restore dropdown
+
+        // ─── Run log (full Blender stdout+stderr → file, for debugging) ───────
+        StringBuilder _runLog;
+        string        _runLogPath;
 
         // ─── Export ────────────────────────────────────────────────────────────
         ExportMode _exportMode   = ExportMode.Duplicate;
@@ -183,6 +188,7 @@ namespace ZeroShugan.ShuganUnityTools
                 {
                     _blenderProcess.Dispose();
                     _blenderProcess = null;
+                    WriteRunLog();
                     AssetDatabase.Refresh();
                     _state = State.FBXSwapping;
                 }
@@ -200,6 +206,7 @@ namespace ZeroShugan.ShuganUnityTools
                 {
                     _blenderProcess.Dispose();
                     _blenderProcess = null;
+                    WriteRunLog();
                     AssetDatabase.Refresh();
                     _displayProgress  = 1f;
                     _state            = State.Done;
@@ -263,6 +270,8 @@ namespace ZeroShugan.ShuganUnityTools
 
             ShuganToolUI.DrawHeader("AutoRig Feet  —  Distributor");
             ShuganToolUI.DrawSocialLinks(WikiUrl);
+            EditorGUILayout.Space(4);
+            DrawRunButton();   // top run button (mirrors the one at the bottom)
             Separator();
             DrawDependencyStatus();
             Separator();
@@ -274,17 +283,10 @@ namespace ZeroShugan.ShuganUnityTools
 
             DrawProgressBarIfActive();
 
-            bool busy  = _state != State.Idle && _state != State.Done && _state != State.Error;
             bool ready = IsReady();
 
             EditorGUILayout.Space(4);
-            EditorGUI.BeginDisabledGroup(!ready || busy);
-            Color prev = GUI.backgroundColor;
-            GUI.backgroundColor = ready && !busy ? new Color(0.4f, 0.8f, 0.4f) : Color.white;
-            if (GUILayout.Button(busy ? GetBusyLabel() : "▶  AutoRig Feet", GUILayout.Height(34)))
-                Execute();
-            GUI.backgroundColor = prev;
-            EditorGUI.EndDisabledGroup();
+            DrawRunButton();
 
             DrawReadinessHints(ready);
 
@@ -317,6 +319,21 @@ namespace ZeroShugan.ShuganUnityTools
             }
 
             ShuganToolUI.DrawCredits("AutoRig Feet (Distributor)", ToolVersion);
+        }
+
+        // The green "AutoRig Feet" run button — drawn at both the top and bottom of the window.
+        void DrawRunButton()
+        {
+            bool busy  = _state != State.Idle && _state != State.Done && _state != State.Error;
+            bool ready = IsReady();
+
+            EditorGUI.BeginDisabledGroup(!ready || busy);
+            Color prev = GUI.backgroundColor;
+            GUI.backgroundColor = ready && !busy ? new Color(0.4f, 0.8f, 0.4f) : Color.white;
+            if (GUILayout.Button(busy ? GetBusyLabel() : "▶  AutoRig Feet", GUILayout.Height(34)))
+                Execute();
+            GUI.backgroundColor = prev;
+            EditorGUI.EndDisabledGroup();
         }
 
         // ─── Dependency status ─────────────────────────────────────────────────
@@ -562,6 +579,7 @@ namespace ZeroShugan.ShuganUnityTools
             _displayProgress  = 0f;
             _currentStepLabel = "Restoring rig in Blender…";
             lock (_outputLock) _outputQueue.Clear();
+            BeginRunLog("restore");
 
             string pythonCode = BlenderBridge.BuildRestoreFeetScript(
                 sourceFbxAbs, targetMesh, sourceFbxAbs, scriptPath, jsonPath,
@@ -569,7 +587,7 @@ namespace ZeroShugan.ShuganUnityTools
 
             _blenderProcess = BlenderBridge.LaunchBlenderProcess(
                 blenderPath, pythonCode, headless: true, factoryStartup: true,
-                onOutputLine: line => { lock (_outputLock) _outputQueue.Enqueue(line); });
+                onOutputLine: EnqueueLine);
 
             if (_blenderProcess == null)
             {
@@ -995,6 +1013,9 @@ namespace ZeroShugan.ShuganUnityTools
                 backupJsonPath = Path.Combine(backupDir, $"{fbxName}_rigbackup_{stamp}.json");
             }
 
+            // Capture the full Blender console (stdout+stderr) to a log file for debugging.
+            BeginRunLog("autorig");
+
             string sourceFbxAbs = ToAbsPath(AssetDatabase.GetAssetPath(_sourceFbxAsset));
             string pythonCode   = BlenderBridge.BuildAutoRigFeetScript(
                 sourceFbxAbs, targetMesh, _exportPath, scriptPath,
@@ -1003,7 +1024,7 @@ namespace ZeroShugan.ShuganUnityTools
 
             _blenderProcess = BlenderBridge.LaunchBlenderProcess(
                 blenderPath, pythonCode, headless: true, factoryStartup: true,
-                onOutputLine: line => { lock (_outputLock) _outputQueue.Enqueue(line); });
+                onOutputLine: EnqueueLine);
 
             if (_blenderProcess == null)
             {
@@ -1169,6 +1190,51 @@ namespace ZeroShugan.ShuganUnityTools
                     }
                 }
             }
+        }
+
+        // ─── Run log capture (full Blender console → file) ─────────────────────
+
+        // Called on the Blender process's output thread for every stdout/stderr line.
+        void EnqueueLine(string line)
+        {
+            lock (_outputLock)
+            {
+                _outputQueue.Enqueue(line);
+                if (_runLog != null) _runLog.AppendLine(line);
+            }
+        }
+
+        void BeginRunLog(string kind)
+        {
+            _runLog = new StringBuilder();
+            try
+            {
+                string dir = Path.Combine(SourceFbxAbsDir(), "_Backups");
+                Directory.CreateDirectory(dir);
+                string fbxName = _sourceFbxAsset != null
+                    ? Path.GetFileNameWithoutExtension(AssetDatabase.GetAssetPath(_sourceFbxAsset))
+                    : "unknown";
+                _runLogPath = Path.Combine(dir,
+                    $"{fbxName}_{kind}_log_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+            }
+            catch { _runLogPath = null; }
+        }
+
+        void WriteRunLog()
+        {
+            if (_runLog == null || string.IsNullOrEmpty(_runLogPath)) { _runLog = null; return; }
+            try
+            {
+                string text;
+                lock (_outputLock) text = _runLog.ToString();
+                File.WriteAllText(_runLogPath, text);
+                UnityEngine.Debug.Log("[AutoRig Feet] Blender console log saved:\n" + _runLogPath);
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning("[AutoRig Feet] Could not write Blender log: " + ex.Message);
+            }
+            _runLog = null;
         }
 
         // ─── Avatar / FBX detection ────────────────────────────────────────────

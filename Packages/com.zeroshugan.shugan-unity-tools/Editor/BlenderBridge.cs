@@ -812,7 +812,8 @@ print('[BlenderBridge] Restore complete.')
 
             var proc = new Process { StartInfo = psi };
             proc.OutputDataReceived += (_, e) => { if (e.Data != null) onOutputLine?.Invoke(e.Data); };
-            proc.ErrorDataReceived  += (_, e) => { /* discard stderr */ };
+            // Forward stderr too (Blender/Python tracebacks go here) so logs capture failures.
+            proc.ErrorDataReceived  += (_, e) => { if (e.Data != null) onOutputLine?.Invoke("[stderr] " + e.Data); };
             proc.Start();
             proc.BeginOutputReadLine();
             proc.BeginErrorReadLine();
