@@ -31,7 +31,12 @@ namespace ZeroShugan.ShuganUnityTools
         List<string> _currentDeps = new List<string>();
         HashSet<string> _addedSinceRefresh   = new HashSet<string>();
         HashSet<string> _removedSinceRefresh = new HashSet<string>();
+        HashSet<string> _removedPaths        = new HashSet<string>();  // asset paths of removed deps
         bool _hasRefreshed;
+
+        // Tree filter: show everything, or only the new / only the removed dependencies.
+        enum DepFilter { All, NewOnly, RemovedOnly }
+        DepFilter _depFilter = DepFilter.All;
 
         // Folder-tree view of the dependencies (like Unity's native Export Package window).
         DepNode _depTree;
@@ -119,11 +124,19 @@ namespace ZeroShugan.ShuganUnityTools
             if (picked != current && picked >= 0 && picked < presets.Count)
                 SelectPreset(presets[picked]);
 
-            if (_preset != null && GUILayout.Button("Ping", GUILayout.Width(48)))
-                EditorGUIUtility.PingObject(_preset);
             if (_preset != null && GUILayout.Button("Delete", GUILayout.Width(60)))
                 DeleteCurrentPreset();
             EditorGUILayout.EndHorizontal();
+
+            // Direct reference to the selected preset: drag a preset here to select it, or click the
+            // value to ping/highlight it in the Project window.
+            EditorGUI.BeginChangeCheck();
+            var dropped = (PackageExportPreset)EditorGUILayout.ObjectField(
+                new GUIContent("Selected Preset",
+                    "Drag a preset here to select it, or click it to highlight the asset in the Project."),
+                _preset, typeof(PackageExportPreset), false);
+            if (EditorGUI.EndChangeCheck() && dropped != null && dropped != _preset)
+                SelectPreset(dropped);
 
             EditorGUILayout.BeginHorizontal();
             _newPresetName = EditorGUILayout.TextField(_newPresetName);
@@ -206,8 +219,10 @@ namespace ZeroShugan.ShuganUnityTools
                 return;
             }
 
+            bool hasDiff = _addedSinceRefresh.Count > 0 || _removedPaths.Count > 0;
+
             // Diff summary since last refresh
-            if (_addedSinceRefresh.Count > 0 || _removedSinceRefresh.Count > 0)
+            if (hasDiff)
             {
                 Color c = GUI.color;
                 if (_addedSinceRefresh.Count > 0)
@@ -215,16 +230,29 @@ namespace ZeroShugan.ShuganUnityTools
                     GUI.color = new Color(0.5f, 1f, 0.5f);
                     EditorGUILayout.LabelField($"+ {_addedSinceRefresh.Count} new dependency(ies) since last refresh", EditorStyles.miniLabel);
                 }
-                if (_removedSinceRefresh.Count > 0)
+                if (_removedPaths.Count > 0)
                 {
                     GUI.color = new Color(1f, 0.55f, 0.55f);
-                    EditorGUILayout.LabelField($"− {_removedSinceRefresh.Count} dependency(ies) no longer present", EditorStyles.miniLabel);
+                    EditorGUILayout.LabelField($"− {_removedPaths.Count} dependency(ies) removed (shown in red, not exported)", EditorStyles.miniLabel);
                 }
                 GUI.color = c;
             }
 
             int included = _currentDeps.Count(p => !IsExcluded(p));
             EditorGUILayout.LabelField($"{included} / {_currentDeps.Count} dependencies included", EditorStyles.miniLabel);
+
+            // Filter row — only meaningful when there's a diff to look at.
+            if (hasDiff)
+            {
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.Label("Show:", GUILayout.Width(40));
+                DrawFilterToggle("All", DepFilter.All);
+                DrawFilterToggle($"New (+{_addedSinceRefresh.Count})", DepFilter.NewOnly);
+                DrawFilterToggle($"Removed (−{_removedPaths.Count})", DepFilter.RemovedOnly);
+                GUILayout.FlexibleSpace();
+                EditorGUILayout.EndHorizontal();
+            }
+            else _depFilter = DepFilter.All;
 
             EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button("Include All", EditorStyles.miniButton, GUILayout.Width(82)))
@@ -251,6 +279,10 @@ namespace ZeroShugan.ShuganUnityTools
                          .OrderByDescending(c => c.isFolder)
                          .ThenBy(c => c.name, System.StringComparer.OrdinalIgnoreCase))
             {
+                // Apply the New/Removed filter: skip files and empty folders that don't match.
+                if (child.isFolder) { if (!FolderHasVisibleLeaf(child)) continue; }
+                else if (!LeafMatchesFilter(child)) continue;
+
                 EditorGUILayout.BeginHorizontal();
                 GUILayout.Space(indent * 14f);
 
@@ -276,6 +308,23 @@ namespace ZeroShugan.ShuganUnityTools
                     EditorGUILayout.EndHorizontal();
 
                     if (!collapsed) DrawDepNode(child, indent + 1);
+                }
+                else if (_removedPaths.Contains(child.filePath))
+                {
+                    // Removed dependency: red, NOT checkable, not exported. Click pings the asset.
+                    GUILayout.Space(16); // placeholder where the checkbox would be
+                    var icon = AssetDatabase.GetCachedIcon(child.filePath);
+                    if (icon != null) GUILayout.Label(icon, GUILayout.Width(16), GUILayout.Height(16));
+
+                    Color c = GUI.color;
+                    GUI.color = new Color(1f, 0.5f, 0.5f);
+                    if (GUILayout.Button(new GUIContent("− " + child.name + "   (removed)", child.filePath), EditorStyles.label))
+                    {
+                        var obj = AssetDatabase.LoadMainAssetAtPath(child.filePath);
+                        if (obj != null) EditorGUIUtility.PingObject(obj);
+                    }
+                    GUI.color = c;
+                    EditorGUILayout.EndHorizontal();
                 }
                 else
                 {
@@ -305,6 +354,34 @@ namespace ZeroShugan.ShuganUnityTools
                     EditorGUILayout.EndHorizontal();
                 }
             }
+        }
+
+        void DrawFilterToggle(string label, DepFilter f)
+        {
+            bool on = _depFilter == f;
+            Color prev = GUI.backgroundColor;
+            if (on) GUI.backgroundColor = new Color(0.5f, 0.7f, 1f);
+            if (GUILayout.Button(label, EditorStyles.miniButton))
+                _depFilter = f;
+            GUI.backgroundColor = prev;
+        }
+
+        // Does this leaf pass the current New/Removed filter?
+        bool LeafMatchesFilter(DepNode leaf)
+        {
+            if (_depFilter == DepFilter.All) return true;
+            if (_depFilter == DepFilter.RemovedOnly) return _removedPaths.Contains(leaf.filePath);
+            // NewOnly
+            return _addedSinceRefresh.Contains(AssetDatabase.AssetPathToGUID(leaf.filePath));
+        }
+
+        // Does this folder contain at least one leaf visible under the current filter?
+        bool FolderHasVisibleLeaf(DepNode folder)
+        {
+            if (_depFilter == DepFilter.All) return true;
+            foreach (var leaf in Leaves(folder))
+                if (LeafMatchesFilter(leaf)) return true;
+            return false;
         }
 
         static DepNode BuildDepTree(List<string> paths)
@@ -345,6 +422,7 @@ namespace ZeroShugan.ShuganUnityTools
             int total = 0, inc = 0;
             foreach (var leaf in Leaves(folder))
             {
+                if (_removedPaths.Contains(leaf.filePath)) continue; // removed deps aren't selectable
                 total++;
                 if (!_preset.excludedDependencyGuids.Contains(AssetDatabase.AssetPathToGUID(leaf.filePath))) inc++;
             }
@@ -355,6 +433,7 @@ namespace ZeroShugan.ShuganUnityTools
         {
             foreach (var leaf in Leaves(folder))
             {
+                if (_removedPaths.Contains(leaf.filePath)) continue; // can't toggle removed deps
                 string guid = AssetDatabase.AssetPathToGUID(leaf.filePath);
                 if (include) _preset.excludedDependencyGuids.Remove(guid);
                 else if (!_preset.excludedDependencyGuids.Contains(guid)) _preset.excludedDependencyGuids.Add(guid);
@@ -396,12 +475,20 @@ namespace ZeroShugan.ShuganUnityTools
         {
             var rootPaths = GetRootPaths();
             _currentDeps = ComputeDependencies(rootPaths);
-            _depTree = BuildDepTree(_currentDeps);
 
             var currentGuids = new HashSet<string>(_currentDeps.Select(AssetDatabase.AssetPathToGUID));
             var last = new HashSet<string>(_preset.lastKnownDependencyGuids);
             _addedSinceRefresh   = new HashSet<string>(currentGuids.Where(g => !last.Contains(g)));
             _removedSinceRefresh = new HashSet<string>(last.Where(g => !currentGuids.Contains(g)));
+
+            // Resolve removed-dependency GUIDs back to asset paths (only those still on disk), so they
+            // can be shown (red, not exported) in the tree alongside the current dependencies.
+            _removedPaths = new HashSet<string>(_removedSinceRefresh
+                .Select(AssetDatabase.GUIDToAssetPath)
+                .Where(p => !string.IsNullOrEmpty(p) && p.StartsWith("Assets/")));
+
+            _depTree = BuildDepTree(_currentDeps.Concat(_removedPaths).Distinct().ToList());
+            _depFilter = DepFilter.All;
 
             // Drop exclusions that no longer correspond to a real dependency.
             _preset.excludedDependencyGuids.RemoveAll(g => !currentGuids.Contains(g));
@@ -410,7 +497,7 @@ namespace ZeroShugan.ShuganUnityTools
             MarkPresetDirty();
 
             SetStatus($"Found {_currentDeps.Count} dependencies " +
-                      $"(+{_addedSinceRefresh.Count} new, −{_removedSinceRefresh.Count} gone).", MessageType.Info);
+                      $"(+{_addedSinceRefresh.Count} new, −{_removedPaths.Count} removed).", MessageType.Info);
         }
 
         void ExportPackage()
@@ -476,6 +563,8 @@ namespace ZeroShugan.ShuganUnityTools
             _hasRefreshed = false;
             _addedSinceRefresh.Clear();
             _removedSinceRefresh.Clear();
+            _removedPaths.Clear();
+            _depFilter = DepFilter.All;
             _currentDeps.Clear();
             _status = "";
         }

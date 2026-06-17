@@ -26,6 +26,7 @@ namespace ZeroShugan.ShuganUnityTools
         const string PrefSwapMethod           = "ShuganTools_ARF_SwapMethod";
         const string PrefGarments             = "ShuganTools_ARF_Garments";
         const string PrefBackupEnabled        = "ShuganTools_ARF_BackupEnabled";
+        const string PrefAutoMapFeet          = "ShuganTools_ARF_AutoMapFeet";
 
         // ─── Paid-content paths (installed via Shugan store bundle) ───────────
         const string DefaultAutoRigScriptPath = "Assets/! Shugan/!_Lab/Script/shugan_autorig_feet.py";
@@ -62,6 +63,11 @@ namespace ZeroShugan.ShuganUnityTools
         // ─── Rig backup (JSON) ────────────────────────────────────────────────
         bool _backupEnabled = true;   // capture a rig-only JSON backup before each run (Advanced)
         int  _restoreIndex;            // selected backup in the Restore dropdown
+
+        // ─── Humanoid auto-map ────────────────────────────────────────────────
+        // After the rigged FBX is back in Unity, ensure its humanoid foot/toe bones are mapped
+        // (calls HumanoidRigMapping; fills only missing slots, never replaces existing mappings).
+        bool _autoMapFeet = true;
 
         // ─── Run log (full Blender stdout+stderr → file, for debugging) ───────
         StringBuilder _runLog;
@@ -143,6 +149,7 @@ namespace ZeroShugan.ShuganUnityTools
                 : garments.Split('|').Where(s => !string.IsNullOrEmpty(s)).ToList();
 
             _backupEnabled = EditorPrefs.GetBool(PrefBackupEnabled, true);
+            _autoMapFeet   = EditorPrefs.GetBool(PrefAutoMapFeet, true);
 
             if (_prefabsToAdd.Count == 0)
                 foreach (string p in DefaultPrefabPaths)
@@ -190,6 +197,7 @@ namespace ZeroShugan.ShuganUnityTools
                     _blenderProcess = null;
                     WriteRunLog();
                     AssetDatabase.Refresh();
+                    if (_autoMapFeet) AutoMapHumanoidFeet();   // ensure humanoid foot/toes on the new FBX
                     _state = State.FBXSwapping;
                 }
                 Repaint();
@@ -271,7 +279,8 @@ namespace ZeroShugan.ShuganUnityTools
             ShuganToolUI.DrawHeader("AutoRig Feet  —  Distributor");
             ShuganToolUI.DrawSocialLinks(WikiUrl);
             EditorGUILayout.Space(4);
-            DrawRunButton();   // top run button (mirrors the one at the bottom)
+            DrawRunButton();             // single run button, at the top
+            DrawProgressBarIfActive();   // loading bar lives under the top button
             Separator();
             DrawDependencyStatus();
             Separator();
@@ -281,14 +290,7 @@ namespace ZeroShugan.ShuganUnityTools
 
             EditorGUILayout.EndScrollView();
 
-            DrawProgressBarIfActive();
-
-            bool ready = IsReady();
-
-            EditorGUILayout.Space(4);
-            DrawRunButton();
-
-            DrawReadinessHints(ready);
+            DrawReadinessHints(IsReady());
 
             if (_alreadyRigged && _state == State.Idle)
             {
@@ -321,7 +323,7 @@ namespace ZeroShugan.ShuganUnityTools
             ShuganToolUI.DrawCredits("AutoRig Feet (Distributor)", ToolVersion);
         }
 
-        // The green "AutoRig Feet" run button — drawn at both the top and bottom of the window.
+        // The green "AutoRig Feet" run button — drawn once, at the top of the window.
         void DrawRunButton()
         {
             bool busy  = _state != State.Idle && _state != State.Done && _state != State.Error;
@@ -811,6 +813,20 @@ namespace ZeroShugan.ShuganUnityTools
 
             Separator();
 
+            // ── Humanoid auto-map ────────────────────────────────────────────
+            GUILayout.Label("Humanoid", EditorStyles.boldLabel);
+            EditorGUI.BeginChangeCheck();
+            _autoMapFeet = EditorGUILayout.ToggleLeft(
+                new GUIContent("Auto-map feet/toes to Humanoid (after rig)",
+                    "After the rigged FBX returns to Unity, ensure its humanoid Foot/Toes bones are "
+                    + "mapped (sets the FBX to Humanoid if needed). Only fills slots Unity left empty — "
+                    + "never replaces bones you've already mapped. Uses the Humanoid Rig Mapping tool."),
+                _autoMapFeet);
+            if (EditorGUI.EndChangeCheck())
+                EditorPrefs.SetBool(PrefAutoMapFeet, _autoMapFeet);
+
+            Separator();
+
             // ── FBX Swap method ──────────────────────────────────────────────
             GUILayout.Label("FBX Swap", EditorStyles.boldLabel);
             EditorGUI.BeginChangeCheck();
@@ -1189,6 +1205,24 @@ namespace ZeroShugan.ShuganUnityTools
                         }
                     }
                 }
+            }
+        }
+
+        // After Blender returns the rigged FBX, ensure its humanoid Foot/Toes bones are mapped.
+        // Fills only missing slots (never replaces existing mappings); sets the FBX to Humanoid if
+        // needed. Failures are non-fatal — the rest of the pipeline continues.
+        void AutoMapHumanoidFeet()
+        {
+            try
+            {
+                string rel = ToProjectRelative(_exportPath);
+                if (string.IsNullOrEmpty(rel) || !rel.StartsWith("Assets")) return;
+                var res = HumanoidRigMapping.EnsureFeetAndToesMapped(rel, replaceLowConfidence: false, removeJaw: false);
+                UnityEngine.Debug.Log($"[AutoRig Feet] Humanoid auto-map ({System.IO.Path.GetFileName(rel)}): {res.message}");
+            }
+            catch (Exception e)
+            {
+                UnityEngine.Debug.LogWarning("[AutoRig Feet] Humanoid auto-map skipped: " + e.Message);
             }
         }
 

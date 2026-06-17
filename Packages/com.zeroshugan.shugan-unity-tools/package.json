@@ -1,9 +1,9 @@
 {
   "name": "com.zeroshugan.shugan-unity-tools",
   "displayName": "Shugan Unity Tools",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "unity": "2022.3",
-  "description": "Avatar editor toolkit for VRChat: DisplaceComponent (build-time mesh displacement), Animation Clip Batch Editor, FBX Swapper, PhysBone Constraint Helper, Add Prefabs, Blender Bridge, AutoRig Feet Distributor, and Package Exporter.",
+  "description": "Avatar editor toolkit for VRChat: DisplaceComponent (build-time mesh displacement), Animation Clip Batch Editor, FBX Swapper, PhysBone Constraint Helper, Add Prefabs, Blender Bridge, AutoRig Feet Distributor, Humanoid Rig Mapping, and Package Exporter.",
   "author": {
     "name": "ZeroShugan",
     "url": "https://github.com/ZeroShugan"
