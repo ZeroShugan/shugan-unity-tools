@@ -5,9 +5,12 @@
 // ║   Exposes a static API so other tools can ensure feet/toes are mapped.║
 // ╚══════════════════════════════════════════════════════════════════════╝
 
+using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using UnityEditor;
 using UnityEngine;
 
@@ -20,12 +23,18 @@ namespace ZeroShugan.ShuganUnityTools
         const string WIKI_URL     = "https://www.notion.so/shugan/Humanoid-Rig-Mapping";
 
         // ── Keyword tables (ported from the AutoRig Feet detector) ───────────────
-        static readonly string[] FOOT_PRIMARY   = { "foot", "feet", "ankle", "talus", "heel" };
+        // Substring match (lowercased), so English + romaji + CJK all work. Kept specific to avoid
+        // false positives (e.g. no bare 足/あし — ambiguous between leg and foot).
+        static readonly string[] FOOT_PRIMARY   = { "foot", "feet", "ankle", "talus", "heel",
+                                                    "足首", "あしくび", "ashikubi", "踝", "脚踝", "발목" };
         static readonly string[] FOOT_SECONDARY = { "sole", "ball", "pad", "plantar" };
-        static readonly string[] TOE_PRIMARY    = { "toe", "toes", "digit", "phalange" };
+        static readonly string[] TOE_PRIMARY    = { "toe", "toes", "digit", "phalange",
+                                                    "つま先", "つまさき", "tsumasaki", "足指", "あしゆび", "ashiyubi", "趾", "脚趾", "발가락" };
         static readonly string[] TOE_SECONDARY  = { "tip", "knuckle" };
-        static readonly string[] LEG_KEYWORDS   = { "leg", "thigh", "knee", "calf", "shin", "femur", "tibia" };
-        static readonly string[] HIP_KEYWORDS   = { "hip", "pelvis", "root", "base" };
+        static readonly string[] LEG_KEYWORDS   = { "leg", "thigh", "knee", "calf", "shin", "femur", "tibia",
+                                                    "膝", "ひざ", "hiza", "もも", "太もも", "momo", "腿", "すね", "다리", "무릎" };
+        static readonly string[] HIP_KEYWORDS   = { "hip", "pelvis", "root", "base",
+                                                    "腰", "koshi", "ヒップ", "골반", "髋" };
 
         // Scoring weights / penalties (mirrors the Python WEIGHTS/PENALTIES).
         const float W_NAME_PRIMARY = 10f, W_NAME_SECONDARY = 3f, W_SIDE = 3f, W_DEPTH = 5f,
@@ -238,28 +247,7 @@ namespace ZeroShugan.ShuganUnityTools
 
             if (_target == null) return;
 
-            string directPath = AssetDatabase.GetAssetPath(_target);
-            if (IsModelPath(directPath)) _fbxPath = directPath;
-
-            if (string.IsNullOrEmpty(_fbxPath))
-            {
-                var animator = _target.GetComponentInChildren<Animator>(true);
-                if (animator != null && animator.avatar != null)
-                {
-                    string p = AssetDatabase.GetAssetPath(animator.avatar);
-                    if (IsModelPath(p)) _fbxPath = p;
-                }
-            }
-            if (string.IsNullOrEmpty(_fbxPath))
-            {
-                var smr = _target.GetComponentInChildren<SkinnedMeshRenderer>(true);
-                if (smr != null && smr.sharedMesh != null)
-                {
-                    string p = AssetDatabase.GetAssetPath(smr.sharedMesh);
-                    if (IsModelPath(p)) _fbxPath = p;
-                }
-            }
-            if (string.IsNullOrEmpty(_fbxPath)) return;
+            if (!TryResolveRigFbx(_target, out _fbxPath)) { _fbxPath = ""; return; }
 
             var importer = AssetImporter.GetAtPath(_fbxPath) as ModelImporter;
             _animType = importer != null ? importer.animationType : ModelImporterAnimationType.None;
@@ -339,7 +327,7 @@ namespace ZeroShugan.ShuganUnityTools
             { SetStatus("Cancelled.", MessageType.None); return; }
 
             // Manual tool = full policy: replace low-confidence picks + strip Jaw.
-            var r = EnsureFeetAndToesMapped(_fbxPath, replaceLowConfidence: true, removeJaw: true);
+            var r = EnsureFeetAndToesMapped(_fbxPath, replaceLowConfidence: true, removeJaw: true, logSource: "manual");
             Analyze();
             SetStatus(r.message + (r.avatarValid ? "" : "  Open Rig → Configure to finish remaining bones."),
                 r.avatarValid ? MessageType.Info : MessageType.Warning);
@@ -355,79 +343,195 @@ namespace ZeroShugan.ShuganUnityTools
         /// scorer, and (only if replaceLowConfidence) replaces Unity's mapped-but-weak picks. Never
         /// touches non-foot/toe bones. Optionally strips the Jaw. Reimports and reports the result.
         /// </summary>
-        public static MappingResult EnsureFeetAndToesMapped(string fbxPath, bool replaceLowConfidence = false, bool removeJaw = false)
+        public static MappingResult EnsureFeetAndToesMapped(string fbxPath, bool replaceLowConfidence = false,
+                                                            bool removeJaw = false, string logSource = "api")
         {
             var result = new MappingResult();
-            var importer = AssetImporter.GetAtPath(fbxPath) as ModelImporter;
-            if (importer == null) { result.message = "Not a model importer: " + fbxPath; return result; }
+            var log = new StringBuilder();
+            log.AppendLine("══════ Humanoid Rig Mapping ══════");
+            log.AppendLine($"time:   {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            log.AppendLine($"source: {logSource}   replaceLowConfidence: {replaceLowConfidence}   removeJaw: {removeJaw}");
+            log.AppendLine($"fbx:    {fbxPath}");
 
-            if (importer.animationType != ModelImporterAnimationType.Human)
+            try
             {
-                importer.animationType = ModelImporterAnimationType.Human;
-                importer.SaveAndReimport();
-                importer = AssetImporter.GetAtPath(fbxPath) as ModelImporter;
-            }
-
-            var scorer = Scorer.FromFbx(fbxPath);
-            var picks = new Dictionary<string, Transform>
-            {
-                { H_LFOOT, scorer.BestFoot("L") }, { H_RFOOT, scorer.BestFoot("R") },
-            };
-            picks[H_LTOES] = scorer.BestToe(picks[H_LFOOT], "L");
-            picks[H_RTOES] = scorer.BestToe(picks[H_RFOOT], "R");
-
-            var desc  = importer.humanDescription;
-            var human = desc.human != null ? desc.human.ToList() : new List<HumanBone>();
-
-            int changed = 0;
-            foreach (var kv in picks)
-            {
-                if (kv.Value == null) continue;
-                int idx = human.FindIndex(h => h.humanName == kv.Key);
-                string unityBone = idx >= 0 ? human[idx].boneName : "";
-
-                bool doOverride;
-                if (string.IsNullOrEmpty(unityBone)) doOverride = true;           // fill empty
-                else if (!replaceLowConfidence)      doOverride = false;           // keep already-mapped
-                else
+                var importer = AssetImporter.GetAtPath(fbxPath) as ModelImporter;
+                if (importer == null)
                 {
-                    Transform unityT = scorer.FindBone(unityBone);
-                    bool isToe = kv.Key == H_LTOES || kv.Key == H_RTOES;
-                    Transform foot = kv.Key == H_LTOES ? picks[H_LFOOT] : kv.Key == H_RTOES ? picks[H_RFOOT] : null;
-                    float ourScore   = isToe ? scorer.ScoreToe(kv.Value, foot) : scorer.ScoreFoot(kv.Value, SideOf(kv.Value));
-                    float unityScore = unityT != null ? (isToe ? scorer.ScoreToe(unityT, foot) : scorer.ScoreFoot(unityT, SideOf(unityT))) : -999f;
-                    doOverride = kv.Value != unityT && ourScore >= OVERRIDE_MIN_CONF && ourScore >= unityScore + OVERRIDE_MARGIN;
+                    result.message = "Not a model importer: " + fbxPath;
+                    log.AppendLine("ERROR: " + result.message);
+                    WriteLog(fbxPath, logSource, log);
+                    return result;
                 }
-                if (!doOverride) continue;
 
-                if (idx >= 0) { var hb = human[idx]; hb.boneName = kv.Value.name; human[idx] = hb; }
-                else          human.Add(NewHumanBone(kv.Key, kv.Value.name));
-                changed++;
+                log.AppendLine($"animType (before): {importer.animationType}");
+                if (importer.animationType != ModelImporterAnimationType.Human)
+                {
+                    importer.animationType = ModelImporterAnimationType.Human;
+                    importer.SaveAndReimport();
+                    importer = AssetImporter.GetAtPath(fbxPath) as ModelImporter;
+                    log.AppendLine("→ set animationType = Human, reimported");
+                }
+
+                var scorer = Scorer.FromFbx(fbxPath);
+                log.AppendLine($"armature: {scorer.armatureName}   bones: {scorer.bones.Length}   maxInfluence: {scorer.maxInf:0.###}");
+
+                var picks = new Dictionary<string, Transform>
+                {
+                    { H_LFOOT, scorer.BestFoot("L") }, { H_RFOOT, scorer.BestFoot("R") },
+                };
+                picks[H_LTOES] = scorer.BestToe(picks[H_LFOOT], "L");
+                picks[H_RTOES] = scorer.BestToe(picks[H_RFOOT], "R");
+
+                log.AppendLine("\n-- ranked candidates (name=score) --");
+                log.AppendLine("LeftFoot:  " + RankStr(scorer.RankFeet("L")));
+                log.AppendLine("RightFoot: " + RankStr(scorer.RankFeet("R")));
+                log.AppendLine("LeftToes:  " + RankStr(scorer.RankToes(picks[H_LFOOT], "L")));
+                log.AppendLine("RightToes: " + RankStr(scorer.RankToes(picks[H_RFOOT], "R")));
+                log.AppendLine("chosen: " + string.Join(", ", picks.Select(kv => $"{kv.Key}={(kv.Value != null ? kv.Value.name : "—")}")));
+
+                var desc  = importer.humanDescription;
+                var human = desc.human != null ? desc.human.ToList() : new List<HumanBone>();
+                log.AppendLine($"\nimporter skeleton (before): {(desc.skeleton != null ? desc.skeleton.Length : 0)} bones");
+
+                log.AppendLine("\n-- slot decisions --");
+                int changed = 0;
+                foreach (var kv in picks)
+                {
+                    if (kv.Value == null) { log.AppendLine($"{kv.Key}: no candidate → skip"); continue; }
+                    int idx = human.FindIndex(h => h.humanName == kv.Key);
+                    string unityBone = idx >= 0 ? human[idx].boneName : "";
+
+                    bool doOverride; string why;
+                    if (string.IsNullOrEmpty(unityBone)) { doOverride = true; why = "Unity empty → fill with " + kv.Value.name; }
+                    else if (!replaceLowConfidence)      { doOverride = false; why = $"keep Unity '{unityBone}' (replaceLowConfidence off)"; }
+                    else
+                    {
+                        Transform unityT = scorer.FindBone(unityBone);
+                        bool isToe = kv.Key == H_LTOES || kv.Key == H_RTOES;
+                        Transform foot = kv.Key == H_LTOES ? picks[H_LFOOT] : kv.Key == H_RTOES ? picks[H_RFOOT] : null;
+                        float ourScore   = isToe ? scorer.ScoreToe(kv.Value, foot) : scorer.ScoreFoot(kv.Value, SideOf(kv.Value));
+                        float unityScore = unityT != null ? (isToe ? scorer.ScoreToe(unityT, foot) : scorer.ScoreFoot(unityT, SideOf(unityT))) : -999f;
+                        doOverride = kv.Value != unityT && ourScore >= OVERRIDE_MIN_CONF && ourScore >= unityScore + OVERRIDE_MARGIN;
+                        why = $"unity='{unityBone}'({unityScore:0.0}) vs ours='{kv.Value.name}'({ourScore:0.0}) → {(doOverride ? "replace" : "keep")}";
+                    }
+                    log.AppendLine($"{kv.Key}: {why}");
+                    if (!doOverride) continue;
+
+                    if (idx >= 0) { var hb = human[idx]; hb.boneName = kv.Value.name; human[idx] = hb; }
+                    else          human.Add(NewHumanBone(kv.Key, kv.Value.name));
+                    changed++;
+                }
+
+                if (removeJaw)
+                {
+                    int jawIdx = human.FindIndex(h => h.humanName == H_JAW);
+                    result.jawRemoved = jawIdx >= 0 && !string.IsNullOrEmpty(human[jawIdx].boneName);
+                    human.RemoveAll(h => h.humanName == H_JAW);
+                    log.AppendLine("jaw: " + (result.jawRemoved ? "removed" : "not mapped, nothing to remove"));
+                }
+
+                // ── THE FIX: write a COMPLETE skeleton[] so every referenced boneName resolves. ──
+                // Without this, Unity fails with "Transform 'X' not found in HumanDescription".
+                desc.human    = human.ToArray();
+                desc.skeleton = BuildSkeleton(scorer.bones);
+                log.AppendLine($"skeleton written: {desc.skeleton.Length} bones");
+                importer.humanDescription = desc;
+                importer.SaveAndReimport();
+
+                var avatar = AssetDatabase.LoadAllAssetsAtPath(fbxPath).OfType<Avatar>().FirstOrDefault();
+                result.avatarValid = avatar != null && avatar.isValid && avatar.isHuman;
+                result.slotsMapped = changed;
+
+                var finalMap = human.GroupBy(h => h.humanName).ToDictionary(g => g.Key, g => g.First().boneName);
+                result.feetToesComplete = new[] { H_LFOOT, H_RFOOT, H_LTOES, H_RTOES }
+                    .All(k => finalMap.TryGetValue(k, out var b) && !string.IsNullOrEmpty(b));
+
+                log.AppendLine("\n-- final foot/toe map --");
+                foreach (var k in new[] { H_LFOOT, H_RFOOT, H_LTOES, H_RTOES })
+                    log.AppendLine($"{k} = {(finalMap.TryGetValue(k, out var bn) && !string.IsNullOrEmpty(bn) ? bn : "(none)")}");
+                log.AppendLine($"avatar valid: {result.avatarValid}");
+
+                result.message = $"Humanoid map: {changed} foot/toe slot(s) set" +
+                                 (result.jawRemoved ? ", Jaw removed" : "") +
+                                 $"; avatar {(result.avatarValid ? "valid ✓" : "INVALID")}.";
+                log.AppendLine("result: " + result.message);
             }
-
-            if (removeJaw)
+            catch (Exception e)
             {
-                int jawIdx = human.FindIndex(h => h.humanName == H_JAW);
-                result.jawRemoved = jawIdx >= 0 && !string.IsNullOrEmpty(human[jawIdx].boneName);
-                human.RemoveAll(h => h.humanName == H_JAW);
+                result.message = "Humanoid map FAILED: " + e.Message;
+                log.AppendLine("\nEXCEPTION:\n" + e);
             }
 
-            desc.human = human.ToArray();
-            importer.humanDescription = desc;
-            importer.SaveAndReimport();
-
-            var avatar = AssetDatabase.LoadAllAssetsAtPath(fbxPath).OfType<Avatar>().FirstOrDefault();
-            result.avatarValid = avatar != null && avatar.isValid && avatar.isHuman;
-            result.slotsMapped = changed;
-
-            var finalMap = human.GroupBy(h => h.humanName).ToDictionary(g => g.Key, g => g.First().boneName);
-            result.feetToesComplete = new[] { H_LFOOT, H_RFOOT, H_LTOES, H_RTOES }
-                .All(k => finalMap.TryGetValue(k, out var b) && !string.IsNullOrEmpty(b));
-
-            result.message = $"Humanoid map: {changed} foot/toe slot(s) set" +
-                             (result.jawRemoved ? ", Jaw removed" : "") +
-                             $"; avatar {(result.avatarValid ? "valid ✓" : "INVALID")}.";
+            WriteLog(fbxPath, logSource, log);
             return result;
+        }
+
+        static string RankStr(List<(string name, float score)> ranked)
+            => ranked.Count == 0 ? "(none)" : string.Join("   ", ranked.Select(r => $"{r.name}={r.score:0.0}"));
+
+        // Complete skeleton[] for the HumanDescription (name + bind-pose local TRS for every bone).
+        static SkeletonBone[] BuildSkeleton(Transform[] bones)
+        {
+            var skel = new SkeletonBone[bones.Length];
+            for (int i = 0; i < bones.Length; i++)
+            {
+                var t = bones[i];
+                skel[i] = new SkeletonBone
+                {
+                    name = t.name,
+                    position = t.localPosition,
+                    rotation = t.localRotation,
+                    scale = t.localScale,
+                };
+            }
+            return skel;
+        }
+
+        const string LOGS_FOLDER = "Assets/! Shugan/!_Lab/Script/HumanoidRigMapping_Logs";
+        static void WriteLog(string fbxPath, string source, StringBuilder log)
+        {
+            try
+            {
+                string abs = Path.GetFullPath(Path.Combine(Application.dataPath, "..", LOGS_FOLDER));
+                Directory.CreateDirectory(abs);
+                string baseName = string.IsNullOrEmpty(fbxPath) ? "unknown" : Path.GetFileNameWithoutExtension(fbxPath);
+                string file = Path.Combine(abs, $"{baseName}_{source}_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                File.WriteAllText(file, log.ToString());
+                UnityEngine.Debug.Log($"[Humanoid Rig Mapping] Log saved:\n{LOGS_FOLDER}/{Path.GetFileName(file)}");
+            }
+            catch (Exception e)
+            {
+                UnityEngine.Debug.LogWarning("[Humanoid Rig Mapping] Could not write log: " + e.Message);
+            }
+        }
+
+        /// <summary>
+        /// Resolve the rig FBX path for an object: a model asset → its own path; a scene avatar root →
+        /// its Animator.avatar's FBX, else the first SkinnedMeshRenderer's FBX. Returns a project path.
+        /// </summary>
+        public static bool TryResolveRigFbx(GameObject obj, out string fbxPath)
+        {
+            fbxPath = "";
+            if (obj == null) return false;
+
+            string direct = AssetDatabase.GetAssetPath(obj);
+            if (IsModelPath(direct)) { fbxPath = direct; return true; }
+
+            var animator = obj.GetComponentInChildren<Animator>(true);
+            if (animator != null && animator.avatar != null)
+            {
+                string p = AssetDatabase.GetAssetPath(animator.avatar);
+                if (IsModelPath(p)) { fbxPath = p; return true; }
+            }
+
+            var smr = obj.GetComponentInChildren<SkinnedMeshRenderer>(true);
+            if (smr != null && smr.sharedMesh != null)
+            {
+                string p = AssetDatabase.GetAssetPath(smr.sharedMesh);
+                if (IsModelPath(p)) { fbxPath = p; return true; }
+            }
+            return false;
         }
 
         /// <summary>True if the FBX's avatar already has all foot + toe humanoid slots mapped.</summary>
@@ -524,7 +628,9 @@ namespace ZeroShugan.ShuganUnityTools
             {
                 if (t == null) return -1000f;
                 string n = t.name.ToLowerInvariant();
-                if (maxInf > 0 && Influence(t) < MIN_INFLUENCE) return -1000f;
+                // NOTE: do NOT reject zero-influence here — the real humanoid toe bone is often a
+                // weightless connector (its skin weights moved to the AutoRig z_CB bones). Influence
+                // stays only as a positive bonus; hierarchy (parent==foot) carries the decision.
                 float score = 0f;
                 if (HasAny(n, TOE_PRIMARY))   score += W_NAME_PRIMARY;
                 if (HasAny(n, TOE_SECONDARY)) score += W_NAME_SECONDARY;
@@ -554,17 +660,41 @@ namespace ZeroShugan.ShuganUnityTools
             public Transform BestToe(Transform foot, string side)
             {
                 if (foot == null) return null;
+
+                // Primary: best ORIGINAL toe bone under the foot (exclude AutoRig-added bones + _end
+                // leaf bones) so we map the humanoid Toe, not a z_CB sub-bone.
                 Transform best = null; float bestScore = 1f;
                 foreach (var t in bones)
                 {
                     if (SideOf(t) != side) continue;
                     if (!IsDescendantOf(t, foot)) continue;
+                    if (IsAutoRigBone(t.name) || IsEndBone(t.name)) continue;
                     string n = t.name.ToLowerInvariant();
                     if (!HasAny(n, TOE_PRIMARY) && !HasAny(n, TOE_SECONDARY)) continue;
                     float sc = ScoreToe(t, foot);
                     if (sc > bestScore) { bestScore = sc; best = t; }
                 }
-                return best;
+                if (best != null) return best;
+
+                // Fallback: no original toe bone → use the AutoRig parent toe bone 'Toes_<side>'.
+                return FindBone("Toes_" + side);
+            }
+
+            // Ranked toe/foot candidates (for the debug log).
+            public List<(string name, float score)> RankFeet(string side)
+                => bones.Where(t => SideOf(t) == side &&
+                            (HasAny(t.name.ToLowerInvariant(), FOOT_PRIMARY) || HasAny(t.name.ToLowerInvariant(), FOOT_SECONDARY)))
+                        .Select(t => (t.name, ScoreFoot(t, side)))
+                        .OrderByDescending(x => x.Item2).Take(6).ToList();
+
+            public List<(string name, float score)> RankToes(Transform foot, string side)
+            {
+                if (foot == null) return new List<(string, float)>();
+                return bones.Where(t => SideOf(t) == side && IsDescendantOf(t, foot)
+                                && !IsAutoRigBone(t.name) && !IsEndBone(t.name)
+                                && (HasAny(t.name.ToLowerInvariant(), TOE_PRIMARY) || HasAny(t.name.ToLowerInvariant(), TOE_SECONDARY)))
+                            .Select(t => (t.name, ScoreToe(t, foot)))
+                            .OrderByDescending(x => x.Item2).Take(6).ToList();
             }
         }
 
@@ -606,6 +736,21 @@ namespace ZeroShugan.ShuganUnityTools
 
         static bool IsModelPath(string path)
             => !string.IsNullOrEmpty(path) && (AssetImporter.GetAtPath(path) is ModelImporter);
+
+        // Bones the AutoRig Feet script adds (never the original humanoid toe): z_CB *, Toes_L/R,
+        // Toes_a1_L/R. Matched by the conventions our own script always emits.
+        static bool IsAutoRigBone(string name)
+        {
+            string n = name.ToLowerInvariant().Trim();
+            return n.StartsWith("z_cb") || n.StartsWith("toes_");
+        }
+
+        // Leaf "_end" / "end" tail bones are never humanoid bones.
+        static bool IsEndBone(string name)
+        {
+            string n = name.ToLowerInvariant();
+            return n.EndsWith("_end") || n.EndsWith(".end") || n.EndsWith(" end");
+        }
 
         void SetStatus(string msg, MessageType type) { _status = msg; _statusType = type; }
 

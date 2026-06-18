@@ -197,7 +197,6 @@ namespace ZeroShugan.ShuganUnityTools
                     _blenderProcess = null;
                     WriteRunLog();
                     AssetDatabase.Refresh();
-                    if (_autoMapFeet) AutoMapHumanoidFeet();   // ensure humanoid foot/toes on the new FBX
                     _state = State.FBXSwapping;
                 }
                 Repaint();
@@ -250,6 +249,8 @@ namespace ZeroShugan.ShuganUnityTools
                     _displayProgress  = _exportMode == ExportMode.Duplicate ? 0.92f : 0.95f;
                     Repaint();
                     RunAddPrefabs();
+                    // End of pipeline: ensure the FINAL scene avatar's FBX has humanoid foot/toes mapped.
+                    if (_autoMapFeet) AutoMapHumanoidFeet();
                     _displayProgress  = 1f;
                     _state            = State.Done;
                     _currentStepLabel = "Done!";
@@ -1208,17 +1209,26 @@ namespace ZeroShugan.ShuganUnityTools
             }
         }
 
-        // After Blender returns the rigged FBX, ensure its humanoid Foot/Toes bones are mapped.
-        // Fills only missing slots (never replaces existing mappings); sets the FBX to Humanoid if
-        // needed. Failures are non-fatal — the rest of the pipeline continues.
+        // End of pipeline: ensure the FINAL scene avatar's FBX has its humanoid Foot/Toes mapped.
+        // Resolves the FBX from the result instance (the avatar that ends up in the scene), fills only
+        // missing slots (never replaces existing mappings), sets Humanoid if needed. Non-fatal.
         void AutoMapHumanoidFeet()
         {
             try
             {
-                string rel = ToProjectRelative(_exportPath);
-                if (string.IsNullOrEmpty(rel) || !rel.StartsWith("Assets")) return;
-                var res = HumanoidRigMapping.EnsureFeetAndToesMapped(rel, replaceLowConfidence: false, removeJaw: false);
-                UnityEngine.Debug.Log($"[AutoRig Feet] Humanoid auto-map ({System.IO.Path.GetFileName(rel)}): {res.message}");
+                if (_resultInstance == null)
+                {
+                    UnityEngine.Debug.LogWarning("[AutoRig Feet] Humanoid auto-map skipped: no result avatar.");
+                    return;
+                }
+                if (!HumanoidRigMapping.TryResolveRigFbx(_resultInstance, out string fbxPath))
+                {
+                    UnityEngine.Debug.LogWarning("[AutoRig Feet] Humanoid auto-map skipped: couldn't resolve the avatar's FBX.");
+                    return;
+                }
+                var res = HumanoidRigMapping.EnsureFeetAndToesMapped(
+                    fbxPath, replaceLowConfidence: false, removeJaw: false, logSource: "autorig");
+                UnityEngine.Debug.Log($"[AutoRig Feet] Humanoid auto-map ({System.IO.Path.GetFileName(fbxPath)}): {res.message}");
             }
             catch (Exception e)
             {
