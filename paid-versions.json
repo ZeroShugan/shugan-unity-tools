@@ -1,0 +1,9 @@
+{
+  "autorig_feet_bundle": {
+    "version": "3.8.8",
+    "store": "https://shugan.booth.pm/",
+    "changes": [
+      "3.8.8: buyer-protection update — typed issue reporting, pre-flight checks, foot-bone overrides, clean re-rig support"
+    ]
+  }
+}
