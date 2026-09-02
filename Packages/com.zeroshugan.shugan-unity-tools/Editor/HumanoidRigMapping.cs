@@ -534,6 +534,31 @@ namespace ZeroShugan.ShuganUnityTools
             return false;
         }
 
+        /// <summary>
+        /// Ranked foot-bone candidates for one side ("L"/"R") of an FBX, best first — for the
+        /// AutoRig Feet foot-bone picker. Unlike the internal BestFoot, this lists ALL bones of
+        /// that side (not only keyword matches), so rigs with unusual names still get a usable
+        /// dropdown; the scoring simply puts the most foot-like bones on top.
+        /// </summary>
+        public static List<(string name, float score)> RankFootCandidates(string fbxPath, string side, int max = 30)
+        {
+            var result = new List<(string, float)>();
+            if (string.IsNullOrEmpty(fbxPath)) return result;
+            var s = Scorer.FromFbx(fbxPath);
+            return s.bones
+                .Where(t => t != null && t.parent != null && SideOf(t) == side)
+                .Select(t => (t.name, s.ScoreFoot(t, side)))
+                .OrderByDescending(x => x.Item2)
+                .Take(max).ToList();
+        }
+
+        /// <summary>True when the bone name contains a foot/ankle keyword (any supported language).</summary>
+        public static bool NameLooksLikeFoot(string name)
+        {
+            string n = (name ?? "").ToLowerInvariant();
+            return HasAny(n, FOOT_PRIMARY) || HasAny(n, FOOT_SECONDARY);
+        }
+
         /// <summary>True if the FBX's avatar already has all foot + toe humanoid slots mapped.</summary>
         public static bool AreFeetAndToesMapped(string fbxPath)
         {

@@ -536,7 +536,8 @@ namespace ZeroShugan.ShuganUnityTools
         public static string BuildAutoRigFeetScript(
             string sourceFbxPath, string targetName, string exportPath,
             string autoRigScriptPath, bool headless, float stepDelay,
-            string[] garmentNames = null, string backupJsonPath = null)
+            string[] garmentNames = null, string backupJsonPath = null,
+            string footBoneL = null, string footBoneR = null)
         {
             string d        = stepDelay.ToString("F1", CultureInfo.InvariantCulture);
             string pySrc    = sourceFbxPath.Replace("\\", "/");
@@ -545,11 +546,18 @@ namespace ZeroShugan.ShuganUnityTools
             string garmentBlock = BuildGarmentSelectionPython(garmentNames);
             string backupEnv = string.IsNullOrEmpty(backupJsonPath) ? ""
                 : $"os.environ['SHUGAN_RIG_BACKUP_JSON'] = '{backupJsonPath.Replace("\\", "/")}'\n";
+            // Manual foot-bone overrides (user picked from the ranked dropdown in Unity).
+            string footEnv = "";
+            if (!string.IsNullOrEmpty(footBoneL))
+                footEnv += $"os.environ['SHUGAN_FOOT_BONE_L'] = '{PyEscape(footBoneL)}'\n";
+            if (!string.IsNullOrEmpty(footBoneR))
+                footEnv += $"os.environ['SHUGAN_FOOT_BONE_R'] = '{PyEscape(footBoneR)}'\n";
             string exportBlock = FbxExportPython(exportPath);
 
             return
 $@"import bpy, sys, time, os, importlib.util
-{backupEnv}
+{ShuganIssuePython}
+{backupEnv}{footEnv}
 def load_script(path):
     spec = importlib.util.spec_from_file_location('blender_script', path)
     mod  = importlib.util.module_from_spec(spec)
@@ -579,6 +587,10 @@ if obj is None:
             break
 if obj is None:
     print('[BlenderBridge] ERROR: object not found: ' + target_name)
+    _shugan_issue('WRAPPER_OBJECT_NOT_FOUND', 'fatal',
+                  'The selected mesh ""' + target_name + '"" was not found inside the FBX.',
+                  'Re-select the target mesh in the tool (the FBX contents may have changed). '
+                  'Nothing was changed.', final=True)
     sys.exit(1)
 
 bpy.ops.object.select_all(action='DESELECT')
@@ -596,6 +608,23 @@ print('[BlenderBridge] Script complete: ' + _script_basename)
 {delay}sys.exit(0)
 ";
         }
+
+        // Wrapper-side issue reporting: same [SHUGAN_ISSUE]/[SHUGAN_REPORT] stdout sentinels the
+        // paid script emits, so Unity's RunReport parser handles wrapper failures identically.
+        // Also announces the Blender version as an info issue (diagnostics / future version gate).
+        const string ShuganIssuePython =
+@"import json as _sjson
+def _shugan_issue(code, severity, message, hint=None, final=False):
+    _d = {'v': 1, 'code': code, 'severity': severity, 'message': message}
+    if hint:
+        _d['hint'] = hint
+    print('[SHUGAN_ISSUE] ' + _sjson.dumps(_d, ensure_ascii=False), flush=True)
+    if final:
+        print('[SHUGAN_REPORT] ' + _sjson.dumps({'v': 1, 'status': 'fatal', 'issues': [_d], 'stats': {}}, ensure_ascii=False), flush=True)
+_shugan_issue('INFO_BLENDER_VERSION', 'info', 'Blender ' + bpy.app.version_string)";
+
+        static string PyEscape(string s)
+            => s == null ? "" : s.Replace("\\", "\\\\").Replace("'", "\\'");
 
         // The FBX export call shared by the AutoRig run and the Restore round-trip
         // (preset: fbx_to_Unity__no_modifier — MESH + ARMATURE only).
@@ -656,6 +685,7 @@ print('[BlenderBridge] Export done.')";
 
             return
 $@"import bpy, sys, time, os, importlib.util
+{ShuganIssuePython}
 os.environ['SHUGAN_RIG_RESTORE_JSON'] = '{pyJson}'
 
 def load_and_run(path, func):
@@ -688,6 +718,10 @@ if obj is None:
             break
 if obj is None:
     print('[BlenderBridge] ERROR: object not found: ' + target_name)
+    _shugan_issue('WRAPPER_OBJECT_NOT_FOUND', 'fatal',
+                  'The selected mesh ""' + target_name + '"" was not found inside the FBX.',
+                  'Re-select the target mesh in the tool (the FBX contents may have changed). '
+                  'Nothing was changed.', final=True)
     sys.exit(1)
 
 bpy.ops.object.select_all(action='DESELECT')
@@ -725,6 +759,7 @@ print('[BlenderBridge] Restore complete.')
             sb.Append("        print('[BlenderBridge] Garment selected: ' + _gobj.name)\n");
             sb.Append("    else:\n");
             sb.Append("        print('[BlenderBridge] WARNING: garment not found: ' + _gname)\n");
+            sb.Append("        _shugan_issue('GARMENT_NOT_FOUND', 'warning', 'Clothing item \"' + _gname + '\" was not found in the FBX - toe weights were NOT transferred to it.', 'Check the garment name in the tool matches a mesh inside the FBX.')\n");
             return sb.ToString();
         }
 
