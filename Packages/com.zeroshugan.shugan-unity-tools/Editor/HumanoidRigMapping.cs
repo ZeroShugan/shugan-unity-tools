@@ -344,7 +344,8 @@ namespace ZeroShugan.ShuganUnityTools
         /// touches non-foot/toe bones. Optionally strips the Jaw. Reimports and reports the result.
         /// </summary>
         public static MappingResult EnsureFeetAndToesMapped(string fbxPath, bool replaceLowConfidence = false,
-                                                            bool removeJaw = false, string logSource = "api")
+                                                            bool removeJaw = false, string logSource = "api",
+                                                            string logFolderOverride = null)
         {
             var result = new MappingResult();
             var log = new StringBuilder();
@@ -360,7 +361,7 @@ namespace ZeroShugan.ShuganUnityTools
                 {
                     result.message = "Not a model importer: " + fbxPath;
                     log.AppendLine("ERROR: " + result.message);
-                    WriteLog(fbxPath, logSource, log);
+                    WriteLog(fbxPath, logSource, log, logFolderOverride);
                     return result;
                 }
 
@@ -463,7 +464,7 @@ namespace ZeroShugan.ShuganUnityTools
                 log.AppendLine("\nEXCEPTION:\n" + e);
             }
 
-            WriteLog(fbxPath, logSource, log);
+            WriteLog(fbxPath, logSource, log, logFolderOverride);
             return result;
         }
 
@@ -489,16 +490,29 @@ namespace ZeroShugan.ShuganUnityTools
         }
 
         const string LOGS_FOLDER = "Assets/! Shugan/!_Lab/Script/HumanoidRigMapping_Logs";
-        static void WriteLog(string fbxPath, string source, StringBuilder log)
+        /// <summary>
+        /// Writes the mapping narrative. <paramref name="folderOverride"/> lets a caller redirect it
+        /// into its own run folder: AutoRig Feet invokes this on every run, which used to drop a
+        /// SECOND log in a different folder from the rest of that run's diagnostics, so a customer
+        /// sending us "the log" only ever sent half of one. Called standalone (the manual window),
+        /// it still lands in HumanoidRigMapping_Logs exactly as before.
+        /// </summary>
+        static void WriteLog(string fbxPath, string source, StringBuilder log, string folderOverride = null)
         {
             try
             {
-                string abs = Path.GetFullPath(Path.Combine(Application.dataPath, "..", LOGS_FOLDER));
+                bool redirected = !string.IsNullOrEmpty(folderOverride);
+                string folder = redirected ? folderOverride : LOGS_FOLDER;
+                string abs = Path.GetFullPath(Path.Combine(Application.dataPath, "..", folder));
                 Directory.CreateDirectory(abs);
                 string baseName = string.IsNullOrEmpty(fbxPath) ? "unknown" : Path.GetFileNameWithoutExtension(fbxPath);
-                string file = Path.Combine(abs, $"{baseName}_{source}_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                // Inside a run folder the name is fixed: the folder already carries the timestamp,
+                // and a predictable name is what the bug-report bundler looks for.
+                string file = redirected
+                    ? Path.Combine(abs, "humanoid_mapping.txt")
+                    : Path.Combine(abs, $"{baseName}_{source}_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
                 File.WriteAllText(file, log.ToString());
-                UnityEngine.Debug.Log($"[Humanoid Rig Mapping] Log saved:\n{LOGS_FOLDER}/{Path.GetFileName(file)}");
+                UnityEngine.Debug.Log($"[Humanoid Rig Mapping] Log saved:\n{folder}/{Path.GetFileName(file)}");
             }
             catch (Exception e)
             {
@@ -751,12 +765,59 @@ namespace ZeroShugan.ShuganUnityTools
 
         // Detect L/R from a bone name; tokenises on separators so "Foot.L"/"Foot_L"/"LeftFoot" resolve
         // without over-matching names that merely end in 'l'/'r' (e.g. "Skull", "Hair").
+        // Detect the L/R side of a bone from its name.
+        //
+        // Three naming families, matching the Blender-side detect_side():
+        //   1. delimited    - Foot_L, Foot.L, Left_Foot
+        //   2. camel/Pascal - LeftFoot, RightToeBase   <- Mixamo / Unity humanoid exporter
+        //   3. Japanese     - 左足 / 右足
+        //
+        // Family 2 used to return null (the delimited scan never sees " left " in "leftfoot"), which
+        // left RankFootCandidates returning an EMPTY list on those rigs - so the foot-bone dropdown
+        // had nothing in it and BestFoot/BestToe found nothing either.
         static string SideOf(Transform t)
         {
-            string n = " " + t.name.ToLowerInvariant().Replace("_", " ").Replace(".", " ").Replace("-", " ") + " ";
+            string raw = t.name;
+
+            // 1. delimited word
+            string n = " " + raw.ToLowerInvariant().Replace("_", " ").Replace(".", " ").Replace("-", " ") + " ";
             if (n.Contains(" left ")  || n.Contains(" l ")  || n.Contains(" lft ")) return "L";
             if (n.Contains(" right ") || n.Contains(" r ")  || n.Contains(" rgt ")) return "R";
+
+            // 2. undelimited prefix/suffix. The boundary is the following character's case, so
+            //    "LeftFoot" matches but "Leftovers" does not.
+            if (HasSideWord(raw, "Left"))  return "L";
+            if (HasSideWord(raw, "Right")) return "R";
+
+            // 3. Japanese
+            if (raw.Contains("左")) return "L";
+            if (raw.Contains("右")) return "R";
+
             return null;
+        }
+
+        // True when `word` sits at the start of the name followed by a new word (uppercase letter,
+        // digit, separator or end), or at the end of the name preceded by a lowercase letter/digit.
+        static bool HasSideWord(string name, string word)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+
+            if (name.Length >= word.Length &&
+                name.StartsWith(word, StringComparison.OrdinalIgnoreCase))
+            {
+                if (name.Length == word.Length) return true;
+                char c = name[word.Length];
+                if (char.IsUpper(c) || char.IsDigit(c) || c == '_' || c == '.' || c == '-') return true;
+            }
+
+            if (name.Length > word.Length &&
+                name.EndsWith(word, StringComparison.Ordinal))
+            {
+                char c = name[name.Length - word.Length - 1];
+                if (char.IsLower(c) || char.IsDigit(c)) return true;
+            }
+
+            return false;
         }
 
         static bool IsModelPath(string path)

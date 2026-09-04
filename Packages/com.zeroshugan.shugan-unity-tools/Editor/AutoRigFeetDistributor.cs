@@ -6,14 +6,24 @@ using System.Linq;
 using System.Text;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace ZeroShugan.ShuganUnityTools
 {
     public class AutoRigFeetDistributor : EditorWindow
     {
         enum ExportMode { Duplicate, Replace }
-        enum SwapMethod { Legacy, Experimental }
+        // Order is load-bearing: the choice is persisted as an INT in EditorPrefs
+        // (PrefSwapMethod), so reordering these would silently flip existing users' setting.
+        // "Experimental" was renamed to "Standard" in place — it is the mode actually relied on —
+        // and keeping its index means nobody's stored preference changed meaning.
+        enum SwapMethod { Legacy, Standard }
         enum State      { Idle, BlenderRunning, FBXSwapping, AddingPrefabs, Restoring, Done, Error }
+        enum Tab        { Setup, Logs, Backups, Report }
+
+        // One concern per tab. These three used to share a single "Logs & Support" page, where the
+        // run history, the backups and the bug-report form ran together as one long scroll.
+        static readonly string[] TabLabels = { "Setup", "Run Logs", "Backups", "Report a Bug" };
 
         // ─── EditorPrefs ───────────────────────────────────────────────────────
         const string PrefFbxPath              = "ShuganTools_ARF_FbxPath";
@@ -24,10 +34,13 @@ namespace ZeroShugan.ShuganUnityTools
         const string PrefAdvanced             = "ShuganTools_ARF_Advanced";
         const string PrefAutoRigScriptPath    = "ShuganTools_ARF_AutoRigScriptPath";
         const string PrefSwapMethod           = "ShuganTools_ARF_SwapMethod";
+        const string PrefAutoSwapMethod       = "ShuganTools_ARF_AutoSwapMethod";
         const string PrefGarments             = "ShuganTools_ARF_Garments";
         const string PrefBackupEnabled        = "ShuganTools_ARF_BackupEnabled";
         const string PrefAutoMapFeet          = "ShuganTools_ARF_AutoMapFeet";
         const string PrefTimeoutMin           = "ShuganTools_ARF_TimeoutMin";
+        const string PrefTab                  = "ShuganTools_ARF_Tab";
+        const string PrefBugContact           = "ShuganTools_ARF_BugContact";
 
         // ─── Paid-content paths (installed via Shugan store bundle) ───────────
         const string DefaultAutoRigScriptPath = "Assets/! Shugan/!_Lab/Script/shugan_autorig_feet.py";
@@ -74,9 +87,14 @@ namespace ZeroShugan.ShuganUnityTools
         // (calls HumanoidRigMapping; fills only missing slots, never replaces existing mappings).
         bool _autoMapFeet = true;
 
-        // ─── Run log (full Blender stdout+stderr → file, for debugging) ───────
-        StringBuilder _runLog;
-        string        _runLogPath;
+        // ─── Run log (unified per-run diagnostics folder) ─────────────────────
+        // Everything one run produces — Blender console, Unity Console, the typed report, the
+        // environment and the avatar snapshot — lands in ONE folder the customer can send us.
+        // See ShuganRunLog. Previously this was a StringBuilder flushed once when Blender exited,
+        // which lost the whole log on a crash or watchdog kill.
+        const string LogToolName = "AutoRigFeet";
+        ShuganRunLog _runLogger;
+        string       _runLogPath;
 
         // ─── Run report (typed issues parsed from the Blender stdout sentinels) ───
         // Filled live by DrainOutputQueue (RunReport.TryParseLine), evaluated when the process
@@ -87,7 +105,28 @@ namespace ZeroShugan.ShuganUnityTools
 
         // ─── Export ────────────────────────────────────────────────────────────
         ExportMode _exportMode   = ExportMode.Duplicate;
-        SwapMethod _swapMethod   = SwapMethod.Legacy;
+        SwapMethod _swapMethod   = SwapMethod.Legacy;   // manual choice, only used when !_autoSwapMethod
+
+        // Pick the swap method from the Export Mode instead of asking. Only one method honours each
+        // mode, so the question was never really the user's to answer:
+        //
+        //   Replace   → Legacy   — the only method that writes the source FBX in place.
+        //   Duplicate → Standard — duplicate-and-relink, the proven path.
+        //
+        // The combination that made this worth automating is Standard + Replace: Standard always
+        // duplicates, so it silently ignored Replace and left the source untouched while the user
+        // believed it had been replaced. That combination is now unreachable by default.
+        //
+        // The manual override survives as an escape hatch: Legacy + Duplicate is still a valid path
+        // (prefab rebuild), and if the duplicate-and-relink swap ever chokes on someone's avatar it
+        // is the only workaround they have before a fix ships.
+        bool _autoSwapMethod = true;
+
+        SwapMethod EffectiveSwapMethod()
+        {
+            if (!_autoSwapMethod) return _swapMethod;
+            return _exportMode == ExportMode.Replace ? SwapMethod.Legacy : SwapMethod.Standard;
+        }
         string     _exportSuffix = "Rig_Feet";
         string     _exportFolder = "";
 
@@ -116,6 +155,18 @@ namespace ZeroShugan.ShuganUnityTools
         string      _statusMsg  = "";
         MessageType _statusType = MessageType.None;
         bool        _advancedFoldout;
+        Tab         _tab = Tab.Setup;
+
+        // ─── Logs & Support tab ────────────────────────────────────────────────
+        List<ShuganRunLog.RunFolder> _runsCache;
+        bool    _runsCacheDirty = true;
+        int     _selectedRun;
+        string  _bugMessage = "";
+        string  _bugContact = "";
+        bool    _bugConsent;                 // per-send, reset after each report (never persisted)
+        string  _bugStatus  = "";
+        bool    _bugStatusOk;
+        bool    _bugLogsFoldout;
 
         // ─── Dependency cache (refreshed each OnGUI pass) ─────────────────────
         bool   _depBlender;
@@ -141,7 +192,8 @@ namespace ZeroShugan.ShuganUnityTools
         void OnEnable()
         {
             _exportMode    = (ExportMode)EditorPrefs.GetInt(PrefExportMode, (int)ExportMode.Duplicate);
-            _swapMethod    = (SwapMethod)EditorPrefs.GetInt(PrefSwapMethod, (int)SwapMethod.Legacy);
+            _swapMethod     = (SwapMethod)EditorPrefs.GetInt(PrefSwapMethod, (int)SwapMethod.Legacy);
+            _autoSwapMethod = EditorPrefs.GetBool(PrefAutoSwapMethod, true);
             _exportSuffix  = EditorPrefs.GetString(PrefSuffix, "Rig_Feet");
             _exportFolder  = EditorPrefs.GetString(PrefExportFolder, "");
             _advancedFoldout = EditorPrefs.GetBool(PrefAdvanced, false);
@@ -163,6 +215,11 @@ namespace ZeroShugan.ShuganUnityTools
             _backupEnabled = EditorPrefs.GetBool(PrefBackupEnabled, true);
             _autoMapFeet   = EditorPrefs.GetBool(PrefAutoMapFeet, true);
             _timeoutMin    = EditorPrefs.GetInt(PrefTimeoutMin, 10);
+            _tab           = (Tab)EditorPrefs.GetInt(PrefTab, (int)Tab.Setup);
+            // The contact field persists (so a repeat reporter doesn't retype it) but the message
+            // and the consent tick never do — consent is per-send, exactly as in the addon.
+            _bugContact    = EditorPrefs.GetString(PrefBugContact, "");
+            _runsCacheDirty = true;
 
             if (_prefabsToAdd.Count == 0)
                 foreach (string p in DefaultPrefabPaths)
@@ -183,6 +240,17 @@ namespace ZeroShugan.ShuganUnityTools
             // Once-per-session check whether a newer paid AutoRig .py is published (GitHub
             // version file; stores can't push updates through VCC).
             StartPyVersionCheck();
+        }
+
+        // Closing the window mid-run must not leave the log stream open — the file would keep the
+        // handle and the folder would look like a run that never ended.
+        void OnDisable()
+        {
+            if (_runLogger != null)
+            {
+                _runLogger.Line("[log] tool window closed or scripts reloaded — log ended here");
+                CloseRunLog();
+            }
         }
 
         void OnSelectionChange() => TryAdoptSelectedAvatar();
@@ -255,6 +323,10 @@ namespace ZeroShugan.ShuganUnityTools
                     AssetDatabase.Refresh();
                     if (EvaluateBlenderResult(exitCode, isRestore: true))
                     {
+                        // A SUCCESSFUL restore goes straight to Done — there is no prefab step to
+                        // finalize it — so without this its report was never written and its log
+                        // was left open. (Failures were already covered by EvaluateBlenderResult.)
+                        FinishRunReport();
                         _displayProgress  = 1f;
                         _state            = State.Done;
                         _currentStepLabel = "Restore done!";
@@ -290,6 +362,8 @@ namespace ZeroShugan.ShuganUnityTools
                     _displayProgress  = _exportMode == ExportMode.Duplicate ? 0.92f : 0.95f;
                     Repaint();
                     RunAddPrefabs();
+                    // Give the finished avatar a name that describes what it IS, not how it was made.
+                    RenameResultInstance();
                     // Zero the ticked feet shape keys on the generated copy (Duplicate mode only —
                     // in Replace mode the user fixes them on the avatar itself via the warning).
                     ApplyDuplicateShapeKeyFixes();
@@ -325,17 +399,39 @@ namespace ZeroShugan.ShuganUnityTools
             ShuganToolUI.DrawHeader("AutoRig Feet  —  Distributor");
             ShuganToolUI.DrawSocialLinks(WikiUrl);
             EditorGUILayout.Space(4);
-            DrawDependencyStatus();
-            Separator();
-            DrawMainSection();
-            Separator();
-            DrawAdvancedSection();
+
+            // Only the scroll-view BODY switches. Everything below EndScrollView (status, report
+            // panel, run button, progress) is chrome that stays put, so the run button remains
+            // reachable from either tab exactly as before.
+            EditorGUI.BeginChangeCheck();
+            _tab = (Tab)GUILayout.Toolbar((int)_tab, TabLabels, GUILayout.Height(22));
+            if (EditorGUI.EndChangeCheck())
+            {
+                EditorPrefs.SetInt(PrefTab, (int)_tab);
+                _runsCacheDirty = true;
+                GUI.FocusControl(null);
+            }
+            EditorGUILayout.Space(6);
+
+            switch (_tab)
+            {
+                case Tab.Setup:
+                    DrawDependencyStatus();
+                    Separator();
+                    DrawMainSection();
+                    Separator();
+                    DrawAdvancedSection();
+                    break;
+                case Tab.Logs:    DrawRunLogsTab();   break;
+                case Tab.Backups: DrawBackupsTab();   break;
+                case Tab.Report:  DrawBugReportTab(); break;
+            }
 
             EditorGUILayout.EndScrollView();
 
-            DrawReadinessHints(IsReady());
+            if (_tab == Tab.Setup) DrawReadinessHints(IsReady());
 
-            if (_alreadyRigged && _state == State.Idle)
+            if (_tab == Tab.Setup && _alreadyRigged && _state == State.Idle)
             {
                 EditorGUILayout.HelpBox(
                     "This avatar already has AutoRig Feet bones (z_CB / Toes_a1 found). " +
@@ -417,17 +513,45 @@ namespace ZeroShugan.ShuganUnityTools
         {
             string path = _autoRigScriptResolvedPath;
             if (string.IsNullOrEmpty(path)) return null;
-            if (path == _localPyVersionPath) return _localPyVersion;
-            _localPyVersionPath = path;
+
+            // Cache key is path + LAST WRITE TIME, not path alone.
+            //
+            // Keying on the path only meant the version was read once and then held forever: after
+            // the paid script was updated in place, the tool kept reporting the OLD version until
+            // the next domain reload. Observed for real — a run wrote "3.8.7" into environment.json
+            // and into a bug report while the file on disk said 3.8.8.
+            //
+            // That is precisely the case this whole version check exists for: a customer buys an
+            // update and drops the new .py in while Unity is open. Reporting a stale version there
+            // is worse than not checking at all, because the update banner stays hidden AND the
+            // wrong version is attached to any bug report they send.
+            string stamp = path;
+            try
+            {
+                string absStamp = Path.GetFullPath(Path.Combine(Application.dataPath, "..", path));
+                if (File.Exists(absStamp))
+                    stamp = path + "|" + File.GetLastWriteTimeUtc(absStamp).Ticks;
+            }
+            catch { }
+
+            if (stamp == _localPyVersionPath) return _localPyVersion;
+            _localPyVersionPath = stamp;
             _localPyVersion = null;
             try
             {
                 // Only the head of the file is needed (SCRIPT_VERSION sits near the top; the
                 // docstring "v3.8.7" is the fallback for older paid-script versions).
+                //
+                // The window was 6000 chars and that turned out to be too tight: the script's
+                // docstring grows with every release, and by 3.8.8 SCRIPT_VERSION had drifted to
+                // offset ~7200, out of range. Detection then silently fell through to the docstring
+                // regex — which happens to work, but is the fallback meant for OLD scripts, so a
+                // version mismatch would have been reported with no sign anything was wrong.
+                // 64 KB leaves generous headroom and still reads only the head of a 300 KB file.
                 string abs = Path.GetFullPath(Path.Combine(Application.dataPath, "..", path));
                 using (var reader = new StreamReader(abs))
                 {
-                    var buf = new char[6000];
+                    var buf = new char[65536];
                     int n = reader.Read(buf, 0, buf.Length);
                     string head = new string(buf, 0, Mathf.Max(0, n));
                     var m = System.Text.RegularExpressions.Regex.Match(
@@ -752,7 +876,8 @@ namespace ZeroShugan.ShuganUnityTools
             }
 
             DrawGarmentSection();
-            DrawRestoreSection();
+            // Restore Original Rig now lives on the "Logs & Support" tab, next to the backups it
+            // reads and the run logs that explain why you might want it.
         }
 
 
@@ -1078,10 +1203,65 @@ namespace ZeroShugan.ShuganUnityTools
 
         // ─── Restore original rig (from JSON backup) ───────────────────────────
 
+        // True when the SOURCE FBX asset itself carries AutoRig Feet bones — i.e. some previous run
+        // rigged it IN PLACE. Cached on path + last-write-time; OnGUI runs many times a second and
+        // this walks a few hundred transforms.
+        string _srcRiggedKey;
+        bool   _srcRiggedValue;
+
+        bool SourceFbxIsRigged()
+        {
+            if (_sourceFbxAsset == null) return false;
+            string path = AssetDatabase.GetAssetPath(_sourceFbxAsset);
+            if (string.IsNullOrEmpty(path)) return false;
+
+            string key = path;
+            try
+            {
+                string abs = ToAbsPath(path);
+                if (File.Exists(abs)) key = path + "|" + File.GetLastWriteTimeUtc(abs).Ticks;
+            }
+            catch { }
+            if (key == _srcRiggedKey) return _srcRiggedValue;
+
+            _srcRiggedKey = key;
+            _srcRiggedValue = false;
+            try
+            {
+                var asset = AssetDatabase.LoadAssetAtPath<GameObject>(path);
+                if (asset != null) _srcRiggedValue = HasFeetRigBones(asset);
+            }
+            catch { }
+            return _srcRiggedValue;
+        }
+
         void DrawRestoreSection()
         {
             bool hasFbx = _sourceFbxAsset != null && IsValidFbx(_sourceFbxAsset);
             if (!hasFbx) return;
+
+            // Restore reads AND writes the SOURCE fbx (see RunRestore: BuildRestoreFeetScript gets
+            // sourceFbxAbs as both input and output). That only makes sense when the source is the
+            // file that got rigged — i.e. Replace mode. In Duplicate mode the rig goes to a separate
+            // "_Rig_Feet.fbx" and the source is never modified, so restoring it would push an
+            // untouched file through a pointless Blender round-trip.
+            //
+            // Gated on whether the source ACTUALLY carries rig bones, not on the current Export Mode
+            // dropdown: someone who rigged in Replace mode and later switched the dropdown to
+            // Duplicate still has a rigged source and still needs this.
+            if (!SourceFbxIsRigged())
+            {
+                EditorGUILayout.Space(6);
+                GUILayout.Label("Restore Original Rig", EditorStyles.boldLabel);
+                EditorGUILayout.HelpBox(
+                    "Not needed for this FBX — it has no AutoRig Feet bones, so nothing has been "
+                    + "rigged into it.\n\n"
+                    + "In Duplicate mode the rig is written to a separate FBX and your source file "
+                    + "is never modified, so there is nothing to restore. This appears automatically "
+                    + "if you rig this FBX in Replace mode.",
+                    MessageType.None);
+                return;
+            }
 
             string backupDir = Path.Combine(SourceFbxAbsDir(), "_Backups");
             string fbxName   = Path.GetFileNameWithoutExtension(AssetDatabase.GetAssetPath(_sourceFbxAsset));
@@ -1153,12 +1333,21 @@ namespace ZeroShugan.ShuganUnityTools
                 sourceFbxAbs, targetMesh, sourceFbxAbs, scriptPath, jsonPath,
                 headless: true, stepDelay: 0f);
 
+            ArchiveWrapperScript(pythonCode);
+
             _blenderProcess = BlenderBridge.LaunchBlenderProcess(
                 blenderPath, pythonCode, headless: true, factoryStartup: true,
                 onOutputLine: EnqueueLine);
 
             if (_blenderProcess == null)
             {
+                _runReport.AddIssue("U_LAUNCH_FAILED", "fatal",
+                    "Blender could not be started for the restore.",
+                    "Check the Blender path in Advanced Settings.");
+                _runReport.exitCode       = -1;
+                _runReport.logPath        = _runLogPath ?? "";
+                _runReport.timestampTicks = DateTime.UtcNow.Ticks;
+                FinishRunReport();
                 SetError("Failed to launch Blender for restore.");
                 return;
             }
@@ -1168,7 +1357,537 @@ namespace ZeroShugan.ShuganUnityTools
             SetStatus("Restoring rig in Blender… Unity will refresh when it finishes.", MessageType.Info);
         }
 
+        // ─── Run Logs tab ──────────────────────────────────────────────────────
+        // What each run produced. The selection made here is what the Report a Bug tab attaches.
+
+        void DrawRunLogsTab()
+        {
+            EditorGUILayout.LabelField("Run History", EditorStyles.boldLabel);
+            EditorGUILayout.HelpBox(
+                "Every run writes its full log, the typed report, your setup and an anonymized "
+                + "description of the avatar to:\n" + ShuganRunLog.ToolRootAssetPath(LogToolName)
+                + "\nThe last " + ShuganRunLog.DefaultKeepRuns
+                + " runs are kept; older ones are deleted automatically.",
+                MessageType.None);
+
+            DrawRunHistory();
+
+            var sel = SelectedRun();
+            if (sel != null)
+            {
+                EditorGUILayout.Space(6);
+                EditorGUILayout.HelpBox(
+                    "The selected run is the one the \"Report a Bug\" tab will attach.",
+                    MessageType.None);
+                if (GUILayout.Button("Report this run to the developer…", GUILayout.Height(22)))
+                    GoToTab(Tab.Report);
+            }
+        }
+
+        void GoToTab(Tab tab)
+        {
+            _tab = tab;
+            EditorPrefs.SetInt(PrefTab, (int)_tab);
+            _runsCacheDirty = true;
+            GUI.FocusControl(null);
+            Repaint();
+        }
+
+        List<ShuganRunLog.RunFolder> Runs()
+        {
+            if (_runsCache == null || _runsCacheDirty)
+            {
+                _runsCache      = ShuganRunLog.ListRuns(LogToolName);
+                _runsCacheDirty = false;
+                _selectedRun    = Mathf.Clamp(_selectedRun, 0, Mathf.Max(0, _runsCache.Count - 1));
+            }
+            return _runsCache;
+        }
+
+        ShuganRunLog.RunFolder SelectedRun()
+        {
+            var runs = Runs();
+            if (runs.Count == 0) return null;
+            return runs[Mathf.Clamp(_selectedRun, 0, runs.Count - 1)];
+        }
+
+        void DrawRunHistory()
+        {
+            var runs = Runs();
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("Refresh", GUILayout.Width(70))) _runsCacheDirty = true;
+                using (new EditorGUI.DisabledScope(runs.Count == 0))
+                {
+                    if (GUILayout.Button("Open Folder", GUILayout.Width(95)))
+                    {
+                        string root = ShuganSanitize.ToAbsolute(ShuganRunLog.ToolRootAssetPath(LogToolName));
+                        if (!string.IsNullOrEmpty(root)) EditorUtility.RevealInFinder(root);
+                    }
+                }
+            }
+
+            if (runs.Count == 0)
+            {
+                EditorGUILayout.HelpBox(
+                    "No runs recorded yet. The next time you run AutoRig Feet — successful or not — "
+                    + "its diagnostics will appear here.", MessageType.Info);
+                return;
+            }
+
+            for (int i = 0; i < runs.Count; i++)
+            {
+                var r = runs[i];
+                bool selected = i == _selectedRun;
+
+                using (new EditorGUILayout.VerticalScope(selected ? EditorStyles.helpBox : GUIStyle.none))
+                {
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        if (GUILayout.Toggle(selected, GUIContent.none, GUILayout.Width(16)) && !selected)
+                            _selectedRun = i;
+
+                        Color prev = GUI.color;
+                        GUI.color = StatusColor(r.status);
+                        GUILayout.Label(StatusGlyph(r.status), GUILayout.Width(18));
+                        GUI.color = prev;
+
+                        GUILayout.Label(r.when != default(DateTime)
+                                ? r.when.ToString("yyyy-MM-dd HH:mm") : "(unknown date)",
+                            GUILayout.Width(115));
+                        GUILayout.Label(string.IsNullOrEmpty(r.label) ? "—" : r.label,
+                            EditorStyles.miniLabel);
+                        GUILayout.FlexibleSpace();
+                        GUILayout.Label(FormatBytes(r.sizeBytes), EditorStyles.miniLabel,
+                            GUILayout.Width(60));
+                    }
+
+                    if (selected)
+                    {
+                        using (new EditorGUILayout.HorizontalScope())
+                        {
+                            GUILayout.Space(18);
+                            if (GUILayout.Button("Open Log", GUILayout.Width(80)))
+                                OpenRunFile(r, "run.log");
+                            using (new EditorGUI.DisabledScope(!r.hasReport))
+                                if (GUILayout.Button("Report", GUILayout.Width(70)))
+                                    OpenRunFile(r, "report.json");
+                            using (new EditorGUI.DisabledScope(!r.hasAvatar))
+                                if (GUILayout.Button("Avatar", GUILayout.Width(70)))
+                                    OpenRunFile(r, "avatar.json");
+                            if (GUILayout.Button("Show in Explorer", GUILayout.Width(120)))
+                                EditorUtility.RevealInFinder(r.folderAbs);
+                            GUILayout.FlexibleSpace();
+                        }
+                    }
+                }
+            }
+        }
+
+        static void OpenRunFile(ShuganRunLog.RunFolder r, string fileName)
+        {
+            try
+            {
+                string p = Path.Combine(r.folderAbs, fileName);
+                if (File.Exists(p)) EditorUtility.OpenWithDefaultApp(p);
+                else EditorUtility.DisplayDialog("Not found",
+                    fileName + " is not in this run's folder.\n\n"
+                    + "That usually means the run ended before it got that far.", "OK");
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning("[AutoRig Feet] Could not open " + fileName + ": " + ex.Message);
+            }
+        }
+
+        static string StatusGlyph(string status)
+        {
+            switch (status)
+            {
+                case "fatal":    return "✖";
+                case "warnings": return "▲";
+                case "ok":       return "✔";
+                default:         return "•";
+            }
+        }
+
+        static Color StatusColor(string status)
+        {
+            switch (status)
+            {
+                case "fatal":    return new Color(1f, 0.45f, 0.45f);
+                case "warnings": return new Color(1f, 0.85f, 0.4f);
+                case "ok":       return new Color(0.5f, 0.9f, 0.5f);
+                default:         return Color.gray;
+            }
+        }
+
+        static string FormatBytes(long b)
+        {
+            if (b <= 0) return "—";
+            if (b < 1024) return b + " B";
+            if (b < 1024 * 1024) return (b / 1024f).ToString("0.#") + " KB";
+            return (b / (1024f * 1024f)).ToString("0.#") + " MB";
+        }
+
+        // ─── Backups + restore (moved here from the Setup tab) ─────────────────
+
+        void DrawBackupsTab()
+        {
+            EditorGUILayout.LabelField("Backups & Restore", EditorStyles.boldLabel);
+
+            if (_sourceFbxAsset == null)
+            {
+                EditorGUILayout.HelpBox(
+                    "Select a Target Avatar on the Setup tab to see its backups.", MessageType.Info);
+                return;
+            }
+
+            EditorGUILayout.LabelField("Source FBX",
+                Path.GetFileName(AssetDatabase.GetAssetPath(_sourceFbxAsset)));
+
+            EditorGUILayout.HelpBox(
+                "Backups stay next to your FBX in its _Backups folder, not in the logs folder — "
+                + "they are recovery files, and they are never rotated away.\n\n"
+                + "A full FBX copy is only made when a run would overwrite your source file "
+                + "(Replace mode). Duplicate mode writes a separate FBX and leaves the source "
+                + "untouched, so it does not need one.", MessageType.None);
+
+            try
+            {
+                string dir = Path.Combine(SourceFbxAbsDir(), "_Backups");
+                string fbx = Path.GetFileNameWithoutExtension(AssetDatabase.GetAssetPath(_sourceFbxAsset));
+                if (Directory.Exists(dir))
+                {
+                    var fbxBackups = Directory.GetFiles(dir, fbx + "_backup_*.fbx");
+                    Array.Sort(fbxBackups, StringComparer.Ordinal);
+                    Array.Reverse(fbxBackups);
+
+                    EditorGUILayout.LabelField(
+                        "Full FBX backups: " + fbxBackups.Length, EditorStyles.miniLabel);
+                    int show = Mathf.Min(fbxBackups.Length, 5);
+                    for (int i = 0; i < show; i++)
+                    {
+                        using (new EditorGUILayout.HorizontalScope())
+                        {
+                            GUILayout.Label("  " + Path.GetFileName(fbxBackups[i]), EditorStyles.miniLabel);
+                            GUILayout.FlexibleSpace();
+                            if (GUILayout.Button("Show", GUILayout.Width(50)))
+                                EditorUtility.RevealInFinder(fbxBackups[i]);
+                        }
+                    }
+                    if (fbxBackups.Length > show)
+                        EditorGUILayout.LabelField("  … and " + (fbxBackups.Length - show) + " older",
+                            EditorStyles.miniLabel);
+                }
+                else
+                {
+                    EditorGUILayout.LabelField("No _Backups folder yet.", EditorStyles.miniLabel);
+                }
+            }
+            catch (Exception ex)
+            {
+                EditorGUILayout.HelpBox("Could not list backups: " + ex.Message, MessageType.Warning);
+            }
+
+            EditorGUILayout.Space(4);
+            DrawRestoreSection();
+        }
+
+        // ─── Report a Bug ──────────────────────────────────────────────────────
+        // [ARF-BUGREPORT] Consent-first, mirroring the Data Transfer++ addon: Send stays disabled
+        // until there is a message AND a ticked consent box, View shows the exact payload first,
+        // and consent resets after every send.
+
+        const string BugProductSlug = "shugan_autorig_feet";
+
+        // Triage order: what the setup was, what the tool concluded, what the avatar looked like,
+        // then the full trace.
+        static readonly string[] ReportFileNames =
+            { "environment.json", "report.json", "avatar.json", "humanoid_mapping.txt", "run.log" };
+
+        // CooldownRemaining() reads a small JSON file; OnGUI runs many times a second, so it is
+        // sampled at most once a second rather than per repaint.
+        double _cooldownCheckedAt = -999;
+        int    _cooldownCache;
+
+        int CachedCooldown()
+        {
+            double now = EditorApplication.timeSinceStartup;
+            if (now - _cooldownCheckedAt > 1.0)
+            {
+                _cooldownCheckedAt = now;
+                _cooldownCache     = ShuganBugReport.CooldownRemaining();
+            }
+            return _cooldownCache;
+        }
+
+        void DrawBugReportTab()
+        {
+            EditorGUILayout.LabelField("Report a Bug", EditorStyles.boldLabel);
+
+            var runs = Runs();
+            if (runs.Count == 0)
+            {
+                EditorGUILayout.HelpBox(
+                    "Run AutoRig Feet once first — a report is built from a run's diagnostics.",
+                    MessageType.Info);
+                return;
+            }
+
+            EditorGUILayout.HelpBox(
+                "Sends: versions + the selected run's logs + your message.\n"
+                + "Logs include names used in Unity (objects, bones, meshes, shape keys).\n"
+                + "No mesh geometry, textures, materials or files. Material and texture names are "
+                + "replaced with anonymous ids. Anonymous unless you fill in a contact.",
+                MessageType.None);
+
+            // Its own picker: the run list lives on another tab now, so a user who lands here
+            // directly still has to be able to choose which run they are reporting.
+            var labels = new string[runs.Count];
+            for (int i = 0; i < runs.Count; i++)
+            {
+                var r = runs[i];
+                labels[i] = StatusGlyph(r.status) + "  "
+                          + (r.when != default(DateTime) ? r.when.ToString("yyyy-MM-dd HH:mm") : "?")
+                          + "  " + (string.IsNullOrEmpty(r.label) ? "—" : r.label)
+                          + (string.IsNullOrEmpty(r.status) ? "" : "  (" + r.status + ")");
+            }
+            _selectedRun = Mathf.Clamp(_selectedRun, 0, runs.Count - 1);
+            _selectedRun = EditorGUILayout.Popup("Run to report", _selectedRun, labels);
+
+            var run = runs[_selectedRun];
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.Space(EditorGUIUtility.labelWidth);
+                if (GUILayout.Button("Open Log", GUILayout.Width(80)))
+                    OpenRunFile(run, "run.log");
+                if (GUILayout.Button("Show in Explorer", GUILayout.Width(120)))
+                    EditorUtility.RevealInFinder(run.folderAbs);
+                GUILayout.FlexibleSpace();
+            }
+
+            EditorGUILayout.Space(4);
+            EditorGUILayout.LabelField("What happened?");
+            _bugMessage = EditorGUILayout.TextArea(_bugMessage, GUILayout.Height(56));
+
+            EditorGUI.BeginChangeCheck();
+            _bugContact = EditorGUILayout.TextField(
+                new GUIContent("Contact (optional)",
+                    "Email or username if you want a reply — leave empty to stay fully anonymous."),
+                _bugContact);
+            if (EditorGUI.EndChangeCheck()) EditorPrefs.SetString(PrefBugContact, _bugContact ?? "");
+
+            _bugLogsFoldout = EditorGUILayout.Foldout(_bugLogsFoldout, "What gets attached", true);
+            if (_bugLogsFoldout)
+            {
+                EditorGUI.indentLevel++;
+                // Sizes come from FileInfo, not from assembling the bundle: this runs on every
+                // repaint, and reading a 400 KB log per frame to show a number would be absurd.
+                foreach (string f in ReportFileNames)
+                {
+                    string p = Path.Combine(run.folderAbs, f);
+                    bool exists = File.Exists(p);
+                    long len = 0;
+                    if (exists) { try { len = new FileInfo(p).Length; } catch { } }
+                    EditorGUILayout.LabelField("• " + f, exists ? FormatBytes(len) : "(not produced)");
+                }
+                EditorGUILayout.LabelField(" ",
+                    "Use View Report to read the exact text before sending.", EditorStyles.miniLabel);
+                EditorGUI.indentLevel--;
+            }
+
+            _bugConsent = EditorGUILayout.ToggleLeft(
+                new GUIContent("I agree to share this data anonymously",
+                    "Required before sending. Consent resets after each report."),
+                _bugConsent);
+
+            int cooldown = CachedCooldown();
+            bool canSend = _bugConsent
+                           && !string.IsNullOrEmpty((_bugMessage ?? "").Trim())
+                           && cooldown == 0
+                           && !ShuganBugReport.IsSending;
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("View Report", GUILayout.Height(24)))
+                {
+                    string p = ShuganBugReport.OpenPreview(ShuganBugReport.Build(BuildBugRequest()));
+                    _bugStatusOk = p != null;
+                    _bugStatus   = p != null
+                        ? "Report opened in your text editor — nothing was sent."
+                        : "Could not open the preview file.";
+                }
+
+                using (new EditorGUI.DisabledScope(!canSend))
+                {
+                    if (GUILayout.Button(ShuganBugReport.IsSending ? "Sending…" : "Send Report",
+                            GUILayout.Height(24)))
+                        ConfirmAndSendBugReport();
+                }
+            }
+
+            if (cooldown > 0)
+                EditorGUILayout.LabelField(" ",
+                    "You can send another report in " + cooldown + "s.", EditorStyles.miniLabel);
+            else if (!_bugConsent || string.IsNullOrEmpty((_bugMessage ?? "").Trim()))
+                EditorGUILayout.LabelField(" ",
+                    "Describe the issue and tick the consent box to enable Send.",
+                    EditorStyles.miniLabel);
+
+            if (!string.IsNullOrEmpty(_bugStatus))
+                EditorGUILayout.HelpBox(_bugStatus,
+                    _bugStatusOk ? MessageType.Info : MessageType.Warning);
+        }
+
+        void ConfirmAndSendBugReport()
+        {
+            var payload = ShuganBugReport.Build(BuildBugRequest());
+
+            bool go = EditorUtility.DisplayDialog(
+                "Send anonymous bug report?",
+                "Will be sent to the developer (Shugan):\n"
+                + "  • the selected run's logs + your message\n"
+                + "  • tool / Unity / Blender / OS versions\n"
+                + "  • an anonymized description of your avatar\n\n"
+                + "Logs include names used in Unity (objects, bones, meshes, shape keys).\n"
+                + "No mesh geometry, textures or files.\n"
+                + (string.IsNullOrEmpty(payload.contact)
+                    ? "The report is anonymous."
+                    : "You will be identifiable by the contact you entered: " + payload.contact),
+                "Send Report", "Cancel");
+            if (!go) return;
+
+            ShuganBugReport.Send(payload, _bugConsent, (ok, msg) =>
+            {
+                _bugStatusOk = ok;
+                _bugStatus   = msg;
+                if (ok)
+                {
+                    // Message and consent clear on success; the contact deliberately stays, so a
+                    // repeat reporter does not have to retype it.
+                    _bugMessage = "";
+                    _bugConsent = false;
+                }
+                Repaint();
+            });
+            Repaint();
+        }
+
+        ShuganBugReport.Request BuildBugRequest()
+        {
+            return new ShuganBugReport.Request
+            {
+                product        = BugProductSlug,
+                productVersion = PackageVersion() + "+py" + (LocalPyVersion() ?? "unknown"),
+                runtime        = "Unity " + Application.unityVersion + " / " + BlenderVersionForReport(),
+                message        = _bugMessage ?? "",
+                contact        = _bugContact ?? "",
+                logParts       = BuildReportLogParts(),
+            };
+        }
+
+        // Assembles the actual bundle. Only called when the user clicks View Report or Send —
+        // never from OnGUI, because it reads every artifact off disk.
+        List<ShuganBugReport.LogPart> BuildReportLogParts()
+        {
+            var parts = new List<ShuganBugReport.LogPart>();
+            var run   = SelectedRun();
+            if (run == null) return parts;
+
+            foreach (string f in ReportFileNames)
+            {
+                string p = Path.Combine(run.folderAbs, f);
+                if (!File.Exists(p)) continue;
+
+                // Only run.log is trimmable. The structured documents are small, dense and the
+                // most useful part of a report, so they are kept whole and the log takes the cut.
+                bool isConsoleLog = f.EndsWith(".log", StringComparison.OrdinalIgnoreCase);
+                parts.Add(new ShuganBugReport.LogPart(
+                    run.folderName + "/" + f,
+                    ReadTextCapped(p, isConsoleLog ? 400000 : 120000),
+                    trimmable: isConsoleLog));
+            }
+            return parts;
+        }
+
+        // Bounded read: a pathological run log must not be pulled into memory whole just to be
+        // trimmed a moment later by the bundler.
+        static string ReadTextCapped(string path, int maxChars)
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                if (fi.Length <= maxChars) return File.ReadAllText(path);
+
+                using (var sr = new StreamReader(path))
+                {
+                    int head = maxChars / 4;
+                    var buf  = new char[head];
+                    int n    = sr.Read(buf, 0, head);
+                    string headText = new string(buf, 0, Math.Max(0, n));
+
+                    int tail = maxChars - head;
+                    sr.BaseStream.Seek(Math.Max(0, fi.Length - tail), SeekOrigin.Begin);
+                    sr.DiscardBufferedData();
+                    string tailText = sr.ReadToEnd();
+
+                    return headText + "\n\n[... trimmed while reading ...]\n\n" + tailText;
+                }
+            }
+            catch (Exception ex) { return "(could not read " + Path.GetFileName(path) + ": " + ex.Message + ")"; }
+        }
+
+        string BlenderVersionForReport()
+        {
+            try
+            {
+                if (_runReport != null && _runReport.issues != null)
+                    foreach (var i in _runReport.issues)
+                        if (i != null && i.code == "INFO_BLENDER_VERSION" && !string.IsNullOrEmpty(i.message))
+                            return i.message;
+            }
+            catch { }
+            return "Blender (version in logs)";
+        }
+
+        // The published package version, which is what a bug report should quote — ToolVersion is
+        // this window's own label and does not move between releases.
+        static string _packageVersion;
+        static string PackageVersion()
+        {
+            if (!string.IsNullOrEmpty(_packageVersion)) return _packageVersion;
+            _packageVersion = "unknown";
+            try
+            {
+                string p = ShuganSanitize.ToAbsolute(
+                    "Packages/com.zeroshugan.shugan-unity-tools/package.json");
+                if (!string.IsNullOrEmpty(p) && File.Exists(p))
+                {
+                    var m = System.Text.RegularExpressions.Regex.Match(
+                        File.ReadAllText(p), "\"version\"\\s*:\\s*\"([^\"]+)\"");
+                    if (m.Success) _packageVersion = m.Groups[1].Value;
+                }
+            }
+            catch { }
+            return _packageVersion;
+        }
+
         // ─── Garment meshes (toe-weight transfer targets) ──────────────────────
+
+        // Transient feedback for a rejected garment drag-and-drop. Self-clearing, and scoped to the
+        // garment section instead of the window-wide status box.
+        string _garmentDropWarning = "";
+        double _garmentDropWarningAt;
+        const double GarmentDropWarningSeconds = 6.0;
+
+        void SetGarmentDropWarning(string msg)
+        {
+            _garmentDropWarning   = msg;
+            _garmentDropWarningAt = EditorApplication.timeSinceStartup;
+        }
 
         void DrawGarmentSection()
         {
@@ -1217,11 +1936,13 @@ namespace ZeroShugan.ShuganUnityTools
                         _garmentMeshNames[i] = dropped;
                         SaveGarments();
                     }
+                    // Rejections are transient feedback about one drag, NOT run status: they used to
+                    // go through SetStatus, which owns the persistent status box at the bottom and
+                    // never clears — so the message stuck around long after the garment was removed.
                     else if (string.Equals(dropped, bodyMesh, StringComparison.OrdinalIgnoreCase))
-                        SetStatus($"'{dropped}' is the body mesh — pick a different mesh as a garment.",
-                            MessageType.Warning);
+                        SetGarmentDropWarning($"'{dropped}' is the body mesh — pick a different mesh as a garment.");
                     else
-                        SetStatus($"'{dropped}' is not a mesh of the source FBX.", MessageType.Warning);
+                        SetGarmentDropWarning($"'{dropped}' is not a mesh of the source FBX.");
                 }
 
                 // Flag a stale name (mesh no longer in this FBX) or an accidental duplicate.
@@ -1251,6 +1972,19 @@ namespace ZeroShugan.ShuganUnityTools
                 // Garments have their own shape keys, and one that moves the feet breaks the
                 // transferred toe weights the same way it breaks the body.
                 DrawFeetShapeKeyWarning(_garmentMeshNames[i], _garmentMeshNames[i]);
+            }
+
+            // Expires on its own, and disappears immediately once there are no garment slots left.
+            if (!string.IsNullOrEmpty(_garmentDropWarning))
+            {
+                if (_garmentMeshNames.Count == 0 ||
+                    EditorApplication.timeSinceStartup - _garmentDropWarningAt > GarmentDropWarningSeconds)
+                    _garmentDropWarning = "";
+                else
+                {
+                    EditorGUILayout.HelpBox(_garmentDropWarning, MessageType.Warning);
+                    Repaint();   // keep ticking so it clears without needing a mouse move
+                }
             }
 
             if (GUILayout.Button("+ Add Garment Mesh", GUILayout.Height(22)))
@@ -1334,19 +2068,33 @@ namespace ZeroShugan.ShuganUnityTools
             GUILayout.Label("Paid Blender Scripts", EditorStyles.boldLabel);
 
             string overridePath = EditorPrefs.GetString(PrefAutoRigScriptPath, "");
-            string overrideRel  = !string.IsNullOrEmpty(overridePath)
-                ? ToProjectRelative(overridePath) : "";
-            UnityEngine.Object overrideAsset =
-                !string.IsNullOrEmpty(overrideRel) && File.Exists(overridePath)
-                    ? AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(overrideRel)
+
+            // The field shows the script ACTUALLY IN USE, not just a manual override.
+            //
+            // It used to be bound to the override alone, so on a normal install — where the script
+            // sits at the default path and no override is set — the field read "None" while the
+            // green line underneath said the script was found and in use. Two bits of UI directly
+            // contradicting each other, and no way to click through to the asset.
+            //
+            // Now it auto-fills from ResolveAutoRigScriptPath(), so it always mirrors the status
+            // line and you can ping/open the real file from it.
+            bool usingOverride = !string.IsNullOrEmpty(overridePath) && File.Exists(overridePath);
+            string shownPath   = _autoRigScriptResolvedPath;      // override, else default, else null
+            string shownRel    = !string.IsNullOrEmpty(shownPath) ? ToProjectRelative(shownPath) : "";
+            UnityEngine.Object shownAsset =
+                !string.IsNullOrEmpty(shownRel) && shownRel.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)
+                    ? AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(shownRel)
                     : null;
 
             EditorGUILayout.BeginHorizontal();
             EditorGUI.BeginChangeCheck();
             var pickedAsset = EditorGUILayout.ObjectField(
                 new GUIContent("AutoRig Feet .py",
-                    "Custom path to AutoRig_Feet.py.\nEmpty = use default: " + DefaultAutoRigScriptPath),
-                overrideAsset, typeof(UnityEngine.Object), false);
+                    "The AutoRig Feet Python script this tool will run.\n\n"
+                    + "Auto-filled with the script it found. Drop a different .py here to override "
+                    + "it; clear the field (or press ×) to go back to the default:\n"
+                    + DefaultAutoRigScriptPath),
+                shownAsset, typeof(UnityEngine.Object), false);
             if (EditorGUI.EndChangeCheck())
             {
                 if (pickedAsset != null)
@@ -1354,14 +2102,33 @@ namespace ZeroShugan.ShuganUnityTools
                     string rel = AssetDatabase.GetAssetPath(pickedAsset);
                     if (!string.IsNullOrEmpty(rel) && rel.EndsWith(".py",
                             StringComparison.OrdinalIgnoreCase))
-                        EditorPrefs.SetString(PrefAutoRigScriptPath, ToAbsPath(rel));
+                    {
+                        // Picking the default script is not an override — leave the pref empty so
+                        // the tool keeps tracking the default if it ever moves.
+                        string abs = ToAbsPath(rel);
+                        bool isDefault = false;
+                        // Guarded: this runs inside OnGUI, and an exception here would break the
+                        // layout for the rest of the frame.
+                        try
+                        {
+                            isDefault = string.Equals(
+                                Path.GetFullPath(abs),
+                                Path.GetFullPath(ToAbsPath(DefaultAutoRigScriptPath)),
+                                StringComparison.OrdinalIgnoreCase);
+                        }
+                        catch { }
+                        EditorPrefs.SetString(PrefAutoRigScriptPath, isDefault ? "" : abs);
+                    }
                     else
+                    {
                         EditorPrefs.SetString(PrefAutoRigScriptPath, "");
+                    }
                 }
                 else
                 {
                     EditorPrefs.SetString(PrefAutoRigScriptPath, "");
                 }
+                _autoRigScriptResolvedPath = ResolveAutoRigScriptPath();   // reflect it immediately
             }
             if (GUILayout.Button("Browse…", GUILayout.Width(70)))
                 BrowseForAutoRigScript();
@@ -1369,20 +2136,24 @@ namespace ZeroShugan.ShuganUnityTools
                 EditorPrefs.SetString(PrefAutoRigScriptPath, "");
             EditorGUILayout.EndHorizontal();
 
-            if (!string.IsNullOrEmpty(overridePath) && overrideAsset == null)
+            // A script outside the Unity project can't be shown as an object reference, so fall
+            // back to a read-only path field — otherwise the row would look empty for those users.
+            if (!string.IsNullOrEmpty(shownPath) && shownAsset == null)
             {
                 EditorGUI.BeginDisabledGroup(true);
                 EditorGUILayout.TextField(new GUIContent("Path",
-                    "External script path (outside the Unity project)"), overridePath);
+                    "External script path (outside the Unity project)"), shownPath);
                 EditorGUI.EndDisabledGroup();
             }
 
-            // Status line
+            // Status line — says WHERE it came from, so an auto-filled field is not mistaken for a
+            // manual override the user does not remember setting.
             Color cs = GUI.color;
             GUI.color = _depAutoRigScript ? Color.green : Color.red;
             EditorGUILayout.LabelField(
                 _depAutoRigScript
-                    ? $"✓ Using: {ToProjectRelative(_autoRigScriptResolvedPath)}"
+                    ? $"✓ Using {(usingOverride ? "custom override" : "default location")}: " +
+                      ToProjectRelative(_autoRigScriptResolvedPath)
                     : "✗ Not found — install paid bundle or set a custom path",
                 EditorStyles.miniLabel);
             GUI.color = cs;
@@ -1433,19 +2204,48 @@ namespace ZeroShugan.ShuganUnityTools
             // ── FBX Swap method ──────────────────────────────────────────────
             GUILayout.Label("FBX Swap", EditorStyles.boldLabel);
             EditorGUI.BeginChangeCheck();
-            _swapMethod = (SwapMethod)EditorGUILayout.EnumPopup(
-                new GUIContent("Method",
-                    "Legacy: rebuild the avatar on the new FBX (current behaviour).\n" +
-                    "Experimental: duplicate the avatar and give it a private copy of the FBX " +
-                    "— the original is never touched. Always produces a duplicate."),
-                _swapMethod);
+            _autoSwapMethod = EditorGUILayout.ToggleLeft(
+                new GUIContent("Choose method automatically  (recommended)",
+                    "Replace → Legacy (the only method that writes your FBX in place).\n"
+                    + "Duplicate → Standard (duplicate-and-relink).\n\n"
+                    + "Untick only to force a method — e.g. to fall back to Legacy if the "
+                    + "duplicate-and-relink swap fails on a particular avatar."),
+                _autoSwapMethod);
             if (EditorGUI.EndChangeCheck())
-                EditorPrefs.SetInt(PrefSwapMethod, (int)_swapMethod);
-            if (_swapMethod == SwapMethod.Experimental)
-                EditorGUILayout.HelpBox(
-                    "Experimental: always duplicates (Export Mode is treated as Duplicate). " +
-                    "Writes a debug log to Assets/! Shugan/!_Lab/Script/FBXSwapper_Logs/.",
-                    MessageType.None);
+                EditorPrefs.SetBool(PrefAutoSwapMethod, _autoSwapMethod);
+
+            if (_autoSwapMethod)
+            {
+                EditorGUILayout.LabelField("Method",
+                    EffectiveSwapMethod() + "   (from Export Mode: " + _exportMode + ")",
+                    EditorStyles.miniLabel);
+            }
+            else
+            {
+                EditorGUI.BeginChangeCheck();
+                _swapMethod = (SwapMethod)EditorGUILayout.EnumPopup(
+                    new GUIContent("Method (forced)",
+                        "Standard: duplicate the avatar and give it a private copy of the FBX "
+                        + "— your original is never touched. Always produces a duplicate.\n"
+                        + "Legacy: rebuild the avatar on the new FBX. The only method that honours "
+                        + "Replace mode."),
+                    _swapMethod);
+                if (EditorGUI.EndChangeCheck())
+                    EditorPrefs.SetInt(PrefSwapMethod, (int)_swapMethod);
+
+                // Only reachable now that the choice is forced — automatic selection can't produce it.
+                if (_swapMethod == SwapMethod.Standard && _exportMode == ExportMode.Replace)
+                    EditorGUILayout.HelpBox(
+                        "Standard always duplicates, so Export Mode = Replace will be IGNORED and "
+                        + "your source FBX left untouched. Use Legacy to actually replace it, or "
+                        + "re-enable automatic selection.",
+                        MessageType.Warning);
+            }
+
+            if (EffectiveSwapMethod() == SwapMethod.Standard)
+                EditorGUILayout.LabelField(" ",
+                    "Writes a swap debug log to Assets/! Shugan/!_Lab/Script/FBXSwapper_Logs/.",
+                    EditorStyles.miniLabel);
 
             Separator();
 
@@ -1673,12 +2473,26 @@ namespace ZeroShugan.ShuganUnityTools
                 backupJsonPath: backupJsonPath,
                 footBoneL: _footOverrideL, footBoneR: _footOverrideR);
 
+            // Archive the wrapper that actually ran. It goes to a fixed temp filename and is
+            // overwritten by the next run, so without this the exact python behind a failure is
+            // unrecoverable. Saved as .txt, never .py, so it can never be mistaken for the paid
+            // script by the script-path resolver or by the user browsing the folder.
+            ArchiveWrapperScript(pythonCode);
+
             _blenderProcess = BlenderBridge.LaunchBlenderProcess(
                 blenderPath, pythonCode, headless: true, factoryStartup: true,
                 onOutputLine: EnqueueLine);
 
             if (_blenderProcess == null)
             {
+                _runReport.AddIssue("U_LAUNCH_FAILED", "fatal",
+                    "Blender could not be started.",
+                    "Check the Blender path in Advanced Settings, and that Blender is not blocked "
+                    + "by antivirus or already running an update.");
+                _runReport.exitCode       = -1;
+                _runReport.logPath        = _runLogPath ?? "";
+                _runReport.timestampTicks = DateTime.UtcNow.Ticks;
+                FinishRunReport();
                 SetStatus("Failed to launch Blender.", MessageType.Error);
                 _state = State.Error;
                 return;
@@ -1694,10 +2508,10 @@ namespace ZeroShugan.ShuganUnityTools
 
         void RunFBXSwap()
         {
-            // Experimental method: duplicate-and-relink. Always produces a duplicate, so it
+            // Standard method: duplicate-and-relink. Always produces a duplicate, so it
             // ignores Export Mode (Replace). The "new FBX" is the Blender export; the "old FBX"
             // is the source body FBX whose duplicate gets the new content written into it.
-            if (_swapMethod == SwapMethod.Experimental)
+            if (EffectiveSwapMethod() == SwapMethod.Standard)
             {
                 string relExp   = ToProjectRelative(_exportPath);
                 var newFbxExp   = AssetDatabase.LoadAssetAtPath<GameObject>(relExp);
@@ -1705,7 +2519,7 @@ namespace ZeroShugan.ShuganUnityTools
 
                 _resultInstance = FBXSwapperTest.ExecuteSwap(_avatarObject, newFbxExp, _sourceFbxAsset);
                 if (_resultInstance == null)
-                    SetError("Experimental FBX swap failed — see the Console and the FBXSwapper log.");
+                    SetError("FBX swap failed — see the Console and the FBXSwapper log.");
                 return;
             }
 
@@ -1771,9 +2585,22 @@ namespace ZeroShugan.ShuganUnityTools
                 return;
             }
 
-            _resultInstance = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
+            // Instantiate into the TARGET AVATAR'S OWN SCENE, not the active one. With several
+            // scenes open in the Hierarchy, the active scene is often not the one the avatar lives
+            // in, and the rigged copy would land in the wrong scene — far from the original, and
+            // easy to save into a scene the user never meant to touch.
+            var targetScene = _avatarObject != null ? _avatarObject.scene : default(Scene);
+            _resultInstance = targetScene.IsValid()
+                ? (GameObject)PrefabUtility.InstantiatePrefab(prefab, targetScene)
+                : (GameObject)PrefabUtility.InstantiatePrefab(prefab);
+
             _resultInstance.transform.position = _avatarObject.transform.position + Vector3.right * 1f;
             _resultInstance.transform.rotation = _avatarObject.transform.rotation;
+
+            // Keep it next to the original in the Hierarchy too: same parent, inserted right after.
+            if (_avatarObject.transform.parent != null)
+                _resultInstance.transform.SetParent(_avatarObject.transform.parent, worldPositionStays: true);
+            _resultInstance.transform.SetSiblingIndex(_avatarObject.transform.GetSiblingIndex() + 1);
         }
 
         // Returns the .prefab asset the scene avatar is an instance of, or null if none.
@@ -1821,6 +2648,87 @@ namespace ZeroShugan.ShuganUnityTools
                 Undo.RegisterCreatedObjectUndo(child, "AutoRig Feet — Add Prefab");
             }
             Selection.activeGameObject = _resultInstance;
+        }
+
+        // ─── Final pass: name the result after what it is ──────────────────────
+
+        /// <summary>
+        /// Rename the finished avatar to "&lt;original avatar&gt;_&lt;Export Suffix&gt;", e.g.
+        /// `Poiyomi_Airi` → `Poiyomi_Airi_Rig_Feet`.
+        ///
+        /// Neither swap path produced a meaningful name on its own: the Standard swap calls its
+        /// duplicate `<name>_swap`, which describes the mechanism rather than the result (and
+        /// FBXSwapper is a general-purpose tool, so that name stays right for its standalone use),
+        /// while Legacy Duplicate mode simply inherits the source prefab's name. Either way the
+        /// scene object did not say it was the feet-rigged version, and did not match the naming the
+        /// exported FBX already uses.
+        ///
+        /// NOT done in Replace mode: there `_resultInstance` IS the user's original scene object,
+        /// and renaming it would rename the avatar they already had rather than a new copy.
+        /// </summary>
+        void RenameResultInstance()
+        {
+            if (_resultInstance == null || _avatarObject == null) return;
+            if (_resultInstance == _avatarObject) return;   // Replace mode — same object, leave it
+
+            string suffix = (_exportSuffix ?? "").Trim();
+            if (suffix.Length == 0) suffix = "Rig_Feet";     // same fallback as ComputeExportPath
+
+            string desired = _avatarObject.name + "_" + suffix;
+            string final   = UniqueSiblingName(_resultInstance, desired);
+            if (_resultInstance.name == final) return;
+
+            try
+            {
+                string before = _resultInstance.name;
+                Undo.RecordObject(_resultInstance, "AutoRig Feet — Rename Result");
+                _resultInstance.name = final;
+                UnityEngine.Debug.Log(
+                    "[AutoRig Feet Distributor] Renamed result: " + before + " → " + final);
+            }
+            catch (Exception ex)
+            {
+                // Cosmetic only — never fail a completed rig over a name.
+                UnityEngine.Debug.LogWarning(
+                    "[AutoRig Feet Distributor] Could not rename the result: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// `desired`, or `desired_001`, `desired_002`… if a sibling already has that name. Mirrors
+        /// how ComputeExportPath numbers a taken FBX filename, so a second run's scene object and
+        /// its FBX stay parallel instead of silently producing two identically-named avatars.
+        /// </summary>
+        static string UniqueSiblingName(GameObject self, string desired)
+        {
+            if (!NameTakenAmongSiblings(self, desired)) return desired;
+            for (int n = 1; n < 1000; n++)
+            {
+                string candidate = desired + "_" + n.ToString("D3");
+                if (!NameTakenAmongSiblings(self, candidate)) return candidate;
+            }
+            return desired;
+        }
+
+        static bool NameTakenAmongSiblings(GameObject self, string name)
+        {
+            try
+            {
+                Transform parent = self.transform.parent;
+                if (parent != null)
+                {
+                    foreach (Transform t in parent)
+                        if (t != null && t.gameObject != self && t.name == name) return true;
+                    return false;
+                }
+                // No parent: the siblings are the scene's root objects.
+                var scene = self.scene;
+                if (!scene.IsValid()) return false;
+                foreach (var root in scene.GetRootGameObjects())
+                    if (root != null && root != self && root.name == name) return true;
+            }
+            catch { }
+            return false;
         }
 
         void DrainOutputQueue()
@@ -1884,6 +2792,13 @@ namespace ZeroShugan.ShuganUnityTools
         {
             KillBlender();
             _runReport.AddIssue("U_CANCELLED", "info", "Run cancelled by the user.");
+            _runReport.exitCode       = -1;
+            _runReport.logPath        = _runLogPath ?? "";
+            _runReport.timestampTicks = DateTime.UtcNow.Ticks;
+            // A cancelled run used to skip this entirely, so its report was never written and its
+            // log folder was left open. A user who cancels because something looks wrong is exactly
+            // the user whose diagnostics we want to keep.
+            FinishRunReport();
             _state            = State.Idle;
             _displayProgress  = 0f;
             _currentStepLabel = "";
@@ -1954,7 +2869,11 @@ namespace ZeroShugan.ShuganUnityTools
 
             if (string.IsNullOrEmpty(_runReport.status))
                 _runReport.status = _runReport.HasWarnings ? "warnings" : "ok";
-            FinishRunReport();
+            // SAVE, do not FINISH: the run is not over. The FBX swap, prefab wiring and humanoid
+            // auto-map still have to happen, and finishing here would close the run log right after
+            // Blender — which is exactly what it used to do, truncating the log before the
+            // Unity-side steps and sending the humanoid mapping log to the wrong folder.
+            SaveRunReport();
             return true;
         }
 
@@ -1967,24 +2886,70 @@ namespace ZeroShugan.ShuganUnityTools
 
         [SerializeField] bool _reportFoldout = true;
 
-        // Persist the evaluated report next to the run logs and remember it per-FBX, so the
-        // panel survives domain reloads and Unity restarts.
-        void FinishRunReport()
+        // Persist the evaluated report into this run's diagnostics folder and remember it per-FBX,
+        // so the panel survives domain reloads and Unity restarts. Also the single place the run
+        // log is closed — every terminal path funnels through here, including cancellation.
+        // Save the report WITHOUT ending the run. Used at intermediate checkpoints (the Blender step
+        // succeeded, but the Unity-side pipeline is still going).
+        void SaveRunReport()
         {
             try
             {
-                if (_sourceFbxAsset == null) return;
-                string fbxPath = AssetDatabase.GetAssetPath(_sourceFbxAsset);
-                string dir     = Path.Combine(SourceFbxAbsDir(), "_Backups");
-                Directory.CreateDirectory(dir);
-                string path = Path.Combine(dir,
-                    Path.GetFileNameWithoutExtension(fbxPath) + "_lastreport.json");
-                File.WriteAllText(path, JsonUtility.ToJson(_runReport, true));
-                string guid = AssetDatabase.AssetPathToGUID(fbxPath);
-                if (!string.IsNullOrEmpty(guid))
-                    EditorPrefs.SetString(PrefLastReportPrefix + guid, path);
+                if (_runReport != null)
+                {
+                    _runReport.toolVersion   = ToolVersion;
+                    _runReport.scriptVersion = LocalPyVersion() ?? "";
+                    _runReport.runFolder     = _runLogger != null ? (_runLogger.FolderAssetPath ?? "") : "";
+                }
+
+                string json = JsonUtility.ToJson(_runReport, true);
+
+                // Primary home: the run folder, so report.json sits with the log, the environment
+                // and the avatar snapshot as one sendable bundle.
+                if (_runLogger != null) _runLogger.WriteText("report.json", json);
+
+                // Secondary: the per-FBX "last report" pointer that drives the panel. Kept beside
+                // the FBX as before so an existing project keeps working after this change.
+                if (_sourceFbxAsset != null)
+                {
+                    string fbxPath = AssetDatabase.GetAssetPath(_sourceFbxAsset);
+                    string dir     = Path.Combine(SourceFbxAbsDir(), "_Backups");
+                    Directory.CreateDirectory(dir);
+                    string path = Path.Combine(dir,
+                        Path.GetFileNameWithoutExtension(fbxPath) + "_lastreport.json");
+                    File.WriteAllText(path, json);
+                    string guid = AssetDatabase.AssetPathToGUID(fbxPath);
+                    if (!string.IsNullOrEmpty(guid))
+                        EditorPrefs.SetString(PrefLastReportPrefix + guid, path);
+                }
             }
             catch { /* persistence is best-effort — the in-memory report still shows */ }
+        }
+
+        // The run is over: save the final report and close the log. Every terminal path calls this.
+        void FinishRunReport()
+        {
+            SaveRunReport();
+            CloseRunLog();
+        }
+
+        // Close the streaming log. Safe to call twice.
+        void CloseRunLog()
+        {
+            if (_runLogger == null) return;
+            try
+            {
+                _runLogger.Section("RUN FINISHED — status: " +
+                    (_runReport != null && !string.IsNullOrEmpty(_runReport.status)
+                        ? _runReport.status : "(none)"));
+                _runLogger.End();
+            }
+            catch { }
+            _runLogger = null;
+            _runsCacheDirty = true;
+            // No AssetDatabase.Refresh here: the log folder ends in `~`, so Unity deliberately does
+            // not import it (see ShuganRunLog.ToolRootAssetPath). Refreshing was what dragged the
+            // still-being-written run.log into the asset pipeline in the first place.
         }
 
         // Reload the last saved report for the current FBX (only when nothing is in memory).
@@ -2086,6 +3051,19 @@ namespace ZeroShugan.ShuganUnityTools
                 }
                 GUILayout.FlexibleSpace();
                 EditorGUILayout.EndHorizontal();
+
+                // A failed run is exactly when a customer wants to reach us, so offer the route
+                // here rather than making them find the tab. This only NAVIGATES — it never sends;
+                // the consent gate over there is still the only thing that can.
+                if (_runReport.HasFatal && _tab != Tab.Report)
+                {
+                    EditorGUILayout.Space(2);
+                    if (GUILayout.Button("Report this to the developer…", GUILayout.Height(22)))
+                    {
+                        _selectedRun = 0;             // the run that just failed is the newest
+                        GoToTab(Tab.Report);
+                    }
+                }
             }
             EditorGUILayout.EndVertical();
         }
@@ -2112,8 +3090,12 @@ namespace ZeroShugan.ShuganUnityTools
                     UnityEngine.Debug.LogWarning("[AutoRig Feet] Humanoid auto-map skipped: couldn't resolve the avatar's FBX.");
                     return;
                 }
+                // Redirect the mapping log into THIS run's folder. It used to land in
+                // HumanoidRigMapping_Logs, so every AutoRig run scattered a second log somewhere the
+                // customer would never think to send.
                 var res = HumanoidRigMapping.EnsureFeetAndToesMapped(
-                    fbxPath, replaceLowConfidence: false, removeJaw: false, logSource: "autorig");
+                    fbxPath, replaceLowConfidence: false, removeJaw: false, logSource: "autorig",
+                    logFolderOverride: _runLogger != null ? _runLogger.FolderAssetPath : null);
                 UnityEngine.Debug.Log($"[AutoRig Feet] Humanoid auto-map ({System.IO.Path.GetFileName(fbxPath)}): {res.message}");
                 if (!res.avatarValid || !res.feetToesComplete)
                     _runReport.AddIssue("U_HUMANOID_MAP", "warning",
@@ -2131,49 +3113,146 @@ namespace ZeroShugan.ShuganUnityTools
             }
         }
 
-        // ─── Run log capture (full Blender console → file) ─────────────────────
+        // ─── Run log capture (Blender console + Unity console → run folder) ────
 
         // Called on the Blender process's output thread for every stdout/stderr line.
         void EnqueueLine(string line)
         {
-            lock (_outputLock)
-            {
-                _outputQueue.Enqueue(line);
-                if (_runLog != null) _runLog.AppendLine(line);
-            }
+            lock (_outputLock) _outputQueue.Enqueue(line);
+            // Streamed straight to disk (ShuganRunLog does its own locking, so the two locks are
+            // never nested). AutoFlush means the log survives a crash or a watchdog kill.
+            if (_runLogger != null) _runLogger.Line(line);
         }
 
+        // Opens this run's diagnostics folder and captures everything we know BEFORE Blender starts,
+        // so a run that dies early still produces a usable bundle.
         void BeginRunLog(string kind)
         {
-            _runLog = new StringBuilder();
-            try
-            {
-                string dir = Path.Combine(SourceFbxAbsDir(), "_Backups");
-                Directory.CreateDirectory(dir);
-                string fbxName = _sourceFbxAsset != null
-                    ? Path.GetFileNameWithoutExtension(AssetDatabase.GetAssetPath(_sourceFbxAsset))
-                    : "unknown";
-                _runLogPath = Path.Combine(dir,
-                    $"{fbxName}_{kind}_log_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-            }
-            catch { _runLogPath = null; }
+            try { if (_runLogger != null) _runLogger.End(); } catch { }
+
+            string fbxName = _sourceFbxAsset != null
+                ? Path.GetFileNameWithoutExtension(AssetDatabase.GetAssetPath(_sourceFbxAsset))
+                : "unknown";
+
+            _runLogger  = ShuganRunLog.Begin(LogToolName, fbxName);
+            _runLogPath = _runLogger.LogFileAbs;
+            _runLogger.BeginConsoleCapture();
+
+            _runLogger.Line("AutoRig Feet — " + kind + " run");
+            _runLogger.Line("tool " + ToolVersion + " · script " + (LocalPyVersion() ?? "?")
+                            + " · Unity " + Application.unityVersion);
+            _runLogger.Line("folder: " + _runLogger.FolderAssetPath);
+
+            WriteEnvironmentJson(kind);
+            WriteAvatarSnapshotJson();
+            _runLogger.Section("BLENDER CONSOLE");
         }
 
+        // The Blender process ended. The log stays OPEN: the Unity-side steps that follow (FBX swap,
+        // prefab wiring, humanoid auto-map) can fail too, and those failures used to be invisible.
+        // FinishRunReport closes it.
         void WriteRunLog()
         {
-            if (_runLog == null || string.IsNullOrEmpty(_runLogPath)) { _runLog = null; return; }
+            if (_runLogger == null) return;
+            _runLogger.Section("BLENDER PROCESS ENDED");
+            if (!string.IsNullOrEmpty(_runLogPath))
+                UnityEngine.Debug.Log("[AutoRig Feet] Run log:\n" + _runLogPath);
+        }
+
+        void WriteEnvironmentJson(string kind)
+        {
             try
             {
-                string text;
-                lock (_outputLock) text = _runLog.ToString();
-                File.WriteAllText(_runLogPath, text);
-                UnityEngine.Debug.Log("[AutoRig Feet] Blender console log saved:\n" + _runLogPath);
+                string blenderPath = EditorPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
+                var e = new List<KeyValuePair<string, string>>
+                {
+                    new KeyValuePair<string, string>("runKind",        kind),
+                    new KeyValuePair<string, string>("startedUtc",     DateTime.UtcNow.ToString("o")),
+                    new KeyValuePair<string, string>("toolVersion",    ToolVersion),
+                    new KeyValuePair<string, string>("scriptVersion",  LocalPyVersion() ?? "(unknown)"),
+                    new KeyValuePair<string, string>("scriptPath",     _autoRigScriptResolvedPath ?? "(unresolved)"),
+                    new KeyValuePair<string, string>("unityVersion",   Application.unityVersion),
+                    new KeyValuePair<string, string>("os",             SystemInfo.operatingSystem),
+                    new KeyValuePair<string, string>("blenderPath",    blenderPath),
+                    new KeyValuePair<string, string>("hasVRCFury",     _depVRCFury.ToString()),
+                    new KeyValuePair<string, string>("exportMode",     _exportMode.ToString()),
+                    new KeyValuePair<string, string>("swapMethod",     EffectiveSwapMethod().ToString()),
+                    new KeyValuePair<string, string>("swapMethodAuto", _autoSwapMethod.ToString()),
+                    new KeyValuePair<string, string>("exportSuffix",   _exportSuffix ?? ""),
+                    new KeyValuePair<string, string>("exportFolder",   string.IsNullOrEmpty(_exportFolder) ? "(beside source)" : _exportFolder),
+                    new KeyValuePair<string, string>("backupEnabled",  _backupEnabled.ToString()),
+                    new KeyValuePair<string, string>("autoMapFeet",    _autoMapFeet.ToString()),
+                    new KeyValuePair<string, string>("timeoutMinutes", _timeoutMin.ToString()),
+                    new KeyValuePair<string, string>("footOverrideL",  string.IsNullOrEmpty(_footOverrideL) ? "(auto)" : _footOverrideL),
+                    new KeyValuePair<string, string>("footOverrideR",  string.IsNullOrEmpty(_footOverrideR) ? "(auto)" : _footOverrideR),
+                    new KeyValuePair<string, string>("targetMesh",     CurrentMeshName()),
+                    new KeyValuePair<string, string>("garments",       string.Join(", ", _garmentMeshNames.ToArray())),
+                    new KeyValuePair<string, string>("alreadyRigged",  _alreadyRigged.ToString()),
+                };
+                _runLogger.WriteText("environment.json", AutoRigAvatarSnapshot.CaptureEnvironmentJson(e));
             }
-            catch (Exception ex)
+            catch (Exception ex) { _runLogger.Line("[log] environment capture failed: " + ex.Message); }
+        }
+
+        void WriteAvatarSnapshotJson()
+        {
+            try
             {
-                UnityEngine.Debug.LogWarning("[AutoRig Feet] Could not write Blender log: " + ex.Message);
+                var extras = new AutoRigAvatarSnapshot.Extras
+                {
+                    bodyMeshName     = CurrentMeshName(),
+                    garmentMeshNames = new List<string>(_garmentMeshNames),
+                };
+                extras.shapeKeyFindings = CollectShapeKeyFindings();
+
+                string fbxPath = _sourceFbxAsset != null
+                    ? AssetDatabase.GetAssetPath(_sourceFbxAsset) : "";
+                string json = AutoRigAvatarSnapshot.CaptureJson(_avatarObject, fbxPath, extras);
+                _runLogger.WriteText("avatar.json", json);
+                _runLogger.Line("[log] avatar snapshot written (" + json.Length + " chars)");
             }
-            _runLog = null;
+            catch (Exception ex) { _runLogger.Line("[log] avatar snapshot failed: " + ex.Message); }
+        }
+
+        // Re-uses the tool's own feet-shape-key detection, so the bundle records exactly what the
+        // red warning showed the user — including the case where nothing was detected and why.
+        List<string> CollectShapeKeyFindings()
+        {
+            var findings = new List<string>();
+            var meshes   = new List<string> { CurrentMeshName() };
+            meshes.AddRange(_garmentMeshNames);
+
+            foreach (string mn in meshes)
+            {
+                if (string.IsNullOrEmpty(mn)) continue;
+                try
+                {
+                    var smr = FindAvatarSkinnedMesh(mn);
+                    if (smr == null) { findings.Add(mn + ": not found in the scene avatar"); continue; }
+                    GetFeetVerts(smr, out string note);
+                    if (!string.IsNullOrEmpty(note)) findings.Add(mn + ": " + note);
+                    foreach (var o in GetFeetShapeOffenders(smr))
+                        findings.Add(mn + ": shape key '" + o.name + "' = " + o.weight.ToString("0.##")
+                                     + " moves the feet by " + (o.delta * 100f).ToString("0.###") + " cm");
+                }
+                catch (Exception ex) { findings.Add(mn + ": shape key check failed — " + ex.Message); }
+            }
+            return findings;
+        }
+
+        string CurrentMeshName()
+        {
+            if (_meshNames == null || _meshNames.Length == 0) return "";
+            return _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
+        }
+
+        // The generated wrapper is public-package code that importlib-loads the paid script by
+        // path — it contains no paid source, so archiving it leaks nothing.
+        void ArchiveWrapperScript(string pythonCode)
+        {
+            if (_runLogger == null || string.IsNullOrEmpty(pythonCode)) return;
+            try { _runLogger.WriteText("blender_wrapper.txt", pythonCode); }
+            catch { }
         }
 
         // ─── Avatar / FBX detection ────────────────────────────────────────────
@@ -2687,14 +3766,66 @@ namespace ZeroShugan.ShuganUnityTools
         void BackupOriginalFbx()
         {
             string srcAbs    = ToAbsPath(AssetDatabase.GetAssetPath(_sourceFbxAsset));
+
+            // Only back up a file we are actually about to overwrite.
+            //
+            // This used to run unconditionally, so Duplicate mode — where Blender exports to a
+            // separate "_Rig_Feet.fbx" and the source is never written — left a full copy of an
+            // untouched FBX behind on every run. Measured on a real project: three Duplicate-mode
+            // runs produced three identical 17.4 MB copies, 51 MB of backups of a file nothing had
+            // touched. These are deliberately never rotated, so it grows without bound.
+            //
+            // The test is the export path itself rather than the Export Mode enum, so it stays
+            // correct if ComputeExportPath's rules ever change.
+            bool overwritesSource = false;
+            try
+            {
+                overwritesSource = !string.IsNullOrEmpty(_exportPath) &&
+                    string.Equals(Path.GetFullPath(_exportPath), Path.GetFullPath(srcAbs),
+                                  StringComparison.OrdinalIgnoreCase);
+            }
+            catch { overwritesSource = true; }   // can't tell — keep the safety net
+
+            if (!overwritesSource)
+            {
+                UnityEngine.Debug.Log(
+                    "[AutoRig Feet Distributor] Full FBX backup skipped: this run writes to "
+                    + Path.GetFileName(_exportPath) + " and does not modify the source FBX.");
+                return;
+            }
+
             string backupDir = Path.Combine(Path.GetDirectoryName(srcAbs), "_Backups");
             Directory.CreateDirectory(backupDir);
             string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             string name  = Path.GetFileNameWithoutExtension(srcAbs);
             string dest  = Path.Combine(backupDir, $"{name}_backup_{stamp}.fbx");
             File.Copy(srcAbs, dest, overwrite: false);
+
+            // Copy the .meta so the backup keeps the original's import settings (rig type, scale,
+            // material mapping) — restoring an FBX without them is close to useless.
+            //
+            // But give it a FRESH guid. A straight copy duplicates the original's guid, and Unity
+            // then logs "GUID [...] conflicts with '<original>.fbx' (current owner). Assigning a new
+            // guid." on the next import, once per backup, forever. Caught by the run log's console
+            // capture on the very first real run.
             string metaSrc = srcAbs + ".meta";
-            if (File.Exists(metaSrc)) File.Copy(metaSrc, dest + ".meta", overwrite: false);
+            if (File.Exists(metaSrc))
+            {
+                try
+                {
+                    string meta = File.ReadAllText(metaSrc);
+                    meta = System.Text.RegularExpressions.Regex.Replace(
+                        meta, @"(?m)^guid:\s*[0-9a-fA-F]{32}\s*$",
+                        "guid: " + Guid.NewGuid().ToString("N"));
+                    File.WriteAllText(dest + ".meta", meta);
+                }
+                catch (Exception ex)
+                {
+                    // Import settings are a nice-to-have; the FBX itself is the backup that matters.
+                    UnityEngine.Debug.LogWarning(
+                        "[AutoRig Feet Distributor] Backup .meta not written: " + ex.Message);
+                }
+            }
             UnityEngine.Debug.Log($"[AutoRig Feet Distributor] Backup: {dest}");
         }
 
@@ -2816,6 +3947,24 @@ namespace ZeroShugan.ShuganUnityTools
             SetStatus(msg, MessageType.Error);
             _state = State.Error;
             UnityEngine.Debug.LogError("[AutoRig Feet Distributor] " + msg);
+
+            // A run that had started logging must not end with an open log and no report. This
+            // catches the post-Blender steps — the FBX swap and prefab wiring throw into SetError,
+            // and those failures are exactly why the log is kept open past the Blender process.
+            //
+            // Guarded on _runLogger, which is null both before a run starts (SetError is also used
+            // for pre-flight validation, which must not overwrite the previous run's report) and
+            // after FinishRunReport has already run — so the paths that finalize then call SetError
+            // do not write twice.
+            if (_runLogger == null || _runReport == null) return;
+
+            if (!_runReport.HasFatal)
+                _runReport.AddIssue("U_STEP_FAILED", "fatal", msg,
+                    "This happened after Blender finished, so the exported FBX exists — check the "
+                    + "run log. Your original FBX is backed up in the _Backups folder next to it.");
+            _runReport.logPath        = _runLogPath ?? "";
+            _runReport.timestampTicks = DateTime.UtcNow.Ticks;
+            FinishRunReport();
         }
 
         static string TruncateLabel(string s, int max)

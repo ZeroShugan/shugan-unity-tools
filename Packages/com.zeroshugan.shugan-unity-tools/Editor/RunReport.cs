@@ -20,6 +20,19 @@ namespace ShuganTools
         public string message;
         public string hint;
 
+        /// <summary>
+        /// The verbatim sentinel JSON this issue was parsed from.
+        ///
+        /// Python attaches a `data` object to several issues — most importantly the 1500-character
+        /// traceback on PY_EXCEPTION, and the ranked candidate lists on BONE_CANDIDATES. JsonUtility
+        /// cannot deserialize an arbitrary object, and silently drops any field with no matching
+        /// member, so all of that used to vanish the moment it reached C#: the report panel showed
+        /// "unhandled exception" with no traceback, and the traceback survived only in the raw
+        /// console log. Keeping the original line costs nothing and couples us to no schema, so a
+        /// future python-side `data` key needs no change here.
+        /// </summary>
+        public string rawJson = "";
+
         public bool IsFatal   => severity == "fatal";
         public bool IsWarning => severity == "warning";
         public bool IsInfo    => severity == "info" || string.IsNullOrEmpty(severity);
@@ -38,6 +51,19 @@ namespace ShuganTools
         public int            exitCode = int.MinValue; // Blender process exit code (Unity fills this)
         public string         logPath = "";      // per-run log file (Unity fills this)
         public long           timestampTicks;    // DateTime.UtcNow.Ticks at evaluation (Unity fills this)
+
+        /// <summary>
+        /// The verbatim [SHUGAN_REPORT] line. Preserves python's `stats` object (bones_created,
+        /// garments, and whatever gets added later), which FinalReportDto cannot express and so
+        /// used to be parsed away entirely. Keeping the raw line means the run folder's report.json
+        /// carries the complete python-side result, not just the part C# happens to model.
+        /// </summary>
+        public string finalRawJson = "";
+
+        /// <summary>Context the Unity side fills in so report.json stands alone in a bug report.</summary>
+        public string runFolder = "";
+        public string toolVersion = "";
+        public string scriptVersion = "";
 
         public bool HasFatal
         {
@@ -85,9 +111,15 @@ namespace ShuganTools
             {
                 try
                 {
-                    var issue = JsonUtility.FromJson<RunIssue>(line.Substring(idx + IssuePrefix.Length));
+                    string json  = line.Substring(idx + IssuePrefix.Length);
+                    var    issue = JsonUtility.FromJson<RunIssue>(json);
                     if (issue != null && !string.IsNullOrEmpty(issue.code) && !Contains(issue))
+                    {
+                        // Set after deserializing: the sentinel JSON has no rawJson key, so
+                        // FromJson would have cleared anything assigned beforehand.
+                        issue.rawJson = json;
                         issues.Add(issue);
+                    }
                 }
                 catch { /* malformed — ignore, the raw line is still in the run log */ }
                 return true;
@@ -98,7 +130,9 @@ namespace ShuganTools
             {
                 try
                 {
-                    var final = JsonUtility.FromJson<FinalReportDto>(line.Substring(idx + ReportPrefix.Length));
+                    string finalJson = line.Substring(idx + ReportPrefix.Length);
+                    finalRawJson = finalJson;
+                    var final = JsonUtility.FromJson<FinalReportDto>(finalJson);
                     if (final != null)
                     {
                         receivedFinal = true;

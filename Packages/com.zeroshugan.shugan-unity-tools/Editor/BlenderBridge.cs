@@ -821,14 +821,35 @@ print('[BlenderBridge] Restore complete.')
                 line => { lock (_outputLock) _outputQueue.Enqueue(line); });
         }
 
+        // Unique per-launch names would otherwise accumulate forever in the temp cache. Nothing
+        // written on a customer machine may grow without a bound.
+        static void PruneOldBridgeScripts()
+        {
+            try
+            {
+                var files = Directory.GetFiles(
+                    Application.temporaryCachePath, "shugan_blender_bridge_*.py");
+                if (files.Length <= 10) return;
+                Array.Sort(files, StringComparer.Ordinal);   // timestamped names sort chronologically
+                for (int i = 0; i < files.Length - 10; i++)
+                    try { File.Delete(files[i]); } catch { }
+            }
+            catch { }
+        }
+
         public static Process LaunchBlenderProcess(
             string blenderPath, string pythonCode, bool headless, bool factoryStartup,
             Action<string> onOutputLine)
         {
             if (!File.Exists(blenderPath)) return null;
 
-            string script = Path.Combine(Application.temporaryCachePath, "shugan_blender_bridge.py");
+            // Per-launch filename. This used to be a single fixed path, so two runs overlapping even
+            // briefly (a slow Blender still starting while the user launched another tool) would
+            // read a script the other had just overwritten.
+            string script = Path.Combine(Application.temporaryCachePath,
+                "shugan_blender_bridge_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + ".py");
             File.WriteAllText(script, pythonCode, Encoding.UTF8);
+            PruneOldBridgeScripts();
 
             var args = new StringBuilder();
             if (factoryStartup) args.Append("--factory-startup ");

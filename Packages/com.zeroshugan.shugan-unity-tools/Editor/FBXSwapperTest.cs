@@ -50,7 +50,7 @@ namespace ZeroShugan.ShuganUnityTools
 
             EditorGUILayout.Space(4);
             EditorGUILayout.HelpBox(
-                "Experimental swap method. Instead of rebuilding the avatar, it DUPLICATES your scene " +
+                "Duplicate-and-relink swap. Instead of rebuilding the avatar, it DUPLICATES your scene " +
                 "avatar, gives the duplicate a private copy of the FBX, writes the new FBX into that copy, " +
                 "and grafts any new bones. Your original avatar is never modified.\n\n" +
                 "Best for the AutoRig Feet case (same meshes, added toe bones). Writes a debug log to " +
@@ -146,6 +146,21 @@ namespace ZeroShugan.ShuganUnityTools
                 // Step 2 — duplicate the scene avatar
                 dup = Object.Instantiate(sceneAvatar);
                 dup.name = sceneAvatar.name + "_swap";
+
+                // Keep the duplicate in the SOURCE avatar's scene. Object.Instantiate drops a clone
+                // into the ACTIVE scene, which with several scenes open in the Hierarchy is often
+                // not the one the avatar came from — the rigged copy then appeared in the wrong
+                // scene, and could be saved into a scene the user never meant to touch.
+                if (sceneAvatar.transform.parent != null)
+                {
+                    dup.transform.SetParent(sceneAvatar.transform.parent, worldPositionStays: true);
+                }
+                else if (sceneAvatar.scene.IsValid() && dup.scene != sceneAvatar.scene)
+                {
+                    UnityEngine.SceneManagement.SceneManager.MoveGameObjectToScene(dup, sceneAvatar.scene);
+                }
+                dup.transform.SetSiblingIndex(sceneAvatar.transform.GetSiblingIndex() + 1);
+
                 if (offset) dup.transform.position += Vector3.right * 1f;
                 Undo.RegisterCreatedObjectUndo(dup, "FBX Swapper (Test)");
                 if (PrefabUtility.IsPartOfPrefabInstance(dup))
