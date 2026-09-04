@@ -67,6 +67,7 @@ namespace ZeroShugan.ShuganUnityTools
         int          _selectedMeshIndex = 0;
         bool         _fbxAutoDetected;
         bool         _alreadyRigged;
+        string       _riggedVersion;   // script version that built the existing rig; null = unknown
 
         // ─── Garment meshes (toe-weight transfer targets) ─────────────────────
         // Extra meshes from the source FBX (socks / thigh-highs / shoes) that the body's toe + foot
@@ -178,12 +179,12 @@ namespace ZeroShugan.ShuganUnityTools
         // ─── Menu ──────────────────────────────────────────────────────────────
 
         const string WikiUrl = "https://www.notion.so/shugan/AutoRig-Feet-Distributor";
-        const string ToolVersion = "1.0";
 
         [MenuItem("Tools/Shugan/AutoRig Feet (Distributor)", false, 1900)]
         static void Open()
         {
-            var win = GetWindow<AutoRigFeetDistributor>("AutoRig Feet (Distributor)");
+            // Tab title stays short — the full "v1.2.2 · script 3.9.0" line is in the header.
+            var win = GetWindow<AutoRigFeetDistributor>("AutoRig Feet " + PackageVersion());
             win.minSize = new Vector2(460, 420);
         }
 
@@ -370,6 +371,10 @@ namespace ZeroShugan.ShuganUnityTools
                     // End of pipeline: ensure the FINAL scene avatar's FBX has humanoid foot/toes mapped.
                     if (_autoMapFeet) AutoMapHumanoidFeet();
                     FinishRunReport();   // re-save: the auto-map may have added warnings
+                    // The avatar now HAS a rig (and a fresh version marker). Without this the
+                    // "already rigged" notice stayed hidden in Replace mode, where the result is
+                    // the same object so avatar-change adoption never fires.
+                    RefreshRigState();
                     _displayProgress  = 1f;
                     _state            = State.Done;
                     _currentStepLabel = "Done!";
@@ -396,7 +401,13 @@ namespace ZeroShugan.ShuganUnityTools
 
             _scroll = EditorGUILayout.BeginScrollView(_scroll);
 
-            ShuganToolUI.DrawHeader("AutoRig Feet  —  Distributor");
+            // Both versions in the header: the package version identifies the Unity tool, the
+            // script version is the paid bundle — and the script version is the one that decides
+            // whether re-applying a rig gains the user anything, so it belongs where it is visible
+            // rather than only in Advanced Settings.
+            string pyVer = LocalPyVersion();
+            ShuganToolUI.DrawHeader("AutoRig Feet  —  Distributor    v" + PackageVersion()
+                + (string.IsNullOrEmpty(pyVer) ? "" : "  ·  script " + pyVer));
             ShuganToolUI.DrawSocialLinks(WikiUrl);
             EditorGUILayout.Space(4);
 
@@ -431,13 +442,13 @@ namespace ZeroShugan.ShuganUnityTools
 
             if (_tab == Tab.Setup) DrawReadinessHints(IsReady());
 
-            if (_tab == Tab.Setup && _alreadyRigged && _state == State.Idle)
+            // Deliberately NOT gated on State.Idle any more: after a run the state is Done, and
+            // hiding the notice exactly then meant the avatar that had just been rigged was the one
+            // avatar that never showed it.
+            if (_tab == Tab.Setup && _alreadyRigged && _state != State.BlenderRunning
+                && _state != State.Restoring)
             {
-                EditorGUILayout.HelpBox(
-                    "This avatar already has AutoRig Feet bones (z_CB / Toes_a1 found). " +
-                    "Running again is safe: the previous feet rig is removed automatically and " +
-                    "re-created cleanly — use this to redo the rig or apply a newer script version.",
-                    MessageType.Info);
+                EditorGUILayout.HelpBox(BuildAlreadyRiggedMessage(), MessageType.Info);
             }
 
             if (!string.IsNullOrEmpty(_statusMsg))
@@ -466,7 +477,9 @@ namespace ZeroShugan.ShuganUnityTools
             DrawRunButton();
             DrawProgressBarIfActive();
 
-            ShuganToolUI.DrawCredits("AutoRig Feet (Distributor)", ToolVersion);
+            // Package version, not the old hardcoded ToolVersion: a third version string that never
+            // moved told the user nothing and disagreed with everything else on screen.
+            ShuganToolUI.DrawCredits("AutoRig Feet (Distributor)", PackageVersion());
         }
 
         // The green "AutoRig Feet" run button — drawn once, at the bottom of the window.
@@ -1853,8 +1866,9 @@ namespace ZeroShugan.ShuganUnityTools
             return "Blender (version in logs)";
         }
 
-        // The published package version, which is what a bug report should quote — ToolVersion is
-        // this window's own label and does not move between releases.
+        // The published package version — the single Unity-side version this tool reports anywhere
+        // (window title, header, credits, run log, environment.json, bug reports). It replaced a
+        // hardcoded "1.0" constant that never moved and disagreed with everything else on screen.
         static string _packageVersion;
         static string PackageVersion()
         {
@@ -2429,6 +2443,10 @@ namespace ZeroShugan.ShuganUnityTools
                 if (!ok) return;
             }
 
+            // RE-RIG: the source FBX already carries a rig, so this run will replace it. Ask how to
+            // treat the existing foot weights before anything is written.
+            if (!ConfirmReRigStrategy(out _rerigRestoreJson, out _rerigSkipFootReduction)) return;
+
             BackupOriginalFbx();
 
             _blenderMilestone  = 0f;
@@ -2471,7 +2489,9 @@ namespace ZeroShugan.ShuganUnityTools
                 sourceFbxAbs, targetMesh, _exportPath, scriptPath,
                 headless: true, stepDelay: 0f, garmentNames: garmentNames,
                 backupJsonPath: backupJsonPath,
-                footBoneL: _footOverrideL, footBoneR: _footOverrideR);
+                footBoneL: _footOverrideL, footBoneR: _footOverrideR,
+                rerigRestoreJsonPath: _rerigRestoreJson,
+                skipFootReduction: _rerigSkipFootReduction);
 
             // Archive the wrapper that actually ran. It goes to a fixed temp filename and is
             // overwritten by the next run, so without this the exact python behind a failure is
@@ -2897,7 +2917,7 @@ namespace ZeroShugan.ShuganUnityTools
             {
                 if (_runReport != null)
                 {
-                    _runReport.toolVersion   = ToolVersion;
+                    _runReport.toolVersion   = PackageVersion();
                     _runReport.scriptVersion = LocalPyVersion() ?? "";
                     _runReport.runFolder     = _runLogger != null ? (_runLogger.FolderAssetPath ?? "") : "";
                 }
@@ -3139,7 +3159,7 @@ namespace ZeroShugan.ShuganUnityTools
             _runLogger.BeginConsoleCapture();
 
             _runLogger.Line("AutoRig Feet — " + kind + " run");
-            _runLogger.Line("tool " + ToolVersion + " · script " + (LocalPyVersion() ?? "?")
+            _runLogger.Line("tool " + PackageVersion() + " · script " + (LocalPyVersion() ?? "?")
                             + " · Unity " + Application.unityVersion);
             _runLogger.Line("folder: " + _runLogger.FolderAssetPath);
 
@@ -3168,7 +3188,7 @@ namespace ZeroShugan.ShuganUnityTools
                 {
                     new KeyValuePair<string, string>("runKind",        kind),
                     new KeyValuePair<string, string>("startedUtc",     DateTime.UtcNow.ToString("o")),
-                    new KeyValuePair<string, string>("toolVersion",    ToolVersion),
+                    new KeyValuePair<string, string>("toolVersion",    PackageVersion()),
                     new KeyValuePair<string, string>("scriptVersion",  LocalPyVersion() ?? "(unknown)"),
                     new KeyValuePair<string, string>("scriptPath",     _autoRigScriptResolvedPath ?? "(unresolved)"),
                     new KeyValuePair<string, string>("unityVersion",   Application.unityVersion),
@@ -3188,6 +3208,15 @@ namespace ZeroShugan.ShuganUnityTools
                     new KeyValuePair<string, string>("targetMesh",     CurrentMeshName()),
                     new KeyValuePair<string, string>("garments",       string.Join(", ", _garmentMeshNames.ToArray())),
                     new KeyValuePair<string, string>("alreadyRigged",  _alreadyRigged.ToString()),
+                    new KeyValuePair<string, string>("riggedWithScript",
+                        string.IsNullOrEmpty(_riggedVersion) ? "(unknown / pre-3.9.0)" : _riggedVersion),
+                    // Which re-rig strategy the user picked, so a bug report explains why the foot
+                    // weights look the way they do.
+                    new KeyValuePair<string, string>("rerigStrategy",
+                        !string.IsNullOrEmpty(_rerigRestoreJson) ? "restore original weights first"
+                        : _rerigSkipFootReduction               ? "keep current weights (no backup to restore)"
+                        : _alreadyRigged                        ? "re-apply as-is (weights reduced again)"
+                        : "n/a (first rig)"),
                 };
                 _runLogger.WriteText("environment.json", AutoRigAvatarSnapshot.CaptureEnvironmentJson(e));
             }
@@ -3259,11 +3288,150 @@ namespace ZeroShugan.ShuganUnityTools
 
         void OnAvatarChanged()
         {
-            _alreadyRigged = false;
+            RefreshRigState();
             if (_avatarObject == null) return;
-            _alreadyRigged = HasFeetRigBones(_avatarObject);
             AutoDetectFbx();
             LoadLastReport();   // show the saved report for the newly selected FBX (if any)
+        }
+
+        /// <summary>
+        /// Recompute whether the scene avatar carries a feet rig, and which script version built it.
+        ///
+        /// Called on avatar change AND at the end of a run. The end-of-run refresh matters because
+        /// in Replace mode the result IS the original object, so `TryAdoptSelectedAvatar` early-outs
+        /// on `go == _avatarObject` and never re-ran this — the "already rigged" notice stayed
+        /// hidden on the very avatar that had just been rigged.
+        /// </summary>
+        void RefreshRigState()
+        {
+            _alreadyRigged  = false;
+            _riggedVersion  = null;
+            if (_avatarObject == null) return;
+            _alreadyRigged  = HasFeetRigBones(_avatarObject);
+            if (_alreadyRigged) _riggedVersion = GetRiggedScriptVersion(_avatarObject);
+        }
+
+        // Chosen in ConfirmReRigStrategy, consumed when building the Blender script.
+        string _rerigRestoreJson;
+        bool   _rerigSkipFootReduction;
+
+        /// <summary>
+        /// The OLDEST rig backup for the source FBX, or null when there is none.
+        ///
+        /// Oldest, not newest, on purpose: the first rig's backup is the only one captured from a
+        /// genuinely un-rigged mesh. (Later ones can no longer be written — the script now refuses
+        /// to overwrite a good backup on a re-rig — but older projects may still have some.)
+        /// </summary>
+        string OldestRigBackup()
+        {
+            try
+            {
+                if (_sourceFbxAsset == null) return null;
+                string dir = Path.Combine(SourceFbxAbsDir(), "_Backups");
+                if (!Directory.Exists(dir)) return null;
+                string fbx = Path.GetFileNameWithoutExtension(AssetDatabase.GetAssetPath(_sourceFbxAsset));
+                var files = Directory.GetFiles(dir, fbx + "_rigbackup_*.json");
+                if (files.Length == 0) return null;
+                Array.Sort(files, StringComparer.Ordinal);   // timestamped names sort chronologically
+                return files[0];
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// When the source FBX already has a rig, ask how to treat the existing foot weights.
+        /// Returns false to abort the run. Outputs are the two Blender-side options.
+        ///
+        /// Why this exists: the foot-weight reduction is multiplicative from the CURRENT weight, so
+        /// re-applying a rig on an already-rigged mesh reduces the foot influence again — and again
+        /// on the next run. That is silent damage on precisely the workflow meant to IMPROVE an
+        /// avatar (re-apply after a script update). The user gets to decide, with the consequence
+        /// spelled out, rather than finding out three re-rigs later.
+        /// </summary>
+        bool ConfirmReRigStrategy(out string restoreJson, out bool skipFootReduction)
+        {
+            restoreJson       = null;
+            skipFootReduction = false;
+
+            if (!SourceFbxIsRigged()) return true;   // normal first rig — nothing to ask
+
+            string backup    = OldestRigBackup();
+            bool   hasBackup = !string.IsNullOrEmpty(backup);
+            string riggedVer = GetRiggedScriptVersion(_avatarObject)
+                               ?? GetRiggedScriptVersion(_sourceFbxAsset);
+
+            string head = "This avatar already has an AutoRig Feet rig"
+                        + (string.IsNullOrEmpty(riggedVer) ? "" : " (script " + riggedVer + ")")
+                        + ". Running now rebuilds it.\n\n"
+                        + "Re-applying reduces the foot weights again, on top of the reduction the "
+                        + "previous run already made. Repeated re-rigs fade the foot influence "
+                        + "toward zero.\n\n";
+
+            string protectLabel = hasBackup ? "Protect my weights" : "Keep current weights";
+            string protectHow = hasBackup
+                ? "PROTECT: restores the original foot weights from your backup first, then rigs.\n"
+                  + "    " + Path.GetFileName(backup) + "\n"
+                  + "    Result: the new rig is built from the un-rigged mesh, exactly like the "
+                  + "first time.\n\n"
+                : "KEEP: no backup was found for this FBX, so the original weights can't be "
+                  + "restored.\n    Instead the foot reduction is skipped, so nothing degrades "
+                  + "further. The toe bones and their weights are still fully rebuilt; only the "
+                  + "foot/toe blend keeps the earlier run's shaping.\n\n";
+
+            int choice = EditorUtility.DisplayDialogComplex(
+                "Re-apply AutoRig Feet?",
+                head + protectHow
+                     + "RE-APPLY AS-IS: rigs without protecting anything. The foot weights are "
+                     + "reduced again.",
+                protectLabel,            // 0
+                "Cancel",                // 1  (middle button = the safe default on Esc)
+                "Re-apply as-is");       // 2
+
+            if (choice == 1) return false;
+
+            if (choice == 0)
+            {
+                if (hasBackup) restoreJson = backup;
+                else           skipFootReduction = true;
+            }
+            return true;
+        }
+
+        /// <summary>true when <paramref name="a"/> is an older version than <paramref name="b"/>.</summary>
+        static bool IsOlder(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            return Version.TryParse(a.TrimStart('v', 'V'), out var va) &&
+                   Version.TryParse(b.TrimStart('v', 'V'), out var vb) && va < vb;
+        }
+
+        // The "this is already rigged" notice. Says which version built it and whether re-applying
+        // would actually gain anything — the whole point of stamping the version in the first place.
+        string BuildAlreadyRiggedMessage()
+        {
+            string installed = LocalPyVersion();
+
+            string what = string.IsNullOrEmpty(_riggedVersion)
+                ? "This avatar already has an AutoRig Feet rig (z_CB / Toes_a1 bones found). "
+                  + "It was made before the script started recording its version, so it predates "
+                  + (string.IsNullOrEmpty(installed) ? "the installed one." : installed + ".")
+                : "This avatar already has an AutoRig Feet rig, built with script "
+                  + _riggedVersion + ".";
+
+            string advice;
+            if (!string.IsNullOrEmpty(_riggedVersion) && !string.IsNullOrEmpty(installed)
+                && IsOlder(_riggedVersion, installed))
+                advice = "  You have " + installed + " — re-run to update the rig.";
+            else if (!string.IsNullOrEmpty(_riggedVersion) && _riggedVersion == installed)
+                advice = "  That is the version you have installed, so re-running would rebuild "
+                       + "the same rig.";
+            else
+                advice = "  Re-running rebuilds the rig from scratch.";
+
+            return what + advice
+                 + "\n\nThe old rig is removed automatically first, so nothing stacks. When you run, "
+                 + "you'll be asked whether to protect your existing foot weights — re-applying "
+                 + "reduces them again unless the originals are restored first.";
         }
 
         void AutoDetectFbx()
@@ -3600,6 +3768,30 @@ namespace ZeroShugan.ShuganUnityTools
                 foreach (string kw in AutoRigFeetBoneKeywords)
                     if (t.name.Contains(kw)) return true;
             return false;
+        }
+
+        // The paid script stamps the version that built a rig into two leaf bones named
+        // "z_CB ARFv3_9_0_L" / "_R" (dots become underscores — dots are Blender's duplicate-name
+        // convention and travel badly through FBX). Bone names are the only thing that reliably
+        // survives Blender → FBX → Unity, which is why the version lives in one.
+        static readonly System.Text.RegularExpressions.Regex RigVersionMarker =
+            new System.Text.RegularExpressions.Regex(
+                @"ARFv(\d+)_(\d+)_(\d+)", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>
+        /// The script version that produced this avatar's feet rig, or null when unknown — either
+        /// it has no rig, or it was rigged before 3.9.0, when nothing recorded the version at all.
+        /// </summary>
+        static string GetRiggedScriptVersion(GameObject avatar)
+        {
+            if (avatar == null) return null;
+            foreach (Transform t in avatar.GetComponentsInChildren<Transform>(true))
+            {
+                var m = RigVersionMarker.Match(t.name);
+                if (m.Success)
+                    return m.Groups[1].Value + "." + m.Groups[2].Value + "." + m.Groups[3].Value;
+            }
+            return null;
         }
 
         static bool IsRootObject(GameObject go)

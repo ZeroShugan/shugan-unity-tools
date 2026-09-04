@@ -537,7 +537,8 @@ namespace ZeroShugan.ShuganUnityTools
             string sourceFbxPath, string targetName, string exportPath,
             string autoRigScriptPath, bool headless, float stepDelay,
             string[] garmentNames = null, string backupJsonPath = null,
-            string footBoneL = null, string footBoneR = null)
+            string footBoneL = null, string footBoneR = null,
+            string rerigRestoreJsonPath = null, bool skipFootReduction = false)
         {
             string d        = stepDelay.ToString("F1", CultureInfo.InvariantCulture);
             string pySrc    = sourceFbxPath.Replace("\\", "/");
@@ -552,12 +553,23 @@ namespace ZeroShugan.ShuganUnityTools
                 footEnv += $"os.environ['SHUGAN_FOOT_BONE_L'] = '{PyEscape(footBoneL)}'\n";
             if (!string.IsNullOrEmpty(footBoneR))
                 footEnv += $"os.environ['SHUGAN_FOOT_BONE_R'] = '{PyEscape(footBoneR)}'\n";
+
+            // RE-RIG options, chosen by the user in the dialog Execute() shows when the source FBX
+            // already carries a rig. Restoring the original weights first is what stops repeated
+            // re-rigs from compounding foot-weight loss; skipping the reduction is the fallback when
+            // there is no backup to restore from. Both are absent on a normal first rig.
+            string rerigEnv = "";
+            if (!string.IsNullOrEmpty(rerigRestoreJsonPath))
+                rerigEnv += $"os.environ['SHUGAN_RERIG_RESTORE_JSON'] = '{rerigRestoreJsonPath.Replace("\\", "/")}'\n";
+            if (skipFootReduction)
+                rerigEnv += "os.environ['SHUGAN_SKIP_FOOT_REDUCTION'] = '1'\n";
+
             string exportBlock = FbxExportPython(exportPath);
 
             return
 $@"import bpy, sys, time, os, importlib.util
 {ShuganIssuePython}
-{backupEnv}{footEnv}
+{backupEnv}{footEnv}{rerigEnv}
 def load_script(path):
     spec = importlib.util.spec_from_file_location('blender_script', path)
     mod  = importlib.util.module_from_spec(spec)
