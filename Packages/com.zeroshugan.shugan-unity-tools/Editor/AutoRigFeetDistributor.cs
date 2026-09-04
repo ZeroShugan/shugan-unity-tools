@@ -3858,12 +3858,27 @@ namespace ZeroShugan.ShuganUnityTools
         string ToAbsPath(string assetPath)
             => Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
 
+        /// <summary>
+        /// Absolute path → project-relative AssetDatabase path ("Assets/…"), or the path unchanged
+        /// when it lies outside the project.
+        ///
+        /// Returns FORWARD slashes for the relative case. It used to inherit whatever separators the
+        /// input had, which on Windows meant `Assets\! Shugan\…`. AssetDatabase mostly tolerates
+        /// that, so it went unnoticed — until a caller reasonably tested the result with
+        /// `StartsWith("Assets/")` and it silently never matched.
+        ///
+        /// Both sides are normalised before comparison too: the inputs arrive from a mix of
+        /// `Application.dataPath` (forward slashes), `Path.GetFullPath` (backslashes) and
+        /// `EditorUtility.OpenFilePanel` (forward slashes), so a raw comparison depends on which
+        /// helper happened to produce the path.
+        /// </summary>
         string ToProjectRelative(string absPath)
         {
             if (string.IsNullOrEmpty(absPath)) return "";
-            string root = Directory.GetParent(Application.dataPath).FullName;
-            return absPath.StartsWith(root)
-                ? absPath.Substring(root.Length).TrimStart('\\', '/') : absPath;
+            string root = Directory.GetParent(Application.dataPath).FullName.Replace('\\', '/');
+            string p    = absPath.Replace('\\', '/');
+            if (!p.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return absPath;
+            return p.Substring(root.Length).TrimStart('/');
         }
 
         bool IsValidFbx(GameObject obj)
