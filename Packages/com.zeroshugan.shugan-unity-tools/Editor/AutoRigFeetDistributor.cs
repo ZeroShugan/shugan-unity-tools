@@ -1059,6 +1059,63 @@ namespace ZeroShugan.ShuganUnityTools
         readonly HashSet<string> _shapeFixOptOut = new HashSet<string>();
         static string ShapeFixKey(string meshName, string shapeName) => meshName + "|" + shapeName;
 
+        // ─── The same shape key on OTHER meshes ────────────────────────────────
+        //
+        // Zeroing a feet-moving shape key on the body but leaving the SAME key at another value on
+        // a garment desyncs them. The rig is built at basis, so once the body is fixed to 0 and the
+        // garment still sits at 100, the moment the user toggles that garment on its feet are
+        // somewhere the body's are not. Both meshes have to agree, and it does not matter whether
+        // the garment came from the body's FBX or an entirely separate one dropped under the avatar.
+        //
+        // Cache: the name → (mesh, index) map only changes when the AVATAR changes, so it is built
+        // once and weights are read live off it. GetBlendShapeIndex is a name lookup and OnGUI runs
+        // many times a second — doing it per frame across every mesh on a 583-blendshape avatar is
+        // not free.
+        GameObject _companionCacheFor;
+        readonly Dictionary<string, List<(SkinnedMeshRenderer smr, int idx)>> _companionCache =
+            new Dictionary<string, List<(SkinnedMeshRenderer smr, int idx)>>();
+
+        List<(SkinnedMeshRenderer smr, int idx)> ShapeKeyLocations(string shapeName)
+        {
+            if (_companionCacheFor != _avatarObject)
+            {
+                _companionCache.Clear();
+                _companionCacheFor = _avatarObject;
+            }
+            if (_companionCache.TryGetValue(shapeName, out var cached)) return cached;
+
+            var list = new List<(SkinnedMeshRenderer smr, int idx)>();
+            if (_avatarObject != null && !string.IsNullOrEmpty(shapeName))
+            {
+                foreach (var s in _avatarObject.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                {
+                    if (s == null || s.sharedMesh == null) continue;
+                    int idx = s.sharedMesh.GetBlendShapeIndex(shapeName);
+                    if (idx >= 0) list.Add((s, idx));
+                }
+            }
+            _companionCache[shapeName] = list;
+            return list;
+        }
+
+        /// <summary>
+        /// Every OTHER mesh under the avatar carrying a shape key of this name at a non-zero weight.
+        /// These are the ones that would fall out of step if only the rigged mesh were fixed.
+        /// </summary>
+        List<(SkinnedMeshRenderer smr, int idx, float weight, string meshName)> CompanionShapeKeys(
+            string shapeName, SkinnedMeshRenderer exclude)
+        {
+            var outp = new List<(SkinnedMeshRenderer smr, int idx, float weight, string meshName)>();
+            foreach (var loc in ShapeKeyLocations(shapeName))
+            {
+                if (loc.smr == null || loc.smr == exclude || loc.smr.sharedMesh == null) continue;
+                float w = loc.smr.GetBlendShapeWeight(loc.idx);
+                if (Mathf.Abs(w) > 0.01f)
+                    outp.Add((loc.smr, loc.idx, w, loc.smr.sharedMesh.name));
+            }
+            return outp;
+        }
+
         // Red warning listing every ENABLED shape key that deforms the feet of one mesh.
         // Drawn for the body mesh and for each garment.
         //
@@ -1123,6 +1180,17 @@ namespace ZeroShugan.ShuganUnityTools
                       + "uploading, and check no animation switches them on in-game.",
                 EditorStyles.wordWrappedMiniLabel);
 
+            // Any "↳ also on" rows below need explaining, or fixing them looks like busywork.
+            bool anyCompanion = false;
+            foreach (var o in offenders)
+                if (CompanionShapeKeys(o.name, smr).Count > 0) { anyCompanion = true; break; }
+            if (anyCompanion)
+                EditorGUILayout.LabelField(
+                    "Other meshes on this avatar have the same shape key switched on (listed under "
+                    + "each one). Fix those too — if the body is set to 0 but a garment is not, the "
+                    + "garment stops lining up with the rigged body the moment it is shown.",
+                    EditorStyles.wordWrappedMiniLabel);
+
             EditorGUILayout.Space(2);
             foreach (var o in offenders)
             {
@@ -1155,16 +1223,66 @@ namespace ZeroShugan.ShuganUnityTools
                     EditorUtility.SetDirty(smr);
                 }
                 EditorGUILayout.EndHorizontal();
+
+                // The same key on other meshes under this avatar. Fixing it here but leaving a
+                // garment at another value is worse than leaving both alone: the garment then
+                // disagrees with the rigged body the moment it is toggled on.
+                foreach (var c in CompanionShapeKeys(o.name, smr))
+                {
+                    EditorGUILayout.BeginHorizontal();
+                    GUILayout.Space(14);
+                    EditorGUILayout.LabelField(
+                        new GUIContent("↳ also on  " + c.meshName,
+                            "This mesh has the same shape key switched on. Fix it too, or it will "
+                            + "not line up with the rigged body when it is shown."),
+                        EditorStyles.miniLabel, GUILayout.MinWidth(96));
+                    GUILayout.Label($"{c.weight:0.#}", EditorStyles.miniLabel, GUILayout.Width(34));
+                    GUILayout.Label(" ", EditorStyles.miniLabel, GUILayout.Width(54));
+
+                    if (duplicating)
+                    {
+                        string ckey = ShapeFixKey(c.meshName, o.name);
+                        bool con = !_shapeFixOptOut.Contains(ckey);
+                        bool cnow = GUILayout.Toggle(con,
+                            new GUIContent(" Fix: set to 0 on duplicate",
+                                "Set this shape key to 0 on this mesh in the generated avatar too."),
+                            GUILayout.Width(170));
+                        if (cnow != con)
+                        {
+                            if (cnow) _shapeFixOptOut.Remove(ckey);
+                            else      _shapeFixOptOut.Add(ckey);
+                        }
+                    }
+                    else if (GUILayout.Button(
+                                 new GUIContent("Fix to 0", "Set this shape key to 0 on this mesh"),
+                                 EditorStyles.miniButton, GUILayout.Width(62)))
+                    {
+                        Undo.RecordObject(c.smr, "AutoRig Feet: zero feet shape key");
+                        c.smr.SetBlendShapeWeight(c.idx, 0f);
+                        EditorUtility.SetDirty(c.smr);
+                    }
+                    EditorGUILayout.EndHorizontal();
+                }
             }
 
-            if (!duplicating && offenders.Count > 1)
+            if (!duplicating && (offenders.Count > 1 || anyCompanion))
             {
                 EditorGUILayout.Space(2);
-                if (GUILayout.Button("Fix all to 0", GUILayout.Height(18)))
+                // Includes the other meshes: fixing only this one is what causes the mismatch.
+                if (GUILayout.Button(anyCompanion ? "Fix all to 0 (this mesh + the others listed)"
+                                                  : "Fix all to 0", GUILayout.Height(18)))
                 {
                     Undo.RecordObject(smr, "AutoRig Feet: zero feet shape keys");
                     foreach (var o in offenders) smr.SetBlendShapeWeight(o.idx, 0f);
                     EditorUtility.SetDirty(smr);
+
+                    foreach (var o in offenders)
+                        foreach (var c in CompanionShapeKeys(o.name, smr))
+                        {
+                            Undo.RecordObject(c.smr, "AutoRig Feet: zero feet shape keys");
+                            c.smr.SetBlendShapeWeight(c.idx, 0f);
+                            EditorUtility.SetDirty(c.smr);
+                        }
                 }
             }
 
@@ -1183,32 +1301,57 @@ namespace ZeroShugan.ShuganUnityTools
             foreach (var g in _garmentMeshNames)
                 if (!string.IsNullOrEmpty(g) && !meshNames.Contains(g)) meshNames.Add(g);
 
-            int fixedCount = 0;
+            // Build the plan first, deduped: the SAME (mesh, shape) pair can be reached twice — once
+            // as a rigged mesh's own offender and once as another mesh's companion.
+            var plan = new List<(string meshName, string shapeName)>();
+            var seen = new HashSet<string>();
+
+            void Queue(string mn2, string shape)
+            {
+                string key = ShapeFixKey(mn2, shape);
+                if (_shapeFixOptOut.Contains(key)) return;   // user unticked it
+                if (!seen.Add(key)) return;
+                plan.Add((mn2, shape));
+            }
+
             foreach (string mn in meshNames)
             {
                 var srcSmr = FindAvatarSkinnedMesh(mn);       // decisions come from the source avatar
                 if (srcSmr == null) continue;
-                var offenders = GetFeetShapeOffenders(srcSmr);
-                if (offenders.Count == 0) continue;
-
-                var dstSmr = FindSkinnedMeshIn(_resultInstance, mn);
-                if (dstSmr == null || dstSmr.sharedMesh == null) continue;
-
-                foreach (var o in offenders)
+                foreach (var o in GetFeetShapeOffenders(srcSmr))
                 {
-                    if (_shapeFixOptOut.Contains(ShapeFixKey(mn, o.name))) continue;   // user unticked it
-                    int idx = dstSmr.sharedMesh.GetBlendShapeIndex(o.name);
-                    if (idx < 0) continue;
-                    dstSmr.SetBlendShapeWeight(idx, 0f);
-                    fixedCount++;
+                    Queue(mn, o.name);
+                    // Every OTHER mesh holding the same key at a non-zero value. Without this the
+                    // body would be corrected while a garment kept its old value, and the two would
+                    // disagree as soon as the garment was toggled on.
+                    foreach (var c in CompanionShapeKeys(o.name, srcSmr))
+                        Queue(c.meshName, o.name);
                 }
+            }
+
+            int fixedCount = 0, companionCount = 0;
+            foreach (var p in plan)
+            {
+                var dstSmr = FindSkinnedMeshIn(_resultInstance, p.meshName);
+                if (dstSmr == null || dstSmr.sharedMesh == null) continue;
+                int idx = dstSmr.sharedMesh.GetBlendShapeIndex(p.shapeName);
+                if (idx < 0) continue;
+                dstSmr.SetBlendShapeWeight(idx, 0f);
                 EditorUtility.SetDirty(dstSmr);
+                fixedCount++;
+                // Case-insensitive to match how meshes are looked up everywhere else.
+                if (meshNames.FindIndex(m => string.Equals(m, p.meshName,
+                        StringComparison.OrdinalIgnoreCase)) < 0) companionCount++;
             }
 
             if (fixedCount > 0)
             {
+                string extra = companionCount > 0
+                    ? $" ({companionCount} of them on other meshes that share the same shape key, so "
+                      + "everything stays in step when those meshes are shown)"
+                    : "";
                 _runReport.AddIssue("U_SHAPEKEY_FIXED", "info",
-                    $"Set {fixedCount} feet-affecting shape key(s) to 0 on the new avatar "
+                    $"Set {fixedCount} feet-affecting shape key(s) to 0 on the new avatar{extra} "
                     + "(the original was left unchanged).");
                 UnityEngine.Debug.Log($"[AutoRig Feet] Zeroed {fixedCount} feet shape key(s) on the duplicate.");
             }
@@ -3261,8 +3404,15 @@ namespace ZeroShugan.ShuganUnityTools
                     GetFeetVerts(smr, out string note);
                     if (!string.IsNullOrEmpty(note)) findings.Add(mn + ": " + note);
                     foreach (var o in GetFeetShapeOffenders(smr))
+                    {
                         findings.Add(mn + ": shape key '" + o.name + "' = " + o.weight.ToString("0.##")
                                      + " moves the feet by " + (o.delta * 100f).ToString("0.###") + " cm");
+                        // Same key switched on elsewhere — a desync source, so it belongs in a
+                        // bug report even though the mesh itself is not being rigged.
+                        foreach (var c in CompanionShapeKeys(o.name, smr))
+                            findings.Add("    also on '" + c.meshName + "' = "
+                                         + c.weight.ToString("0.##"));
+                    }
                 }
                 catch (Exception ex) { findings.Add(mn + ": shape key check failed — " + ex.Message); }
             }
@@ -3306,6 +3456,10 @@ namespace ZeroShugan.ShuganUnityTools
         {
             _alreadyRigged  = false;
             _riggedVersion  = null;
+            // Meshes may have been added or swapped (a run replaces them outright), so the
+            // shape-key location map has to be rebuilt rather than trusted.
+            _companionCache.Clear();
+            _companionCacheFor = _avatarObject;
             if (_avatarObject == null) return;
             _alreadyRigged  = HasFeetRigBones(_avatarObject);
             if (_alreadyRigged) _riggedVersion = GetRiggedScriptVersion(_avatarObject);
