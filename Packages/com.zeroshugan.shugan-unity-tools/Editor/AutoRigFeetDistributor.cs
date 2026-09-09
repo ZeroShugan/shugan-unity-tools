@@ -375,6 +375,7 @@ namespace ZeroShugan.ShuganUnityTools
                     // "already rigged" notice stayed hidden in Replace mode, where the result is
                     // the same object so avatar-change adoption never fires.
                     RefreshRigState();
+                    _backupScanDirty  = true;   // the run just wrote scene and/or FBX backups
                     _displayProgress  = 1f;
                     _state            = State.Done;
                     _currentStepLabel = "Done!";
@@ -1690,67 +1691,224 @@ namespace ZeroShugan.ShuganUnityTools
 
         // ─── Backups + restore (moved here from the Setup tab) ─────────────────
 
+        // ─── Backups tab ───────────────────────────────────────────────────────
+        // Everything this tool has ever backed up, project-wide, grouped by the asset it restores.
+        //
+        // Project-wide rather than "the current avatar's backups" because of when you actually need
+        // this: something broke, and the thing that broke may be the very avatar you can no longer
+        // select. Entries matching the current selection are highlighted so they are still the
+        // easiest to reach.
+
+        List<ShuganBackups.AssetGroup> _backupScan;
+        bool _backupScanDirty = true;
+        readonly HashSet<string> _backupExpanded = new HashSet<string>();
+
+        List<ShuganBackups.AssetGroup> BackupScan()
+        {
+            // Walks every _Backups folder under Assets/, so never from a plain repaint.
+            if (_backupScan == null || _backupScanDirty)
+            {
+                _backupScan      = ShuganBackups.Scan();
+                _backupScanDirty = false;
+            }
+            return _backupScan;
+        }
+
         void DrawBackupsTab()
         {
             EditorGUILayout.LabelField("Backups & Restore", EditorStyles.boldLabel);
 
-            if (_sourceFbxAsset == null)
+            var groups = BackupScan();
+            long total = 0;
+            int  files = 0;
+            foreach (var g in groups) { total += g.totalBytes; files += g.entries.Count; }
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                EditorGUILayout.LabelField(
+                    $"{groups.Count} asset(s), {files} backup(s), {ShuganBackups.FormatBytes(total)}",
+                    EditorStyles.miniLabel);
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("Refresh", GUILayout.Width(70))) _backupScanDirty = true;
+            }
+
+            EditorGUILayout.HelpBox(
+                "Backups live in a _Backups folder next to the asset they restore, so they travel "
+                + "with it. This tool never deletes a backup — not on a schedule, not by age, not "
+                + "ever. A backup is the only copy of a state you might need back, so removing one "
+                + "is your call, in Explorer.\n\n"
+                + "Restoring makes a backup of the current file first, so picking the wrong one is "
+                + "recoverable.", MessageType.None);
+
+            // What the user has selected right now — highlighted below, not filtered to.
+            string selFbx   = _sourceFbxAsset != null ? AssetDatabase.GetAssetPath(_sourceFbxAsset) : null;
+            string selScene = null;
+            if (_avatarObject != null && _avatarObject.scene.IsValid())
+                selScene = _avatarObject.scene.path;
+
+            if (groups.Count == 0)
             {
                 EditorGUILayout.HelpBox(
-                    "Select a Target Avatar on the Setup tab to see its backups.", MessageType.Info);
+                    "No backups yet. Running AutoRig Feet backs up the scene, and the source FBX "
+                    + "whenever a run would overwrite it.", MessageType.Info);
+            }
+
+            ShuganBackups.Kind? lastKind = null;
+            foreach (var g in groups)
+            {
+                if (lastKind != g.kind)
+                {
+                    EditorGUILayout.Space(4);
+                    EditorGUILayout.LabelField(
+                        g.kind == ShuganBackups.Kind.Fbx   ? "FBX"
+                      : g.kind == ShuganBackups.Kind.Scene ? "Scenes"
+                      : "Other", EditorStyles.boldLabel);
+                    lastKind = g.kind;
+                }
+
+                bool isSelected =
+                    (selFbx   != null && string.Equals(g.assetPath, selFbx,   StringComparison.OrdinalIgnoreCase)) ||
+                    (selScene != null && string.Equals(g.assetPath, selScene, StringComparison.OrdinalIgnoreCase));
+
+                Color prevBg = GUI.backgroundColor;
+                if (isSelected) GUI.backgroundColor = new Color(0.55f, 0.85f, 1f);
+                EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+                GUI.backgroundColor = prevBg;
+
+                bool expanded = _backupExpanded.Contains(g.assetPath);
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    bool now = EditorGUILayout.Foldout(expanded,
+                        new GUIContent(g.assetName + (isSelected ? "   ← selected" : ""),
+                                       g.assetPath), true);
+                    if (now != expanded)
+                    {
+                        if (now) _backupExpanded.Add(g.assetPath);
+                        else     _backupExpanded.Remove(g.assetPath);
+                    }
+                    GUILayout.FlexibleSpace();
+                    GUILayout.Label($"{g.entries.Count} × {ShuganBackups.FormatBytes(g.totalBytes)}",
+                                    EditorStyles.miniLabel, GUILayout.Width(120));
+                }
+
+                if (!g.assetExists)
+                    EditorGUILayout.LabelField(
+                        "   The original is gone — restoring writes the file back to " + g.assetPath,
+                        EditorStyles.miniLabel);
+
+                if (expanded)
+                {
+                    foreach (var e in g.entries)
+                        DrawBackupEntry(g, e);
+                }
+                EditorGUILayout.EndVertical();
+            }
+
+            EditorGUILayout.Space(6);
+            DrawRestoreSection();
+        }
+
+        void DrawBackupEntry(ShuganBackups.AssetGroup g, ShuganBackups.Entry e)
+        {
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.Space(14);
+                string label = e.when.ToString("yyyy-MM-dd HH:mm")
+                             + (e.isPreSave ? "  (before unsaved changes)" : "");
+                EditorGUILayout.LabelField(new GUIContent(label, e.fileName),
+                                           EditorStyles.miniLabel, GUILayout.MinWidth(150));
+                GUILayout.Label(ShuganBackups.FormatBytes(e.sizeBytes),
+                                EditorStyles.miniLabel, GUILayout.Width(62));
+
+                if (e.kind == ShuganBackups.Kind.RigJson)
+                {
+                    // Not a file swap — this one is applied through the Blender restore path below.
+                    GUILayout.Label("rig-only — see Restore Original Rig",
+                                    EditorStyles.miniLabel, GUILayout.Width(178));
+                }
+                else if (GUILayout.Button(
+                             new GUIContent("Restore",
+                                 "Put this backup back over " + g.assetName
+                                 + ". The current file is backed up first."),
+                             EditorStyles.miniButton, GUILayout.Width(62)))
+                {
+                    RestoreBackup(g, e);
+                }
+
+                if (GUILayout.Button("Show", EditorStyles.miniButton, GUILayout.Width(46)))
+                    EditorUtility.RevealInFinder(e.filePath);
+            }
+        }
+
+        void RestoreBackup(ShuganBackups.AssetGroup g, ShuganBackups.Entry e)
+        {
+            bool isOpenScene = e.kind == ShuganBackups.Kind.Scene && IsSceneOpen(g.assetPath);
+
+            string msg = "Replace\n    " + g.assetPath
+                       + "\nwith the backup from " + e.when.ToString("yyyy-MM-dd HH:mm")
+                       + (e.isPreSave ? "  (the copy taken before your unsaved changes)" : "")
+                       + "?\n\nThe current file is backed up first, so this is reversible.";
+            if (isOpenScene)
+                msg += "\n\nThat scene is open. It will be reloaded from the restored file, and any "
+                     + "unsaved changes in it are lost.";
+
+            if (!EditorUtility.DisplayDialog("Restore backup?", msg, "Restore", "Cancel")) return;
+
+            // Unity holds the open scene in memory and would write it back over the file we just
+            // restored, so close it to an empty scene first and reopen afterwards.
+            if (isOpenScene)
+            {
+                if (!UnityEditor.SceneManagement.EditorSceneManager
+                        .SaveCurrentModifiedScenesIfUserWantsTo()) return;
+                UnityEditor.SceneManagement.EditorSceneManager.NewScene(
+                    UnityEditor.SceneManagement.NewSceneSetup.EmptyScene,
+                    UnityEditor.SceneManagement.NewSceneMode.Single);
+            }
+
+            if (!ShuganBackups.Restore(e, g.assetPath, out string safety, out string error))
+            {
+                EditorUtility.DisplayDialog("Restore failed", error ?? "Unknown error.", "OK");
                 return;
             }
 
-            EditorGUILayout.LabelField("Source FBX",
-                Path.GetFileName(AssetDatabase.GetAssetPath(_sourceFbxAsset)));
-
-            EditorGUILayout.HelpBox(
-                "Backups stay next to your FBX in its _Backups folder, not in the logs folder — "
-                + "they are recovery files, and they are never rotated away.\n\n"
-                + "A full FBX copy is only made when a run would overwrite your source file "
-                + "(Replace mode). Duplicate mode writes a separate FBX and leaves the source "
-                + "untouched, so it does not need one.", MessageType.None);
-
-            try
+            if (isOpenScene)
             {
-                string dir = Path.Combine(SourceFbxAbsDir(), "_Backups");
-                string fbx = Path.GetFileNameWithoutExtension(AssetDatabase.GetAssetPath(_sourceFbxAsset));
-                if (Directory.Exists(dir))
+                try
                 {
-                    var fbxBackups = Directory.GetFiles(dir, fbx + "_backup_*.fbx");
-                    Array.Sort(fbxBackups, StringComparer.Ordinal);
-                    Array.Reverse(fbxBackups);
-
-                    EditorGUILayout.LabelField(
-                        "Full FBX backups: " + fbxBackups.Length, EditorStyles.miniLabel);
-                    int show = Mathf.Min(fbxBackups.Length, 5);
-                    for (int i = 0; i < show; i++)
-                    {
-                        using (new EditorGUILayout.HorizontalScope())
-                        {
-                            GUILayout.Label("  " + Path.GetFileName(fbxBackups[i]), EditorStyles.miniLabel);
-                            GUILayout.FlexibleSpace();
-                            if (GUILayout.Button("Show", GUILayout.Width(50)))
-                                EditorUtility.RevealInFinder(fbxBackups[i]);
-                        }
-                    }
-                    if (fbxBackups.Length > show)
-                        EditorGUILayout.LabelField("  … and " + (fbxBackups.Length - show) + " older",
-                            EditorStyles.miniLabel);
+                    UnityEditor.SceneManagement.EditorSceneManager.OpenScene(
+                        g.assetPath, UnityEditor.SceneManagement.OpenSceneMode.Single);
                 }
-                else
+                catch (Exception ex)
                 {
-                    EditorGUILayout.LabelField("No _Backups folder yet.", EditorStyles.miniLabel);
+                    UnityEngine.Debug.LogWarning(
+                        "[AutoRig Feet Distributor] Restored, but could not reopen the scene: " + ex.Message);
                 }
             }
-            catch (Exception ex)
-            {
-                EditorGUILayout.HelpBox("Could not list backups: " + ex.Message, MessageType.Warning);
-            }
 
-            EditorGUILayout.Space(4);
-            DrawRestoreSection();
+            _backupScanDirty = true;
+            _avatarObject    = null;      // the object it pointed at may no longer exist
+            RefreshRigState();
+
+            UnityEngine.Debug.Log("[AutoRig Feet Distributor] Restored " + g.assetPath
+                + " from " + e.fileName
+                + (safety != null ? "  (previous file kept as " + Path.GetFileName(safety) + ")" : ""));
+            SetStatus("Restored " + g.assetName + " from the "
+                      + e.when.ToString("yyyy-MM-dd HH:mm") + " backup."
+                      + (safety != null ? " The file it replaced was backed up first." : ""),
+                      MessageType.Info);
         }
+
+        static bool IsSceneOpen(string scenePath)
+        {
+            for (int i = 0; i < UnityEngine.SceneManagement.SceneManager.sceneCount; i++)
+            {
+                var s = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                if (s.IsValid() && string.Equals(s.path, scenePath, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
 
         // ─── Report a Bug ──────────────────────────────────────────────────────
         // [ARF-BUGREPORT] Consent-first, mirroring the Data Transfer++ addon: Send stays disabled
@@ -2590,6 +2748,7 @@ namespace ZeroShugan.ShuganUnityTools
             // treat the existing foot weights before anything is written.
             if (!ConfirmReRigStrategy(out _rerigRestoreJson, out _rerigSkipFootReduction)) return;
 
+            BackupScene();
             BackupOriginalFbx();
 
             _blenderMilestone  = 0f;
@@ -4109,6 +4268,79 @@ namespace ZeroShugan.ShuganUnityTools
 
         // ─── Backup ────────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Back up the scene the avatar lives in, before the run changes it.
+        ///
+        /// Two backups when the scene has unsaved changes, and the order is the point:
+        ///
+        ///   1. the scene file AS IT SITS ON DISK — without the user's pending edits. Someone who
+        ///      was mid-experiment and did not want those edits kept has this to come back to.
+        ///   2. then the scene is saved, and backed up again — now including those edits, which is
+        ///      the state the run is actually about to modify.
+        ///
+        /// A clean scene needs only one, since disk and memory already agree.
+        ///
+        /// Saving is not optional here: without it the second backup would capture nothing the first
+        /// did not, and the user's in-progress work would sit outside every restore point. Backup 1
+        /// is what makes saving safe rather than presumptuous.
+        /// </summary>
+        void BackupScene()
+        {
+            try
+            {
+                if (_avatarObject == null) return;
+                var scene = _avatarObject.scene;
+                if (!scene.IsValid()) return;
+
+                if (string.IsNullOrEmpty(scene.path))
+                {
+                    // Never saved — there is no file to copy, and saving would need a Save As dialog.
+                    _runReport.AddIssue("U_SCENE_UNSAVED", "warning",
+                        "This scene has never been saved, so it could not be backed up.",
+                        "Save the scene once (Ctrl+S) and run again if you want a restore point for it. "
+                        + "Your FBX is still backed up as usual.");
+                    UnityEngine.Debug.LogWarning(
+                        "[AutoRig Feet Distributor] Scene has no path yet — scene backup skipped.");
+                    return;
+                }
+
+                string stamp = ShuganBackups.Stamp();
+                bool   dirty = scene.isDirty;
+
+                // 1. The on-disk state, before any pending edits are written out.
+                if (dirty)
+                {
+                    string pre = ShuganBackups.BackupAsset(scene.path, "_presave", stamp);
+                    if (pre != null)
+                        UnityEngine.Debug.Log(
+                            "[AutoRig Feet Distributor] Scene backup (before your unsaved changes): " + pre);
+
+                    // 2. Save, so the next backup captures the state the run will actually modify.
+                    UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene);
+                }
+
+                string post = ShuganBackups.BackupAsset(scene.path, "", stamp);
+                if (post != null)
+                    UnityEngine.Debug.Log("[AutoRig Feet Distributor] Scene backup: " + post);
+
+                _runReport.AddIssue("U_SCENE_BACKED_UP", "info",
+                    dirty
+                        ? "Scene backed up twice: once as it was on disk before your unsaved changes, "
+                          + "then again after saving them."
+                        : "Scene backed up (it had no unsaved changes).",
+                    "Both are in the _Backups folder next to the scene, and listed on the Backups tab.");
+            }
+            catch (Exception ex)
+            {
+                // A scene backup is a safety net, not a precondition — never block the rig over it.
+                _runReport.AddIssue("U_SCENE_BACKUP_FAILED", "warning",
+                    "The scene could not be backed up: " + ex.Message,
+                    "The run continues, and your FBX backup is unaffected.");
+                UnityEngine.Debug.LogWarning(
+                    "[AutoRig Feet Distributor] Scene backup failed: " + ex.Message);
+            }
+        }
+
         void BackupOriginalFbx()
         {
             string srcAbs    = ToAbsPath(AssetDatabase.GetAssetPath(_sourceFbxAsset));
@@ -4140,39 +4372,12 @@ namespace ZeroShugan.ShuganUnityTools
                 return;
             }
 
-            string backupDir = Path.Combine(Path.GetDirectoryName(srcAbs), "_Backups");
-            Directory.CreateDirectory(backupDir);
-            string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-            string name  = Path.GetFileNameWithoutExtension(srcAbs);
-            string dest  = Path.Combine(backupDir, $"{name}_backup_{stamp}.fbx");
-            File.Copy(srcAbs, dest, overwrite: false);
-
-            // Copy the .meta so the backup keeps the original's import settings (rig type, scale,
-            // material mapping) — restoring an FBX without them is close to useless.
-            //
-            // But give it a FRESH guid. A straight copy duplicates the original's guid, and Unity
-            // then logs "GUID [...] conflicts with '<original>.fbx' (current owner). Assigning a new
-            // guid." on the next import, once per backup, forever. Caught by the run log's console
-            // capture on the very first real run.
-            string metaSrc = srcAbs + ".meta";
-            if (File.Exists(metaSrc))
-            {
-                try
-                {
-                    string meta = File.ReadAllText(metaSrc);
-                    meta = System.Text.RegularExpressions.Regex.Replace(
-                        meta, @"(?m)^guid:\s*[0-9a-fA-F]{32}\s*$",
-                        "guid: " + Guid.NewGuid().ToString("N"));
-                    File.WriteAllText(dest + ".meta", meta);
-                }
-                catch (Exception ex)
-                {
-                    // Import settings are a nice-to-have; the FBX itself is the backup that matters.
-                    UnityEngine.Debug.LogWarning(
-                        "[AutoRig Feet Distributor] Backup .meta not written: " + ex.Message);
-                }
-            }
-            UnityEngine.Debug.Log($"[AutoRig Feet Distributor] Backup: {dest}");
+            // Shared with the scene backup: same naming, same _Backups location, and the same
+            // fresh-guid .meta copy (a verbatim .meta duplicates the original's guid and Unity then
+            // logs a GUID conflict on every import, forever).
+            string dest = ShuganBackups.BackupAsset(AssetDatabase.GetAssetPath(_sourceFbxAsset));
+            if (dest != null)
+                UnityEngine.Debug.Log($"[AutoRig Feet Distributor] Backup: {dest}");
         }
 
         // ─── Path helpers ──────────────────────────────────────────────────────
