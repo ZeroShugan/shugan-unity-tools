@@ -42,6 +42,7 @@ namespace ZeroShugan.ShuganUnityTools
         const string PrefTab                  = "ShuganTools_ARF_Tab";
         const string PrefBugContact           = "ShuganTools_ARF_BugContact";
         const string PrefRigOnBestShape       = "ShuganTools_ARF_RigOnBestShape";
+        const string PrefZeroFeetShapeKeys    = "ShuganTools_ARF_ZeroFeetShapeKeys";
         const string PrefCleanForeignToes     = "ShuganTools_ARF_CleanForeignToes";
 
         // ─── Paid-content paths (installed via Shugan store bundle) ───────────
@@ -94,6 +95,8 @@ namespace ZeroShugan.ShuganUnityTools
         // Rig on the foot shape that fits the bones (FootShapeFit), keep the scene avatar's shape-key
         // values, and add a VRCFury toggle that sets the fitting shape. Off = the 1.2.4 behaviour.
         bool _rigOnBestShape = true;
+        // Off by default: the foot shape keys list keeps the avatar's values and animates them instead.
+        bool _zeroFeetShapeKeys = false;
 
         // ─── Run log (unified per-run diagnostics folder) ─────────────────────
         // Everything one run produces — Blender console, Unity Console, the typed report, the
@@ -223,6 +226,7 @@ namespace ZeroShugan.ShuganUnityTools
             _backupEnabled = EditorPrefs.GetBool(PrefBackupEnabled, true);
             _autoMapFeet   = EditorPrefs.GetBool(PrefAutoMapFeet, true);
             _rigOnBestShape = EditorPrefs.GetBool(PrefRigOnBestShape, true);
+            _zeroFeetShapeKeys = EditorPrefs.GetBool(PrefZeroFeetShapeKeys, false);
             _cleanForeignToes = EditorPrefs.GetBool(PrefCleanForeignToes, true);
             _timeoutMin    = EditorPrefs.GetInt(PrefTimeoutMin, 10);
             _tab           = (Tab)EditorPrefs.GetInt(PrefTab, (int)Tab.Setup);
@@ -394,10 +398,12 @@ namespace ZeroShugan.ShuganUnityTools
                         RestoreSceneBlendShapeWeights();
                         CreateFootShapeToggleAfterRun();
                     }
-                    else
+                    else if (_zeroFeetShapeKeys)
                     {
                         // Zero the ticked feet shape keys on the generated copy (Duplicate mode only —
                         // in Replace mode the user fixes them on the avatar itself via the warning).
+                        // Only when the opt-in section asked for it: nothing changes a shape-key value
+                        // behind the user's back.
                         ApplyDuplicateShapeKeyFixes();
                     }
                     // End of pipeline: ensure the FINAL scene avatar's FBX has humanoid foot/toes mapped.
@@ -953,18 +959,10 @@ namespace ZeroShugan.ShuganUnityTools
             // Garments right under the export settings.
             DrawGarmentSection();
 
-            // The foot shape keys and the toe bones from another rig are both decided for you, and both
-            // read as walls of checkboxes to someone rigging their first avatar — so their lists live in
-            // Advanced Settings, and Setup stays the four things that must be right before a run.
-            //
-            // The old red warning still belongs here, but only when the foot-shape check is NOT speaking
-            // for the body (feature off, or it could not run): otherwise it contradicts the list above it.
-            if (_meshNames.Length > 0)
-            {
-                string bodyName = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
-                if (!FootShapeSpeaksForBody(bodyName))
-                    DrawFeetShapeKeyWarning(bodyName, BodyMeshLabel);
-            }
+            // The foot shape keys, the toe bones from another rig and the old set-to-0 list are all
+            // decided for you, and all three read as walls of checkboxes to someone rigging their first
+            // avatar — so they live in Advanced Settings, and Setup stays the four things that must be
+            // right before a run.
 
             // FBX badge
             if (_avatarObject != null && IsRootObject(_avatarObject))
@@ -1222,34 +1220,35 @@ namespace ZeroShugan.ShuganUnityTools
         //   Replace   → the rig lands on THIS avatar, so the shape key must actually be zeroed here.
         //   Duplicate → the original is left alone; the fix is applied to the generated copy instead,
         //               so the user keeps their shape key on the avatar they are still working on.
-        void DrawFeetShapeKeyWarning(string meshName, string label)
+        // Returns true when it drew something, so the section around it can say that a mesh is clean.
+        bool DrawFeetShapeKeyWarning(string meshName, string label)
         {
-            if (_avatarObject == null || string.IsNullOrEmpty(meshName)) return;
+            if (_avatarObject == null || string.IsNullOrEmpty(meshName)) return false;
 
             var smr = FindAvatarSkinnedMesh(meshName);
-            if (smr == null || smr.sharedMesh == null) return;
+            if (smr == null || smr.sharedMesh == null) return false;
             var mesh = smr.sharedMesh;
-            if (mesh.blendShapeCount == 0) return;
+            if (mesh.blendShapeCount == 0) return false;
 
             // Cheap pass first: only enabled shape keys can cause the problem.
             bool anyActive = false;
             for (int i = 0; i < mesh.blendShapeCount && !anyActive; i++)
                 if (Mathf.Abs(smr.GetBlendShapeWeight(i)) > 0.01f) anyActive = true;
-            if (!anyActive) return;
+            if (!anyActive) return false;
 
             var feetVerts = GetFeetVerts(smr, out string note);
             if (feetVerts == null || feetVerts.Count == 0)
             {
                 // Only worth saying for the body mesh; garments legitimately have no foot weights.
-                if (!string.IsNullOrEmpty(note) && label == BodyMeshLabel)
-                    EditorGUILayout.HelpBox(
-                        "Couldn't check the active shape keys against the feet: " + note + ".",
-                        MessageType.Info);
-                return;
+                if (string.IsNullOrEmpty(note) || label != BodyMeshLabel) return false;
+                EditorGUILayout.HelpBox(
+                    "Couldn't check the active shape keys against the feet: " + note + ".",
+                    MessageType.Info);
+                return true;
             }
 
             var offenders = GetFeetShapeOffenders(smr);
-            if (offenders.Count == 0) return;
+            if (offenders.Count == 0) return false;
 
             // With the foot-shape option on, the new avatar keeps every shape-key value, so there is no
             // "set to 0 on the duplicate" any more: only the explicit Fix-to-0 buttons remain.
@@ -1393,6 +1392,53 @@ namespace ZeroShugan.ShuganUnityTools
             }
 
             EditorGUILayout.EndVertical();
+            return true;
+        }
+
+        // ─── Set feet shape keys to 0 (opt-in) ─────────────────────────────────
+        // What AutoRig Feet used to push on its own: the switched-on shape keys that move the feet,
+        // with a button to zero them, because the rig is built at Basis. The foot shape keys list above
+        // does that job without changing the avatar — it keeps the values and animates them with the
+        // feet — so this is off by default and lives here, for someone who would rather the shape keys
+        // simply went away.
+        void DrawShapeKeyZeroSection()
+        {
+            EditorGUILayout.Space(2);
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+
+            EditorGUI.BeginChangeCheck();
+            _zeroFeetShapeKeys = EditorGUILayout.ToggleLeft(
+                new GUIContent("Set feet shape keys to 0",
+                    "Lists the shape keys that are switched on and move the feet, so you can set them "
+                    + "to 0 before rigging.\n\nUsually unnecessary: with Foot shape keys on, the rig is "
+                    + "built with every shape key at 0, the avatar keeps its own values, and the toggle "
+                    + "sets them while the feet are animated."),
+                _zeroFeetShapeKeys, EditorStyles.boldLabel);
+            if (EditorGUI.EndChangeCheck())
+                EditorPrefs.SetBool(PrefZeroFeetShapeKeys, _zeroFeetShapeKeys);
+
+            if (!_zeroFeetShapeKeys)
+                EditorGUILayout.LabelField(
+                    _rigOnBestShape
+                        ? "Not needed while Foot shape keys is on: its toggle sets those keys for you."
+                        : "Shape keys that move the feet are left exactly as they are.",
+                    EditorStyles.wordWrappedMiniLabel);
+            else
+            {
+                bool drew = false;
+                if (_meshNames.Length > 0)
+                    drew = DrawFeetShapeKeyWarning(
+                        _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)], BodyMeshLabel);
+                // Garments have their own shape keys, and one that moves the feet breaks the
+                // transferred toe weights the same way it breaks the body.
+                foreach (var g in _garmentMeshNames)
+                    if (!string.IsNullOrEmpty(g)) drew |= DrawFeetShapeKeyWarning(g, g);
+                if (!drew)
+                    EditorGUILayout.LabelField("No shape key that moves the feet is switched on.",
+                        EditorStyles.miniLabel);
+            }
+
+            EditorGUILayout.EndVertical();
         }
 
         // After a duplicate avatar is produced, zero the ticked feet shape keys ON THE COPY.
@@ -1517,6 +1563,44 @@ namespace ZeroShugan.ShuganUnityTools
                 var t = FindAvatarBone(_footOverrideR);
                 if (t != null) { footR = t; if (toeR != null && !toeR.IsChildOf(t)) toeR = null; }
             }
+
+            // The humanoid Toes slot is optional, and plenty of bases ship with it empty even though
+            // the armature has a perfectly good toe bone — that is exactly the avatar AutoRig Feet is
+            // for. Blender finds the toe by NAME (its TOE_PRIMARY keywords), so Unity has to as well:
+            // without it the foot-shape check has no joint below the ankle to measure against and
+            // skips a base it could have answered for.
+            if (toeL == null) toeL = FindToeUnder(footL);
+            if (toeR == null) toeR = FindToeUnder(footR);
+        }
+
+        // The shallowest toe-named bone under a foot. Tip markers (*_end) and bones carrying a renderer
+        // are not joints. Shallowest wins, so a toe rig someone added underneath (Toes_1_a1_L…) can
+        // never beat the base's own toe bone.
+        static Transform FindToeUnder(Transform foot)
+        {
+            if (foot == null) return null;
+            Transform best = null;
+            int bestDepth = int.MaxValue;
+
+            void Walk(Transform node, int depth)
+            {
+                for (int i = 0; i < node.childCount; i++)
+                {
+                    var c = node.GetChild(i);
+                    string n = c.name.ToLowerInvariant();
+                    bool isEnd = n.EndsWith("_end") || n.EndsWith(".end") || n.EndsWith(" end");
+                    if (!isEnd && depth < bestDepth && c.GetComponent<Renderer>() == null &&
+                        HumanoidRigMapping.NameLooksLikeToe(c.name))
+                    {
+                        best = c;
+                        bestDepth = depth;
+                    }
+                    Walk(c, depth + 1);
+                }
+            }
+
+            Walk(foot, 0);
+            return best;
         }
 
         // Which renderer, mesh and bones: what the expensive capture depends on.
@@ -1666,20 +1750,7 @@ namespace ZeroShugan.ShuganUnityTools
         }
 
         // The foot shape list: every shape key of the body that moves the feet, ticked when the ARF Foot
-        // Shape toggle will set it (to the value shown). Returns true when it speaks for the body mesh, in
-        // which case the old shape-key warning is not drawn for it.
-        // Whether the foot shape keys list in Advanced Settings covers the body mesh — i.e. the feature is
-        // on and its check ran (or is running). Mirrors what DrawFootShapeSection returns, without drawing,
-        // so Setup can decide whether to show the old shape-key warning wherever the list is.
-        bool FootShapeSpeaksForBody(string bodyMeshName)
-        {
-            if (!_rigOnBestShape || _avatarObject == null) return false;
-            var smr = FindAvatarSkinnedMesh(bodyMeshName);
-            if (smr == null || smr.sharedMesh == null || smr.sharedMesh.blendShapeCount == 0) return false;
-            var fit = EnsureFootShapeFit(smr, out bool measuring);
-            return measuring || (fit != null && fit.error == null);
-        }
-
+        // Shape toggle will set it (to the value shown).
         bool DrawFootShapeSection(string bodyMeshName)
         {
             if (_avatarObject == null) return false;
@@ -1695,7 +1766,8 @@ namespace ZeroShugan.ShuganUnityTools
                     "On: finds the shape keys that put the avatar's own foot bones inside the feet, rigs the toes "
                     + "on that shape, keeps the avatar's shape-key values, and adds a VRCFury toggle ("
                     + FootShapeToggle.MenuPath + ") that sets the ticked keys to the value shown.\n\n"
-                    + "Off: rigs on the Basis as before, with shape keys that move the feet set to 0 on the duplicate."),
+                    + "Off: rigs on the Basis and adds no toggle. The shape keys that move the feet are then "
+                    + "only listed under \"Set feet shape keys to 0\", for you to zero yourself."),
                 _rigOnBestShape, EditorStyles.boldLabel);
             if (EditorGUI.EndChangeCheck())
                 EditorPrefs.SetBool(PrefRigOnBestShape, _rigOnBestShape);
@@ -1745,6 +1817,12 @@ namespace ZeroShugan.ShuganUnityTools
                 }
                 EditorGUILayout.EndScrollView();
             }
+
+            if (fit.coarse)
+                EditorGUILayout.LabelField(
+                    "There is no toe bone under the feet yet, so the fit is judged from the ankle joints "
+                    + "alone — the list of keys above is complete either way.",
+                    EditorStyles.wordWrappedMiniLabel);
 
             if (fit.NeedsShape)
             {
@@ -3076,9 +3154,8 @@ namespace ZeroShugan.ShuganUnityTools
                 }
                 EditorGUILayout.EndHorizontal();
 
-                // Garments have their own shape keys, and one that moves the feet breaks the
-                // transferred toe weights the same way it breaks the body.
-                DrawFeetShapeKeyWarning(_garmentMeshNames[i], _garmentMeshNames[i]);
+                // A garment shape key that moves the feet is listed with the body's, in the
+                // "Set feet shape keys to 0" section of Advanced Settings.
             }
 
             // Expires on its own, and disappears immediately once there are no garment slots left.
@@ -3132,6 +3209,7 @@ namespace ZeroShugan.ShuganUnityTools
             if (_meshNames.Length > 0)
             {
                 DrawFootShapeSection(_meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)]);
+                DrawShapeKeyZeroSection();
                 DrawForeignToeSection();
                 Separator();
             }

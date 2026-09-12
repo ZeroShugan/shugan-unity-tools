@@ -60,6 +60,7 @@ namespace ZeroShugan.ShuganUnityTools
                 return smr.transform.InverseTransformPoint(t.position);
             }
 
+            var verts = mesh.vertices;
             var joints  = new List<Vector3>();
             var samples = new List<Vector3>();
             float scale = 0f;
@@ -91,12 +92,22 @@ namespace ZeroShugan.ShuganUnityTools
                 }
             }
             if (joints.Count == 0) { input.error = "no foot bones could be identified"; return; }
-            if (scale <= 1e-6f) { input.error = "no toe joint was found under the foot bones"; return; }
+            if (scale <= 1e-6f)
+            {
+                // Nothing below the ankle: the armature has no toe bone yet, which is the ordinary
+                // state of a base about to be rigged. The measure still says something — an ankle joint
+                // sitting outside the mesh is exactly what a Basis modelled in the wrong pose looks
+                // like — it only needs a foot length from somewhere, so it comes from the foot's own
+                // geometry instead of from a joint that isn't there. (Blender takes the foot BONE's
+                // length here, which Unity has no equivalent of: a Transform has no tail.)
+                scale = FootMeshExtent(verts, mesh.boneWeights, boneIndex, footL, footR);
+                input.coarse = true;
+            }
+            if (scale <= 1e-6f) { input.error = "nothing on the body mesh is skinned to the foot bones"; return; }
             input.scale   = scale;
             input.joints  = joints.ToArray();
             input.samples = samples.ToArray();
 
-            var verts = mesh.vertices;
             int n = verts.Length;
             float r2 = (RegionFactor * scale) * (RegionFactor * scale);
             var near = new bool[n];
@@ -183,6 +194,37 @@ namespace ZeroShugan.ShuganUnityTools
                 for (int k = 0; k < region.Count; k++) info.regionDelta[k] = dv[region[k]];
                 input.keys.Add(info);
             }
+        }
+
+        // Longest side of the box around one foot's own vertices — a stand-in for foot length on a rig
+        // whose feet end at the ankle. Measured a foot at a time: both boxes together would span the
+        // gap between the legs instead.
+        static float FootMeshExtent(Vector3[] verts, BoneWeight[] weights, Dictionary<Transform, int> boneIndex,
+                                    params Transform[] feet)
+        {
+            if (weights == null || weights.Length != verts.Length) return 0f;
+            float best = 0f;
+            foreach (var foot in feet)
+            {
+                if (foot == null || !boneIndex.TryGetValue(foot, out int bone)) continue;
+                var min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+                var max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+                bool any = false;
+                for (int v = 0; v < weights.Length; v++)
+                {
+                    var w = weights[v];
+                    if (!((w.weight0 > 0f && w.boneIndex0 == bone) || (w.weight1 > 0f && w.boneIndex1 == bone) ||
+                          (w.weight2 > 0f && w.boneIndex2 == bone) || (w.weight3 > 0f && w.boneIndex3 == bone)))
+                        continue;
+                    min = Vector3.Min(min, verts[v]);
+                    max = Vector3.Max(max, verts[v]);
+                    any = true;
+                }
+                if (!any) continue;
+                var size = max - min;
+                best = Mathf.Max(best, Mathf.Max(size.x, Mathf.Max(size.y, size.z)));
+            }
+            return best;
         }
 
         static void MarkWeighted(Transform[] bones, int index, HashSet<Transform> weighted)

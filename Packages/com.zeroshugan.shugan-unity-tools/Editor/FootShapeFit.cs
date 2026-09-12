@@ -86,6 +86,7 @@ namespace ZeroShugan.ShuganUnityTools
             public string error;
             public string meshName;
             public float  scale;
+            public bool   coarse;   // no toe joint: measured from the ankle joints and a mesh-derived foot length
             public List<string> jointNamesL = new List<string>();
             public List<string> jointNamesR = new List<string>();
             public List<KeyInfo> keys = new List<KeyInfo>();
@@ -101,6 +102,7 @@ namespace ZeroShugan.ShuganUnityTools
             public string error;
             public string meshName;
             public float  scale;
+            public bool   coarse;
             public Metrics basis, best;
             public List<string> combo = new List<string>();
             public Dictionary<string, Metrics> singles = new Dictionary<string, Metrics>();
@@ -119,6 +121,7 @@ namespace ZeroShugan.ShuganUnityTools
             var r = new Result
             {
                 error = input.error, meshName = input.meshName, scale = input.scale, keys = input.keys,
+                coarse = input.coarse,
                 jointNamesL = input.jointNamesL, jointNamesR = input.jointNamesR,
             };
             if (input.error != null) return r;
