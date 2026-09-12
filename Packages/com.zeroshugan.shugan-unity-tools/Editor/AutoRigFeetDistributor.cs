@@ -41,6 +41,8 @@ namespace ZeroShugan.ShuganUnityTools
         const string PrefTimeoutMin           = "ShuganTools_ARF_TimeoutMin";
         const string PrefTab                  = "ShuganTools_ARF_Tab";
         const string PrefBugContact           = "ShuganTools_ARF_BugContact";
+        const string PrefRigOnBestShape       = "ShuganTools_ARF_RigOnBestShape";
+        const string PrefCleanForeignToes     = "ShuganTools_ARF_CleanForeignToes";
 
         // ─── Paid-content paths (installed via Shugan store bundle) ───────────
         const string DefaultAutoRigScriptPath = "Assets/! Shugan/!_Lab/Script/shugan_autorig_feet.py";
@@ -87,6 +89,11 @@ namespace ZeroShugan.ShuganUnityTools
         // After the rigged FBX is back in Unity, ensure its humanoid foot/toe bones are mapped
         // (calls HumanoidRigMapping; fills only missing slots, never replaces existing mappings).
         bool _autoMapFeet = true;
+
+        // ─── Foot shape ───────────────────────────────────────────────────────
+        // Rig on the foot shape that fits the bones (FootShapeFit), keep the scene avatar's shape-key
+        // values, and add a VRCFury toggle that sets the fitting shape. Off = the 1.2.4 behaviour.
+        bool _rigOnBestShape = true;
 
         // ─── Run log (unified per-run diagnostics folder) ─────────────────────
         // Everything one run produces — Blender console, Unity Console, the typed report, the
@@ -215,6 +222,8 @@ namespace ZeroShugan.ShuganUnityTools
 
             _backupEnabled = EditorPrefs.GetBool(PrefBackupEnabled, true);
             _autoMapFeet   = EditorPrefs.GetBool(PrefAutoMapFeet, true);
+            _rigOnBestShape = EditorPrefs.GetBool(PrefRigOnBestShape, true);
+            _cleanForeignToes = EditorPrefs.GetBool(PrefCleanForeignToes, true);
             _timeoutMin    = EditorPrefs.GetInt(PrefTimeoutMin, 10);
             _tab           = (Tab)EditorPrefs.GetInt(PrefTab, (int)Tab.Setup);
             // The contact field persists (so a repeat reporter doesn't retype it) but the message
@@ -273,6 +282,15 @@ namespace ZeroShugan.ShuganUnityTools
 
         void Update()
         {
+            // The foot-shape fit is measured on a worker thread; show its answer as soon as it lands.
+            if (_fitTask != null && _fitTask.IsCompleted) Repaint();
+            // Foot-bone candidates that couldn't be read yet are retried here, not left empty.
+            if (FootCandidatesPending && EditorApplication.timeSinceStartup >= _footCandNextTry)
+            {
+                RefreshFootCandidates();
+                Repaint();
+            }
+
             if (_state == State.Idle || _state == State.Done || _state == State.Error) return;
 
             double now = EditorApplication.timeSinceStartup;
@@ -362,12 +380,26 @@ namespace ZeroShugan.ShuganUnityTools
                     _currentStepLabel = "Adding prefabs…";
                     _displayProgress  = _exportMode == ExportMode.Duplicate ? 0.92f : 0.95f;
                     Repaint();
+                    // The other rig's toe bones go first: the swap carries their GameObjects over from the
+                    // avatar even though Blender removed them from the skeleton.
+                    RemoveCleanedToeBoneObjects();
                     RunAddPrefabs();
                     // Give the finished avatar a name that describes what it IS, not how it was made.
                     RenameResultInstance();
-                    // Zero the ticked feet shape keys on the generated copy (Duplicate mode only —
-                    // in Replace mode the user fixes them on the avatar itself via the warning).
-                    ApplyDuplicateShapeKeyFixes();
+                    if (_rigOnBestShape)
+                    {
+                        // The result keeps every shape-key value the avatar had; the foot-shape toggle
+                        // is what switches the feet into the rigged shape while the feet system is on.
+                        // The toggle comes last, so it lands below the prefabs just added.
+                        RestoreSceneBlendShapeWeights();
+                        CreateFootShapeToggleAfterRun();
+                    }
+                    else
+                    {
+                        // Zero the ticked feet shape keys on the generated copy (Duplicate mode only —
+                        // in Replace mode the user fixes them on the avatar itself via the warning).
+                        ApplyDuplicateShapeKeyFixes();
+                    }
                     // End of pipeline: ensure the FINAL scene avatar's FBX has humanoid foot/toes mapped.
                     if (_autoMapFeet) AutoMapHumanoidFeet();
                     FinishRunReport();   // re-save: the auto-map may have added warnings
@@ -488,14 +520,70 @@ namespace ZeroShugan.ShuganUnityTools
         {
             bool busy  = _state != State.Idle && _state != State.Done && _state != State.Error;
             bool ready = IsReady();
+            // The run is held back, and the button says why, until the avatar checks have finished:
+            // starting before them would rig with a guessed foot bone or without the fitting shape.
+            string checking = ready && !busy ? PendingCheckLabel() : null;
 
-            EditorGUI.BeginDisabledGroup(!ready || busy);
+            EditorGUI.BeginDisabledGroup(!ready || busy || checking != null);
             Color prev = GUI.backgroundColor;
-            GUI.backgroundColor = ready && !busy ? new Color(0.4f, 0.8f, 0.4f) : Color.white;
-            if (GUILayout.Button(busy ? GetBusyLabel() : "▶  AutoRig Feet", GUILayout.Height(34)))
+            GUI.backgroundColor = ready && !busy && checking == null ? new Color(0.4f, 0.8f, 0.4f) : Color.white;
+            if (GUILayout.Button(busy ? GetBusyLabel() : checking ?? "▶  AutoRig Feet", GUILayout.Height(34)))
                 Execute();
             GUI.backgroundColor = prev;
             EditorGUI.EndDisabledGroup();
+        }
+
+        // Replace rigs the ORIGINAL avatar. Before anything is written, say what that changes, point at
+        // the safe way to try it, and make clear there is a way back.
+        bool ConfirmReplaceMode()
+        {
+            var changes = new StringBuilder();
+            changes.Append("• Your FBX is overwritten with the rigged version:\n     ")
+                   .Append(AssetDatabase.GetAssetPath(_sourceFbxAsset)).Append('\n');
+            changes.Append("• The avatar in the scene gets the new toe bones, and its foot and toe weights are repainted");
+            if (_garmentMeshNames.Any(g => !string.IsNullOrEmpty(g))) changes.Append(" (on the garments too)");
+            changes.Append(".\n");
+            int prefabs = _prefabsToAdd.Count(p => p != null);
+            if (prefabs > 0)
+                changes.Append($"• {prefabs} feet prefab(s) are added under the avatar.\n");
+            if (_rigOnBestShape && FootShapeToggle.VRCFuryAvailable)
+                changes.Append($"• The \"{FootShapeToggle.ObjectName}\" toggle is added under the avatar, replacing any earlier one.\n");
+            if (_autoMapFeet)
+                changes.Append("• Empty humanoid Foot/Toes slots of the FBX are filled in.\n");
+            var cleanToes = ForeignToeBonesToClean();
+            if (cleanToes.Count > 0)
+                changes.Append($"• {cleanToes.Count} toe bone(s) from another rig are removed ({FormatBoneList(cleanToes)}); "
+                               + "their weights go onto the foot or toe bone they hang from.\n");
+
+            return EditorUtility.DisplayDialog(
+                "Replace your original avatar?",
+                "Export Mode is set to Replace, so AutoRig Feet will modify your ORIGINAL avatar and its FBX:\n\n"
+                + changes
+                + "\nNot sure? Set Export Mode to Duplicate to try it safely: it rigs a copy placed next to your "
+                + "avatar and leaves the original untouched.\n\n"
+                + "Both modes make backups before changing anything: the scene (once it has been saved)"
+                + (_backupEnabled ? ", and a rig backup you can restore from the Backups tab" : "")
+                + ". Replace also keeps a timestamped copy of the original FBX in the _Backups folder next to it, "
+                + "so you can always go back to your original.",
+                "Replace my avatar", "Cancel");
+        }
+
+        // What the run is still waiting for, as the button label, or null when the checks are done.
+        // Also starts the foot-shape check when it hasn't run yet (another tab may be open).
+        string PendingCheckLabel()
+        {
+            if (_avatarObject == null) return null;
+            if (FootCandidatesPending) return "⏳  Checking foot bones…";
+            if (_rigOnBestShape && _meshNames.Length > 0)
+            {
+                var smr = FindAvatarSkinnedMesh(_meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)]);
+                if (smr != null && smr.sharedMesh != null && smr.sharedMesh.blendShapeCount > 0)
+                {
+                    EnsureFootShapeFit(smr, out bool measuring);
+                    if (measuring) return "⏳  Checking foot shape keys…";
+                }
+            }
+            return null;
         }
 
         // ─── Paid bundle update check ──────────────────────────────────────────
@@ -852,11 +940,6 @@ namespace ZeroShugan.ShuganUnityTools
             }
             EditorGUI.EndDisabledGroup();
 
-            // Enabled shape keys that deform the feet would be baked out by the Blender rig.
-            if (_meshNames.Length > 0)
-                DrawFeetShapeKeyWarning(
-                    _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)], BodyMeshLabel);
-
             // Export Mode
             EditorGUI.BeginChangeCheck();
             _exportMode = (ExportMode)EditorGUILayout.EnumPopup(
@@ -866,6 +949,22 @@ namespace ZeroShugan.ShuganUnityTools
                 _exportMode);
             if (EditorGUI.EndChangeCheck())
                 EditorPrefs.SetInt(PrefExportMode, (int)_exportMode);
+
+            // Garments right under the export settings.
+            DrawGarmentSection();
+
+            // The foot shape keys and the toe bones from another rig are both decided for you, and both
+            // read as walls of checkboxes to someone rigging their first avatar — so their lists live in
+            // Advanced Settings, and Setup stays the four things that must be right before a run.
+            //
+            // The old red warning still belongs here, but only when the foot-shape check is NOT speaking
+            // for the body (feature off, or it could not run): otherwise it contradicts the list above it.
+            if (_meshNames.Length > 0)
+            {
+                string bodyName = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
+                if (!FootShapeSpeaksForBody(bodyName))
+                    DrawFeetShapeKeyWarning(bodyName, BodyMeshLabel);
+            }
 
             // FBX badge
             if (_avatarObject != null && IsRootObject(_avatarObject))
@@ -889,7 +988,6 @@ namespace ZeroShugan.ShuganUnityTools
                 }
             }
 
-            DrawGarmentSection();
             // Restore Original Rig now lives on the "Logs & Support" tab, next to the backups it
             // reads and the run logs that explain why you might want it.
         }
@@ -1153,7 +1251,9 @@ namespace ZeroShugan.ShuganUnityTools
             var offenders = GetFeetShapeOffenders(smr);
             if (offenders.Count == 0) return;
 
-            bool duplicating = _exportMode == ExportMode.Duplicate;
+            // With the foot-shape option on, the new avatar keeps every shape-key value, so there is no
+            // "set to 0 on the duplicate" any more: only the explicit Fix-to-0 buttons remain.
+            bool duplicating = _exportMode == ExportMode.Duplicate && !_rigOnBestShape;
 
             EditorGUILayout.Space(3);
             Color prevBg = GUI.backgroundColor;
@@ -1168,7 +1268,12 @@ namespace ZeroShugan.ShuganUnityTools
             GUI.color = prev;
 
             EditorGUILayout.LabelField(
-                duplicating
+                _rigOnBestShape
+                    ? "These shape keys are switched on and they move the feet. The rig is built with "
+                      + "every shape key at 0 and the avatar keeps these values, so while they are on the "
+                      + "toe bones sit away from the feet you see. Set them to 0 below if you don't need "
+                      + "them (this changes the avatar in the scene)."
+                : duplicating
                     ? "These shape keys are switched on and they move the feet. "
                       + "The rig is built with every shape key at 0, so on the new avatar the toe bones "
                       + "would sit away from the feet you see and the toes would animate offset. "
@@ -1356,6 +1461,693 @@ namespace ZeroShugan.ShuganUnityTools
                     + "(the original was left unchanged).");
                 UnityEngine.Debug.Log($"[AutoRig Feet] Zeroed {fixedCount} feet shape key(s) on the duplicate.");
             }
+        }
+
+        // ─── Foot shape: rig on the shape that fits the bones ──────────────────
+        // FootShapeFit measures which of the body's shape keys, each at 0 or 100, put the avatar's own
+        // foot and toe joints inside the mesh. When that is not the Basis (Maya's Basis is a high heel),
+        // Blender builds the rig on the fitting shape and a VRCFury toggle sets it while the feet system
+        // is on. Keys switched on in the scene that push the feet off their bones get a 0 row in that
+        // toggle, and the avatar itself keeps every value it had.
+
+        FootShapeFit.Input  _fitInput;      // mesh, bones and shape-key deltas; rebuilt when those change
+        string              _fitInputKey;
+        FootShapeFit.Result _fit;           // last answer, valid for _fitKey
+        string              _fitKey;
+        System.Threading.Tasks.Task<FootShapeFit.Result> _fitTask;
+        string              _fitTaskKey;
+        // Rows whose tick was changed from its default, by shape-key name.
+        readonly HashSet<string> _fitRowFlipped = new HashSet<string>();
+        Vector2 _footShapeScroll;
+        const float FootShapeListMaxHeight = 150f;   // about seven rows, then it scrolls
+
+        // ─── Toe bones from another rig (ToeRigDetect) ─────────────────────────
+        bool _cleanForeignToes = true;
+        readonly HashSet<Transform> _foreignToeUnticked = new HashSet<Transform>();
+        readonly List<Transform>    _foreignToeAdded    = new List<Transform>();   // null = empty slot
+        Vector2 _foreignToeScroll;
+        string  _cleanToeBonesJson;   // chosen in Execute; null = cleaning switched off
+        List<string> _cleanToeBoneNames = new List<string>();   // the same bones, for the scene-side pass
+        // Chosen in Execute, used once the run is back.
+        string _rigShapeJson;
+        List<FootShapeFit.ToggleRow> _plannedToggleRows;
+        BlendShapeWeightSnapshot.Snapshot _blendShapeSnapshot;
+
+        void ResolveFootTransforms(out Transform footL, out Transform footR, out Transform toeL, out Transform toeR)
+        {
+            footL = footR = toeL = toeR = null;
+            if (_avatarObject == null) return;
+            var animator = _avatarObject.GetComponentInChildren<Animator>(true);
+            if (animator != null && animator.isHuman)
+            {
+                footL = animator.GetBoneTransform(HumanBodyBones.LeftFoot);
+                footR = animator.GetBoneTransform(HumanBodyBones.RightFoot);
+                toeL  = animator.GetBoneTransform(HumanBodyBones.LeftToes);
+                toeR  = animator.GetBoneTransform(HumanBodyBones.RightToes);
+            }
+            // A manual foot pick wins, as it does in Blender. The humanoid toe is only kept when it
+            // actually hangs under the picked foot.
+            if (!string.IsNullOrEmpty(_footOverrideL))
+            {
+                var t = FindAvatarBone(_footOverrideL);
+                if (t != null) { footL = t; if (toeL != null && !toeL.IsChildOf(t)) toeL = null; }
+            }
+            if (!string.IsNullOrEmpty(_footOverrideR))
+            {
+                var t = FindAvatarBone(_footOverrideR);
+                if (t != null) { footR = t; if (toeR != null && !toeR.IsChildOf(t)) toeR = null; }
+            }
+        }
+
+        // Which renderer, mesh and bones: what the expensive capture depends on.
+        static string FootShapeGeometryKey(SkinnedMeshRenderer smr, Transform footL, Transform footR,
+                                           Transform toeL, Transform toeR)
+        {
+            int Id(UnityEngine.Object o) => o != null ? o.GetInstanceID() : 0;
+            return $"{Id(smr)}|{Id(smr.sharedMesh)}|{Id(footL)}|{Id(footR)}|{Id(toeL)}|{Id(toeR)}";
+        }
+
+        // The toggle rows depend on which shape keys are switched on, so the values are part of the question.
+        static string FootShapeWeightsKey(SkinnedMeshRenderer smr)
+        {
+            var sb = new StringBuilder();
+            var mesh = smr.sharedMesh;
+            for (int i = 0; i < mesh.blendShapeCount; i++)
+            {
+                float w = smr.GetBlendShapeWeight(i);
+                if (Mathf.Abs(w) > 0.01f)
+                    sb.Append(i).Append('=')
+                      .Append(w.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)).Append(';');
+            }
+            return sb.ToString();
+        }
+
+        // Main-thread capture, reusing the mesh read when only shape-key values changed.
+        FootShapeFit.Input PrepareFootShapeInput(SkinnedMeshRenderer smr, Transform footL, Transform footR,
+                                                 Transform toeL, Transform toeR, string geometryKey)
+        {
+            if (_fitInput == null || _fitInputKey != geometryKey)
+            {
+                _fitInput    = FootShapeFit.Capture(smr, footL, footR, toeL, toeR, _avatarObject.transform);
+                _fitInputKey = geometryKey;
+            }
+            else
+            {
+                foreach (var k in _fitInput.keys) k.sceneWeight = smr.GetBlendShapeWeight(k.index);
+            }
+            return _fitInput;
+        }
+
+        // The answer for this body, or null while it is still being measured in the background.
+        FootShapeFit.Result EnsureFootShapeFit(SkinnedMeshRenderer smr, out bool measuring)
+        {
+            measuring = false;
+            ResolveFootTransforms(out var footL, out var footR, out var toeL, out var toeR);
+            string geometryKey = FootShapeGeometryKey(smr, footL, footR, toeL, toeR);
+            string key = geometryKey + "#" + FootShapeWeightsKey(smr);
+            if (_fit != null && _fitKey == key) return _fit;
+
+            if (_fitTask != null)
+            {
+                if (!_fitTask.IsCompleted) { measuring = true; return null; }
+                if (_fitTaskKey == key)
+                {
+                    _fit = _fitTask.IsFaulted
+                        ? new FootShapeFit.Result
+                          { error = "the check failed (" + _fitTask.Exception?.GetBaseException().Message + ")" }
+                        : _fitTask.Result;
+                    _fitKey = key;
+                }
+                _fitTask = null;
+                if (_fitKey == key) return _fit;
+            }
+
+            // The input is only touched here, and never while a measurement is still running on it.
+            var input = PrepareFootShapeInput(smr, footL, footR, toeL, toeR, geometryKey);
+            _fitTaskKey = key;
+            _fitTask    = System.Threading.Tasks.Task.Run(() => FootShapeFit.Run(input));
+            measuring   = true;
+            return null;
+        }
+
+        // The same answer, right now: Execute can't wait for the background check to come round.
+        FootShapeFit.Result FootShapeFitNow(string bodyMeshName)
+        {
+            var smr = FindAvatarSkinnedMesh(bodyMeshName);
+            if (smr == null || smr.sharedMesh == null || _avatarObject == null) return null;
+            ResolveFootTransforms(out var footL, out var footR, out var toeL, out var toeR);
+            string geometryKey = FootShapeGeometryKey(smr, footL, footR, toeL, toeR);
+            string key = geometryKey + "#" + FootShapeWeightsKey(smr);
+            if (_fit != null && _fitKey == key) return _fit;
+            if (_fitTask != null)
+            {
+                try { _fitTask.Wait(); } catch { }   // never two measurements over the same input
+                if (_fitTaskKey == key && !_fitTask.IsFaulted)
+                {
+                    _fit = _fitTask.Result;
+                    _fitKey = key;
+                    _fitTask = null;
+                    return _fit;
+                }
+                _fitTask = null;
+            }
+            try
+            {
+                _fit = FootShapeFit.Run(PrepareFootShapeInput(smr, footL, footR, toeL, toeR, geometryKey));
+            }
+            catch (Exception e)
+            {
+                _fit = new FootShapeFit.Result { error = "the check failed (" + e.Message + ")" };
+            }
+            _fitKey = key;
+            return _fit;
+        }
+
+        bool FootShapeRowIncluded(FootShapeFit.ToggleRow row) =>
+            row.includedByDefault != _fitRowFlipped.Contains(row.key);
+
+        List<FootShapeFit.ToggleRow> IncludedFootShapeRows(FootShapeFit.Result fit)
+        {
+            var rows = new List<FootShapeFit.ToggleRow>();
+            if (fit?.rows != null)
+                foreach (var r in fit.rows)
+                    if (FootShapeRowIncluded(r)) rows.Add(r);
+            return rows;
+        }
+
+        // {"High heeled": 100} for the rows set to 100. The 0 rows are not sent: Blender builds the rig
+        // with every other shape key at 0 anyway.
+        static string RigShapeJson(List<FootShapeFit.ToggleRow> rows)
+        {
+            var sb = new StringBuilder("{");
+            bool first = true;
+            foreach (var r in rows)
+            {
+                if (r.value <= 0f) continue;
+                if (!first) sb.Append(", ");
+                first = false;
+                sb.Append('"').Append(JsonEscape(r.key)).Append("\": ")
+                  .Append(r.value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+            }
+            return sb.Append('}').ToString();
+        }
+
+        static string JsonEscape(string s)
+        {
+            var sb = new StringBuilder(s.Length + 8);
+            foreach (char c in s)
+            {
+                if (c == '"') sb.Append("\\\"");
+                else if (c == '\\') sb.Append("\\\\");
+                else if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        // The foot shape list: every shape key of the body that moves the feet, ticked when the ARF Foot
+        // Shape toggle will set it (to the value shown). Returns true when it speaks for the body mesh, in
+        // which case the old shape-key warning is not drawn for it.
+        // Whether the foot shape keys list in Advanced Settings covers the body mesh — i.e. the feature is
+        // on and its check ran (or is running). Mirrors what DrawFootShapeSection returns, without drawing,
+        // so Setup can decide whether to show the old shape-key warning wherever the list is.
+        bool FootShapeSpeaksForBody(string bodyMeshName)
+        {
+            if (!_rigOnBestShape || _avatarObject == null) return false;
+            var smr = FindAvatarSkinnedMesh(bodyMeshName);
+            if (smr == null || smr.sharedMesh == null || smr.sharedMesh.blendShapeCount == 0) return false;
+            var fit = EnsureFootShapeFit(smr, out bool measuring);
+            return measuring || (fit != null && fit.error == null);
+        }
+
+        bool DrawFootShapeSection(string bodyMeshName)
+        {
+            if (_avatarObject == null) return false;
+            var smr = FindAvatarSkinnedMesh(bodyMeshName);
+            if (smr == null || smr.sharedMesh == null || smr.sharedMesh.blendShapeCount == 0) return false;
+
+            EditorGUILayout.Space(2);
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            // The feature's on/off switch is the list's own title, so it sits where its effect is seen.
+            EditorGUI.BeginChangeCheck();
+            _rigOnBestShape = EditorGUILayout.ToggleLeft(
+                new GUIContent("Foot shape keys",
+                    "On: finds the shape keys that put the avatar's own foot bones inside the feet, rigs the toes "
+                    + "on that shape, keeps the avatar's shape-key values, and adds a VRCFury toggle ("
+                    + FootShapeToggle.MenuPath + ") that sets the ticked keys to the value shown.\n\n"
+                    + "Off: rigs on the Basis as before, with shape keys that move the feet set to 0 on the duplicate."),
+                _rigOnBestShape, EditorStyles.boldLabel);
+            if (EditorGUI.EndChangeCheck())
+                EditorPrefs.SetBool(PrefRigOnBestShape, _rigOnBestShape);
+            EditorGUILayout.LabelField("Toggles the ticked blendshapes when you animate the feet.",
+                EditorStyles.miniLabel);
+
+            if (!_rigOnBestShape)
+            {
+                EditorGUILayout.EndVertical();
+                return false;   // off: the old shape-key warning speaks for the body
+            }
+
+            var fit = EnsureFootShapeFit(smr, out bool measuring);
+            if (measuring || fit == null || fit.error != null)
+            {
+                EditorGUILayout.LabelField(
+                    measuring || fit == null ? "Checking the shape keys…" : "Check skipped: " + fit.error + ".",
+                    EditorStyles.wordWrappedMiniLabel);
+                EditorGUILayout.EndVertical();
+                return measuring;
+            }
+
+            bool hasToggle = FootShapeToggle.Find(_avatarObject) != null;
+
+            if (fit.rows.Count == 0)
+            {
+                EditorGUILayout.LabelField("No shape key moves the feet.", EditorStyles.miniLabel);
+            }
+            else
+            {
+                // Fixed height, scrolling: some bases have fifteen keys touching the feet, and the list
+                // must not push the rest of the settings off the window.
+                float rowHeight = EditorGUIUtility.singleLineHeight + 2f;
+                _footShapeScroll = EditorGUILayout.BeginScrollView(_footShapeScroll,
+                    GUILayout.Height(Mathf.Min(fit.rows.Count * rowHeight + 6f, FootShapeListMaxHeight)));
+                foreach (var row in fit.rows)
+                {
+                    EditorGUILayout.BeginHorizontal();
+                    bool on = FootShapeRowIncluded(row);
+                    string nowValue = Mathf.Abs(row.sceneWeight - row.value) > 0.01f
+                        ? $"   (now {row.sceneWeight:0.#})" : "";
+                    bool ticked = EditorGUILayout.ToggleLeft(
+                        new GUIContent($"{row.key}  →  {row.value:0}{nowValue}", FootShapeRowTooltip(row)), on);
+                    if (ticked != on && !_fitRowFlipped.Remove(row.key)) _fitRowFlipped.Add(row.key);
+                    GUILayout.Label(FootShapeRowLabel(row), EditorStyles.miniLabel, GUILayout.Width(110));
+                    EditorGUILayout.EndHorizontal();
+                }
+                EditorGUILayout.EndScrollView();
+            }
+
+            if (fit.NeedsShape)
+            {
+                var lacking = new List<string>();
+                foreach (var g in _garmentMeshNames)
+                {
+                    if (string.IsNullOrEmpty(g)) continue;
+                    var gs = FindAvatarSkinnedMesh(g);
+                    if (gs == null || gs.sharedMesh == null) continue;
+                    var missing = fit.combo.Where(k => gs.sharedMesh.GetBlendShapeIndex(k) < 0).ToList();
+                    if (missing.Count > 0) lacking.Add($"{g} (no {string.Join(", ", missing)})");
+                }
+                if (lacking.Count > 0)
+                    EditorGUILayout.LabelField(
+                        "⚠ No " + string.Join(", ", fit.combo) + " on: " + string.Join("; ", lacking)
+                        + " — won't follow the feet when the toggle is on.",
+                        EditorStyles.wordWrappedMiniLabel);
+            }
+
+            if (!FootShapeToggle.VRCFuryAvailable)
+                EditorGUILayout.LabelField(
+                    "VRCFury is not installed, so no toggle can be added: animate the ticked keys yourself.",
+                    EditorStyles.wordWrappedMiniLabel);
+            else if (hasToggle)
+                DrawFootShapeToggleStatus();
+
+            EditorGUILayout.EndVertical();
+            return true;
+        }
+
+        void DrawFootShapeToggleStatus()
+        {
+            if (FootShapeToggle.IsLastChild(_avatarObject))
+            {
+                EditorGUILayout.LabelField($"✓ \"{FootShapeToggle.ObjectName}\" is on the avatar, as its last object.",
+                    EditorStyles.miniLabel);
+                return;
+            }
+            EditorGUILayout.HelpBox(
+                $"\"{FootShapeToggle.ObjectName}\" is no longer the last object under the avatar. A VRCFury "
+                + "toggle below it that sets the same shape keys would override it.",
+                MessageType.Warning);
+            if (GUILayout.Button("Move to bottom", GUILayout.Height(20)))
+                EditorApplication.delayCall += () =>
+                {
+                    if (_avatarObject != null) FootShapeToggle.MoveToBottom(_avatarObject);
+                    Repaint();
+                };
+        }
+
+        // ─── Clean existing toe bones ──────────────────────────────────────────
+        // Toe bones another rig added under the feet (ToeRigDetect), listed so they can be removed before
+        // rigging: their weights are added onto the foot or toe bone they hang from, in Blender.
+
+        List<Transform> DetectForeignToeBones()
+        {
+            if (_avatarObject == null) return new List<Transform>();
+            ResolveFootTransforms(out var footL, out var footR, out var toeL, out var toeR);
+            try { return ToeRigDetect.Find(_avatarObject.transform, footL, footR, toeL, toeR); }
+            catch { return new List<Transform>(); }
+        }
+
+        // Why a bone can't be added by hand, or null when it can.
+        string ForeignToeAddProblem(Transform t)
+        {
+            if (t == null) return null;
+            if (_avatarObject == null || !t.IsChildOf(_avatarObject.transform)) return "it is not part of this avatar";
+            ResolveFootTransforms(out var footL, out var footR, out var toeL, out var toeR);
+            if (t == footL || t == footR || t == toeL || t == toeR)
+                return "it is the avatar's own foot or toe bone, which the rig needs";
+            if (ToeRigDetect.IsAutoRigBone(t.name)) return "it is an AutoRig Feet bone, which the rig replaces anyway";
+            bool underFoot = (footL != null && t.IsChildOf(footL)) || (footR != null && t.IsChildOf(footR));
+            return underFoot ? null : "it is not under a foot bone";
+        }
+
+        // The bones a run removes: the ticked detected ones plus the valid ones added by hand.
+        List<Transform> ForeignToeBonesToClean()
+        {
+            var list = new List<Transform>();
+            if (!_cleanForeignToes || _avatarObject == null) return list;
+            foreach (var t in DetectForeignToeBones())
+                if (!_foreignToeUnticked.Contains(t)) list.Add(t);
+            foreach (var t in _foreignToeAdded)
+                if (t != null && !list.Contains(t) && ForeignToeAddProblem(t) == null) list.Add(t);
+            return list;
+        }
+
+        static string FormatBoneList(List<Transform> bones) =>
+            string.Join(", ", bones.Take(6).Select(b => b.name)) + (bones.Count > 6 ? $" and {bones.Count - 6} more" : "");
+
+        bool ConfirmForeignToeCleaning(List<Transform> bones) =>
+            EditorUtility.DisplayDialog(
+                "Clean existing toe bones?",
+                $"{bones.Count} toe bone(s) from another rig will be removed from the rigged copy:\n\n"
+                + FormatBoneList(bones)
+                + "\n\nTheir weights are added onto the foot or toe bone they hang from, so the mesh keeps its "
+                + "skinning. Your original avatar is not changed.\n\n"
+                + "To keep some of them, untick them in the \"Clean existing toe bones\" list.",
+                "Clean and rig", "Cancel");
+
+        void DrawForeignToeSection()
+        {
+            if (_avatarObject == null) return;
+            var detected = DetectForeignToeBones();
+
+            EditorGUILayout.Space(2);
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            EditorGUI.BeginChangeCheck();
+            _cleanForeignToes = EditorGUILayout.ToggleLeft(
+                new GUIContent("Clean existing toe bones",
+                    "Toe bones another rig added under the feet. The ticked ones are removed before rigging, and "
+                    + "their weights are added onto the foot or toe bone they hang from, so no vertex loses its "
+                    + "skinning. The avatar's own foot and toe bones are never listed.\n\n"
+                    + "Off: nothing is removed (the run report warns if such bones are found)."),
+                _cleanForeignToes, EditorStyles.boldLabel);
+            if (EditorGUI.EndChangeCheck())
+                EditorPrefs.SetBool(PrefCleanForeignToes, _cleanForeignToes);
+            EditorGUILayout.LabelField("Removes toe bones from another rig; their weights go to the foot.",
+                EditorStyles.miniLabel);
+
+            if (_cleanForeignToes)
+            {
+                int rows = detected.Count + _foreignToeAdded.Count;
+                if (rows == 0)
+                {
+                    EditorGUILayout.LabelField("No toe bones from another rig found.", EditorStyles.miniLabel);
+                }
+                else
+                {
+                    float rowHeight = EditorGUIUtility.singleLineHeight + 2f;
+                    _foreignToeScroll = EditorGUILayout.BeginScrollView(_foreignToeScroll,
+                        GUILayout.Height(Mathf.Min(rows * rowHeight + 6f, FootShapeListMaxHeight)));
+                    foreach (var t in detected)
+                    {
+                        EditorGUILayout.BeginHorizontal();
+                        bool on  = !_foreignToeUnticked.Contains(t);
+                        bool now = EditorGUILayout.Toggle(on, GUILayout.Width(18));
+                        if (now != on)
+                        {
+                            if (now) _foreignToeUnticked.Remove(t);
+                            else     _foreignToeUnticked.Add(t);
+                        }
+                        // Reference only (click it to highlight the bone); a different bone dropped here is ignored.
+                        EditorGUILayout.ObjectField(t, typeof(Transform), true);
+                        EditorGUILayout.EndHorizontal();
+                    }
+                    for (int i = 0; i < _foreignToeAdded.Count; i++)
+                    {
+                        EditorGUILayout.BeginHorizontal();
+                        GUILayout.Space(22);
+                        var picked = (Transform)EditorGUILayout.ObjectField(_foreignToeAdded[i], typeof(Transform), true);
+                        if (picked != _foreignToeAdded[i])
+                        {
+                            string problem = ForeignToeAddProblem(picked);
+                            if (problem == null) _foreignToeAdded[i] = picked;
+                            else SetStatus($"\"{picked.name}\" can't be cleaned: {problem}.", MessageType.Warning);
+                        }
+                        bool removeRow = GUILayout.Button("×", GUILayout.Width(22));
+                        EditorGUILayout.EndHorizontal();
+                        if (removeRow)
+                        {
+                            _foreignToeAdded.RemoveAt(i);
+                            i--;
+                        }
+                    }
+                    EditorGUILayout.EndScrollView();
+                }
+                if (GUILayout.Button(new GUIContent("+ Add bone", "Add a toe bone the check missed. Drop it from the Hierarchy into the new row."),
+                        GUILayout.Height(18)))
+                    _foreignToeAdded.Add(null);
+            }
+            EditorGUILayout.EndVertical();
+        }
+
+        static string FootShapeRowLabel(FootShapeFit.ToggleRow row)
+        {
+            switch (row.reason)
+            {
+                case FootShapeFit.RowReason.BestFit:        return "best fit";
+                case FootShapeFit.RowReason.FitsWorse:      return "fits worse";
+                case FootShapeFit.RowReason.OnAndFitsWorse: return "on, fits worse";
+                case FootShapeFit.RowReason.HidesGeometry:  return "hides geometry";
+                case FootShapeFit.RowReason.ReshapesBody:   return "reshapes body";
+                default:                                    return "minor";
+            }
+        }
+
+        static string FootShapeRowTooltip(FootShapeFit.ToggleRow row)
+        {
+            string cost = $"Switched on from the best shape, it costs {row.samplesDrop * 100f:0} points of the "
+                        + $"foot inside the mesh and {row.depthDrop:0.00} foot lengths of depth.";
+            switch (row.reason)
+            {
+                case FootShapeFit.RowReason.BestFit:
+                    return "The toe rig is built with this shape key at 100, and the toggle sets it to 100.";
+                case FootShapeFit.RowReason.FitsWorse:
+                    return "Moves the feet off their bones. " + cost
+                         + " The toggle holds it at 0, so nothing else can switch it on while the feet system is on.";
+                case FootShapeFit.RowReason.OnAndFitsWorse:
+                    return "Switched on in the scene, and the feet fit their bones better without it. The toggle sets it to 0.";
+                case FootShapeFit.RowReason.HidesGeometry:
+                    return "Hides part of the mesh. Left out of the toggle unless you tick it.";
+                case FootShapeFit.RowReason.ReshapesBody:
+                    return "Also changes the legs or body. Left out of the toggle unless you tick it.";
+                default:
+                    return "Barely changes how the feet fit their bones. " + cost
+                         + " Left out of the toggle unless you tick it.";
+            }
+        }
+
+        // Blender takes the other rig's toe bones out of the FBX skeleton. The scene copy, though, is built
+        // from the avatar that was selected, so those GameObjects come across with it and are left
+        // dangling: nothing skins to them any more, but they still sit under the feet, still carry whatever
+        // the other rig put on them, and still read as bones in the Hierarchy. This removes them from the
+        // finished avatar, in both export modes.
+        //
+        // Two guards, because these are objects the user never named:
+        //   • a bone still used by any SkinnedMeshRenderer (bones array or rootBone) is KEPT, so nothing
+        //     can lose its skinning, whatever happened in Blender;
+        //   • a child that is not itself being removed (a prop or constraint parented under an old toe)
+        //     moves up to the bone's parent instead of being destroyed along with it.
+        void RemoveCleanedToeBoneObjects()
+        {
+            if (_resultInstance == null || _cleanToeBoneNames == null || _cleanToeBoneNames.Count == 0) return;
+            var names = new HashSet<string>(_cleanToeBoneNames, StringComparer.Ordinal);
+
+            var inUse = new HashSet<Transform>();
+            foreach (var smr in _resultInstance.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+            {
+                if (smr.rootBone != null) inUse.Add(smr.rootBone);
+                var bones = smr.bones;
+                if (bones == null) continue;
+                foreach (var b in bones) if (b != null) inUse.Add(b);
+            }
+
+            // Deepest first, so a chain comes apart from its tip and each bone is childless by its turn.
+            var targets = _resultInstance.GetComponentsInChildren<Transform>(true)
+                .Where(t => t != null && t != _resultInstance.transform && names.Contains(t.name))
+                .OrderByDescending(TransformDepth)
+                .ToList();
+
+            int removed = 0, moved = 0;
+            var kept = new List<string>();
+            foreach (var t in targets)
+            {
+                if (t == null) continue;
+                if (inUse.Contains(t)) { kept.Add(t.name + " (still skinned)"); continue; }
+                var parent = t.parent;
+                for (int i = t.childCount - 1; i >= 0; i--)
+                {
+                    Undo.SetTransformParent(t.GetChild(i), parent, "AutoRig Feet — Clean Toe Bones");
+                    moved++;
+                }
+                try
+                {
+                    Undo.DestroyObjectImmediate(t.gameObject);
+                    removed++;
+                }
+                catch (Exception e)
+                {
+                    kept.Add(t.name + " (" + e.Message + ")");
+                }
+            }
+
+            if (removed > 0)
+                _runReport.AddIssue("U_TOE_BONES_CLEANED", "info",
+                    $"{removed} toe bone object(s) from another rig were removed from the avatar in the scene"
+                    + (moved > 0 ? $", and {moved} object(s) parented under them were moved onto the foot" : "")
+                    + ". Blender had already taken them out of the FBX skeleton.");
+            if (kept.Count > 0)
+                _runReport.AddIssue("U_TOE_BONES_KEPT", "warning",
+                    $"{kept.Count} toe bone object(s) could not be removed from the avatar in the scene: "
+                    + string.Join("; ", kept.Take(6)) + (kept.Count > 6 ? "…" : ""),
+                    "They are no longer part of the rig. Delete them by hand if you don't want them, or "
+                    + "use Duplicate mode, which builds a fresh copy.");
+        }
+
+        static int TransformDepth(Transform t)
+        {
+            int d = 0;
+            while (t.parent != null) { d++; t = t.parent; }
+            return d;
+        }
+
+        // After the swap: every shape-key value the original avatar had, by renderer path and name.
+        void RestoreSceneBlendShapeWeights()
+        {
+            if (_resultInstance == null || _blendShapeSnapshot == null) return;
+            var missing = new List<string>();
+            var (matched, changed) = BlendShapeWeightSnapshot.Apply(_resultInstance, _blendShapeSnapshot, missing);
+            _runReport.AddIssue("U_BLENDSHAPES_RESTORED", "info",
+                $"The avatar keeps the shape-key values it had ({matched} checked, {changed} put back after the swap).");
+            if (missing.Count > 0)
+                _runReport.AddIssue("U_BLENDSHAPES_MISSING", "warning",
+                    $"{missing.Count} shape-key value(s) could not be put back, because the shape key or its "
+                    + "mesh no longer exists: " + string.Join("; ", missing.Take(6)) + (missing.Count > 6 ? "…" : ""),
+                    "Check those meshes on the avatar. The original values are in blendshape_weights.json in "
+                    + "the run folder.");
+        }
+
+        // The foot-shape toggle. The 100 rows are what Blender actually built the rig on (from the final
+        // report), so the toggle always matches the rig; the 0 rows are the ticked rows from the box.
+        void CreateFootShapeToggleAfterRun()
+        {
+            if (_resultInstance == null) return;
+            // Every run starts clean: the toggle object from an earlier run goes first, whatever it held,
+            // and a new one is built from this run's list.
+            bool hadToggle = FootShapeToggle.Remove(_resultInstance);
+            var rows = new List<(string key, float value)>();
+            var rigged = ParseRigShapeStats(_runReport.finalRawJson);
+            if (rigged != null)
+                foreach (var kv in rigged)
+                    if (kv.Value > 0f) rows.Add((kv.Key, kv.Value));
+            if (_plannedToggleRows != null)
+                foreach (var r in _plannedToggleRows)
+                    if (r.value <= 0f && !rows.Exists(x => x.key == r.key)) rows.Add((r.key, 0f));
+            if (rows.Count == 0)
+            {
+                if (hadToggle)
+                    _runReport.AddIssue("U_FOOT_SHAPE_TOGGLE_REMOVED", "info",
+                        $"Removed \"{FootShapeToggle.ObjectName}\" from the earlier run: no shape key is ticked "
+                        + "in the foot shape list now.");
+                return;
+            }
+
+            string list = string.Join(", ", rows.Select(r => $"{r.key} = {r.value:0}"));
+            if (!FootShapeToggle.VRCFuryAvailable)
+            {
+                _runReport.AddIssue("U_FOOT_SHAPE_NO_VRCFURY", "warning",
+                    $"The feet need these shape keys while the feet system is on: {list}. VRCFury is not "
+                    + "installed, so no toggle was added.",
+                    "Install VRCFury and run again, or animate those shape keys yourself.");
+                return;
+            }
+            var go = FootShapeToggle.CreateOrUpdate(_resultInstance, rows, out string error);
+            if (go == null)
+            {
+                _runReport.AddIssue("U_FOOT_SHAPE_TOGGLE_FAILED", "warning",
+                    "The foot-shape toggle could not be added: " + error,
+                    $"Animate these shape keys yourself while the feet system is on: {list}.");
+                return;
+            }
+            _runReport.AddIssue("U_FOOT_SHAPE_TOGGLE", "info",
+                (hadToggle ? "Replaced" : "Added") + $" \"{FootShapeToggle.ObjectName}\" as the last object under "
+                + $"the avatar, with the menu toggle {FootShapeToggle.MenuPath}: {list}.",
+                "Turn it on while you use the feet system. Keep the object last under the avatar, so no other "
+                + "toggle overrides it.");
+        }
+
+        // stats.rig_shape from the final report: {"High heeled": 100.0}. JsonUtility can't read a
+        // dictionary, and the keys are the creator's shape-key names, which can hold any character.
+        static Dictionary<string, float> ParseRigShapeStats(string json)
+        {
+            if (string.IsNullOrEmpty(json)) return null;
+            int stats = json.IndexOf("\"stats\"", StringComparison.Ordinal);
+            int at = stats < 0 ? -1 : json.IndexOf("\"rig_shape\"", stats, StringComparison.Ordinal);
+            int i = at < 0 ? -1 : json.IndexOf('{', at);
+            if (i < 0) return null;
+            var map = new Dictionary<string, float>();
+            i++;
+            while (i < json.Length)
+            {
+                while (i < json.Length && (char.IsWhiteSpace(json[i]) || json[i] == ',')) i++;
+                if (i >= json.Length) return null;
+                if (json[i] == '}') return map;
+                string key = ReadJsonString(json, ref i);
+                if (key == null) return null;
+                while (i < json.Length && (char.IsWhiteSpace(json[i]) || json[i] == ':')) i++;
+                int start = i;
+                while (i < json.Length && "+-.0123456789eE".IndexOf(json[i]) >= 0) i++;
+                if (!float.TryParse(json.Substring(start, i - start), System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out float value)) return null;
+                map[key] = value;
+            }
+            return null;
+        }
+
+        static string ReadJsonString(string json, ref int i)
+        {
+            if (i >= json.Length || json[i] != '"') return null;
+            var sb = new StringBuilder();
+            for (i++; i < json.Length; i++)
+            {
+                char c = json[i];
+                if (c == '"') { i++; return sb.ToString(); }
+                if (c != '\\') { sb.Append(c); continue; }
+                if (++i >= json.Length) return null;
+                switch (json[i])
+                {
+                    case 'n': sb.Append('\n'); break;
+                    case 't': sb.Append('\t'); break;
+                    case 'r': sb.Append('\r'); break;
+                    case 'b': sb.Append('\b'); break;
+                    case 'f': sb.Append('\f'); break;
+                    case 'u':
+                        if (i + 4 >= json.Length) return null;
+                        sb.Append((char)Convert.ToInt32(json.Substring(i + 1, 4), 16));
+                        i += 4;
+                        break;
+                    default: sb.Append(json[i]); break;   // \" \\ \/
+                }
+            }
+            return null;
         }
 
         // ─── Restore original rig (from JSON backup) ───────────────────────────
@@ -2334,6 +3126,16 @@ namespace ZeroShugan.ShuganUnityTools
 
             EditorGUI.indentLevel++;
 
+            // ── What the run does to this avatar ─────────────────────────────
+            // Both lists are filled in and ticked for you, so a run is correct without ever opening
+            // them; they are here for the person who wants to see or change what was decided.
+            if (_meshNames.Length > 0)
+            {
+                DrawFootShapeSection(_meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)]);
+                DrawForeignToeSection();
+                Separator();
+            }
+
             // ── Blender path ─────────────────────────────────────────────────
             GUILayout.Label("Blender", EditorStyles.boldLabel);
 
@@ -2561,6 +3363,16 @@ namespace ZeroShugan.ShuganUnityTools
                 EditorGUILayout.LabelField(" ",
                     "Writes a swap debug log to Assets/! Shugan/!_Lab/Script/FBXSwapper_Logs/.",
                     EditorStyles.miniLabel);
+            else if (_exportMode == ExportMode.Duplicate)
+                // Legacy rebuilds the avatar on the new FBX object by object, so anything it has to
+                // recreate comes out as a plain GameObject. Prefabs from other creators on the avatar
+                // therefore arrive in the copy unpacked. Standard keeps them, so say so here rather
+                // than let it be discovered on a finished avatar.
+                EditorGUILayout.HelpBox(
+                    "Legacy rebuilds the avatar object by object, so prefabs on it (hand controllers, "
+                    + "gesture setups, props) lose their prefab link in the copy. Standard keeps them "
+                    + "linked — use it unless Legacy is fixing something else for you.",
+                    MessageType.Info);
 
             Separator();
 
@@ -2661,7 +3473,147 @@ namespace ZeroShugan.ShuganUnityTools
             if (GUILayout.Button("+ Add Prefab Slot", GUILayout.Height(22)))
                 _prefabsToAdd.Add(null);
 
+            Separator();
+
+            DrawFootShapeToggleTest();
+
             EditorGUI.indentLevel--;
+        }
+
+        // ── VRCFury foot-shape toggle (test) ───────────────────────────────────
+        // Builds the same object and toggle a rig run will add, so the VRCFury side can be checked
+        // in the scene on its own. The rows are the shape keys that are switched on and move the
+        // feet (set to 0), plus anything typed in Extra keys.
+        string _footShapeTestSpec = "";
+
+        void DrawFootShapeToggleTest()
+        {
+            GUILayout.Label("VRCFury Foot-Shape Toggle (test)", EditorStyles.boldLabel);
+            if (!FootShapeToggle.VRCFuryAvailable)
+            {
+                EditorGUILayout.HelpBox(
+                    "VRCFury is not installed in this project, so the toggle can't be created.",
+                    MessageType.Info);
+                return;
+            }
+
+            EditorGUILayout.LabelField(
+                $"Adds \"{FootShapeToggle.ObjectName}\" under the avatar, with the menu toggle "
+                + FootShapeToggle.MenuPath + ".",
+                EditorStyles.wordWrappedMiniLabel);
+
+            _footShapeTestSpec = EditorGUILayout.TextField(
+                new GUIContent("Extra keys",
+                    "Optional. Shape keys to put in the toggle, as name=value separated by ';' "
+                    + "(value 0-100; a name on its own means 100). For example:\n"
+                    + "High heeled=100; Foot_hill=0\n\n"
+                    + "The ticked keys of the foot shape list (under Export Mode) are added automatically."),
+                _footShapeTestSpec);
+
+            bool hasAvatar = _avatarObject != null;
+            bool exists    = hasAvatar && FootShapeToggle.Find(_avatarObject) != null;
+
+            // The scene changes are deferred to after this GUI pass: creating or removing the object
+            // mid-pass changes which controls are drawn, which Unity reports as a layout error.
+            EditorGUILayout.BeginHorizontal();
+            GUI.enabled = hasAvatar;
+            if (GUILayout.Button(exists ? "Update toggle on avatar" : "Create toggle on avatar",
+                    GUILayout.Height(22)))
+                EditorApplication.delayCall += CreateFootShapeToggleTest;
+            GUI.enabled = exists;
+            if (GUILayout.Button("Remove", GUILayout.Width(70), GUILayout.Height(22)))
+                EditorApplication.delayCall += RemoveFootShapeToggleTest;
+            GUI.enabled = true;
+            EditorGUILayout.EndHorizontal();
+
+            if (!exists) return;
+            if (FootShapeToggle.IsLastChild(_avatarObject))
+            {
+                EditorGUILayout.LabelField("✓ Present, and the last object under the avatar.",
+                    EditorStyles.miniLabel);
+            }
+            else
+            {
+                EditorGUILayout.HelpBox(
+                    "The toggle is no longer the last object under the avatar. A VRCFury toggle below it "
+                    + "that sets the same shape keys would override it.",
+                    MessageType.Warning);
+                if (GUILayout.Button("Move to bottom", GUILayout.Height(20)))
+                    EditorApplication.delayCall += () =>
+                    {
+                        if (_avatarObject != null) FootShapeToggle.MoveToBottom(_avatarObject);
+                        Repaint();
+                    };
+            }
+        }
+
+        void CreateFootShapeToggleTest()
+        {
+            if (_avatarObject == null) return;
+            var rows = new List<(string key, float value)>();
+            var seen = new HashSet<string>();
+
+            // Typed rows first, so a key can be forced to any value.
+            foreach (string part in (_footShapeTestSpec ?? "").Split(';'))
+            {
+                string p = part.Trim();
+                if (p.Length == 0) continue;
+                int eq = p.LastIndexOf('=');
+                string key = (eq > 0 ? p.Substring(0, eq) : p).Trim();
+                float value = 100f;
+                if (eq > 0 && !float.TryParse(p.Substring(eq + 1).Trim(),
+                        System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out value))
+                {
+                    SetStatus($"Couldn't read the value in \"{p}\". Use name=value, e.g. High heeled=100.",
+                        MessageType.Warning);
+                    Repaint();
+                    return;
+                }
+                if (key.Length > 0 && seen.Add(key)) rows.Add((key, Mathf.Clamp(value, 0f, 100f)));
+            }
+
+            if (_meshNames.Length > 0)
+            {
+                string bodyName = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
+                // The ticked rows of the foot shape list: exactly what a run puts in the toggle. Without
+                // that list (option off, or the check can't run), the switched-on feet shape keys at 0.
+                var fit = _rigOnBestShape ? FootShapeFitNow(bodyName) : null;
+                if (fit != null && fit.error == null)
+                {
+                    foreach (var r in IncludedFootShapeRows(fit))
+                        if (seen.Add(r.key)) rows.Add((r.key, r.value));
+                }
+                else
+                {
+                    foreach (var o in GetFeetShapeOffenders(FindAvatarSkinnedMesh(bodyName)))
+                        if (seen.Add(o.name)) rows.Add((o.name, 0f));
+                }
+            }
+
+            var go = FootShapeToggle.CreateOrUpdate(_avatarObject, rows, out string error);
+            if (go == null)
+            {
+                SetStatus("Foot-shape toggle not created: " + error
+                    + (rows.Count == 0 ? " Type a shape key in Extra keys to test anyway." : ""),
+                    MessageType.Warning);
+            }
+            else
+            {
+                // Pinged, not selected: selecting it would make this window adopt it as the avatar.
+                EditorGUIUtility.PingObject(go);
+                SetStatus($"Foot-shape toggle added under {_avatarObject.name} with {rows.Count} shape key(s): "
+                    + string.Join(", ", rows.Select(r => $"{r.key} = {r.value:0.##}")),
+                    MessageType.Info);
+            }
+            Repaint();
+        }
+
+        void RemoveFootShapeToggleTest()
+        {
+            if (_avatarObject != null && FootShapeToggle.Remove(_avatarObject))
+                SetStatus("Foot-shape toggle removed.", MessageType.Info);
+            Repaint();
         }
 
         // ─── Progress bar ──────────────────────────────────────────────────────
@@ -2733,20 +3685,40 @@ namespace ZeroShugan.ShuganUnityTools
             // keyword, ask before spending a Blender run on a likely misdetection.
             if (!ConfirmFootBonesIfUncertain()) return;
 
-            if (_exportMode == ExportMode.Replace)
-            {
-                bool ok = EditorUtility.DisplayDialog(
-                    "Replace Source FBX?",
-                    "The original FBX will be overwritten:\n" +
-                    AssetDatabase.GetAssetPath(_sourceFbxAsset) +
-                    "\n\nA timestamped backup will be created in a _Backups folder.",
-                    "Replace", "Cancel");
-                if (!ok) return;
-            }
+            if (_exportMode == ExportMode.Replace && !ConfirmReplaceMode()) return;
+
+            // Toe bones from another rig: the ticked ones are removed in Blender. Replace already lists them
+            // in its dialog; a Duplicate run asks here, because it is still a change the user may not expect.
+            var cleanToes = ForeignToeBonesToClean();
+            if (_exportMode == ExportMode.Duplicate && cleanToes.Count > 0 && !ConfirmForeignToeCleaning(cleanToes))
+                return;
+            _cleanToeBonesJson = _cleanForeignToes
+                ? "[" + string.Join(", ", cleanToes.Select(t => "\"" + JsonEscape(t.name) + "\"")) + "]"
+                : null;
+            // Blender takes them out of the FBX skeleton; the scene copy is built from the avatar, so the
+            // GameObjects survive there and have to be removed after the swap (RemoveCleanedToeBoneObjects).
+            _cleanToeBoneNames = cleanToes.Select(t => t.name).ToList();
 
             // RE-RIG: the source FBX already carries a rig, so this run will replace it. Ask how to
             // treat the existing foot weights before anything is written.
             if (!ConfirmReRigStrategy(out _rerigRestoreJson, out _rerigSkipFootReduction)) return;
+
+            // FOOT SHAPE: which shape the rig is built on, what the toggle sets afterwards, and the
+            // shape-key values the result must get back. Measured here if the background check hasn't
+            // finished yet (a second or two at most).
+            _rigShapeJson       = null;
+            _plannedToggleRows  = null;
+            _blendShapeSnapshot = null;
+            if (_rigOnBestShape)
+            {
+                var fit = FootShapeFitNow(targetMesh);
+                if (fit != null && fit.error == null)
+                {
+                    _plannedToggleRows = IncludedFootShapeRows(fit);
+                    _rigShapeJson      = RigShapeJson(_plannedToggleRows);
+                }
+                _blendShapeSnapshot = BlendShapeWeightSnapshot.Capture(_avatarObject);
+            }
 
             BackupScene();
             BackupOriginalFbx();
@@ -2781,6 +3753,21 @@ namespace ZeroShugan.ShuganUnityTools
             // Capture the full Blender console (stdout+stderr) to a log file for debugging.
             BeginRunLog("autorig");
 
+            // The shape-key values the result gets back, kept next to the run log too, so they can be
+            // re-applied by hand if anything goes wrong after the swap.
+            if (_blendShapeSnapshot != null && _runLogger != null && !string.IsNullOrEmpty(_runLogger.FolderAbs))
+            {
+                try
+                {
+                    BlendShapeWeightSnapshot.Save(_blendShapeSnapshot,
+                        Path.Combine(_runLogger.FolderAbs, "blendshape_weights.json"));
+                }
+                catch (Exception e)
+                {
+                    UnityEngine.Debug.LogWarning("[AutoRig Feet] Could not save blendshape_weights.json: " + e.Message);
+                }
+            }
+
             // Fresh run report; the launch timestamp anchors the "was a NEW FBX actually
             // exported?" check (a stale file on disk must not count as success).
             _runReport         = new ShuganTools.RunReport();
@@ -2793,7 +3780,9 @@ namespace ZeroShugan.ShuganUnityTools
                 backupJsonPath: backupJsonPath,
                 footBoneL: _footOverrideL, footBoneR: _footOverrideR,
                 rerigRestoreJsonPath: _rerigRestoreJson,
-                skipFootReduction: _rerigSkipFootReduction);
+                skipFootReduction: _rerigSkipFootReduction,
+                rigShapeJson: _rigShapeJson,
+                cleanToeBonesJson: _cleanToeBonesJson);
 
             // Archive the wrapper that actually ran. It goes to a fixed temp filename and is
             // overwritten by the next run, so without this the exact python behind a failure is
@@ -2959,17 +3948,63 @@ namespace ZeroShugan.ShuganUnityTools
             foreach (var prefabRef in _prefabsToAdd)
             {
                 if (prefabRef == null) continue;
-                if (ChildNameExists(_resultInstance, prefabRef.name))
+
+                // The avatar may already carry this prefab, and the copy can be in one of two states.
+                // A LIVE instance (it came across the swap still linked to its asset) is left exactly
+                // as it is, overrides included. A LOOSE copy — same name, no link, typically flattened
+                // by an older run — is replaced by a real instance, so the finished avatar follows the
+                // prefab instead of holding a frozen snapshot of it.
+                var existing = FindDirectChild(_resultInstance.transform, prefabRef.name);
+                if (existing != null)
                 {
+                    if (IsInstanceOfPrefabAsset(existing.gameObject, prefabRef))
+                    {
+                        UnityEngine.Debug.Log(
+                            $"[AutoRig Feet Distributor] '{existing.name}' is already on '{_resultInstance.name}' "
+                            + "as a prefab instance — kept as it is.");
+                        continue;
+                    }
                     UnityEngine.Debug.LogWarning(
-                        $"[AutoRig Feet Distributor] Skipped '{prefabRef.name}' — already exists under '{_resultInstance.name}'.");
-                    continue;
+                        $"[AutoRig Feet Distributor] '{existing.name}' under '{_resultInstance.name}' had no prefab "
+                        + $"link — replaced with the '{prefabRef.name}' prefab.");
+                    _runReport?.AddIssue("U_PREFAB_RELINKED", "info",
+                        $"\"{existing.name}\" was on the avatar without a prefab link, so it was replaced with the "
+                        + $"\"{prefabRef.name}\" prefab.",
+                        "Any change you had made to that copy is gone — it now follows the prefab again.");
+                    Undo.DestroyObjectImmediate(existing.gameObject);
                 }
                 var child = (GameObject)PrefabUtility.InstantiatePrefab(
                     prefabRef, _resultInstance.transform);
                 Undo.RegisterCreatedObjectUndo(child, "AutoRig Feet — Add Prefab");
             }
             Selection.activeGameObject = _resultInstance;
+        }
+
+        // The child named `name`, or one Unity numbered ("Name (1)") / a suffixed variant, or null.
+        // Same matching as ChildNameExists, which decided whether to skip a prefab.
+        static Transform FindDirectChild(Transform parent, string name)
+        {
+            foreach (Transform t in parent)
+                if (t.name == name || t.name.StartsWith(name + " ")) return t;
+            return null;
+        }
+
+        // True when `go` is a live instance of `prefabAsset` (nested instances included).
+        static bool IsInstanceOfPrefabAsset(GameObject go, GameObject prefabAsset)
+        {
+            if (go == null || prefabAsset == null) return false;
+            if (!PrefabUtility.IsPartOfPrefabInstance(go)) return false;
+            string want = AssetDatabase.GetAssetPath(prefabAsset);
+            if (string.IsNullOrEmpty(want)) return false;
+            try
+            {
+                string have = PrefabUtility.GetPrefabAssetPathOfNearestInstanceRoot(go);
+                if (string.Equals(have, want, StringComparison.OrdinalIgnoreCase)) return true;
+                var src = PrefabUtility.GetCorrespondingObjectFromOriginalSource(go);
+                return src != null && string.Equals(
+                    AssetDatabase.GetAssetPath(src), want, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
         }
 
         // ─── Final pass: name the result after what it is ──────────────────────
@@ -3597,6 +4632,10 @@ namespace ZeroShugan.ShuganUnityTools
 
         void OnAvatarChanged()
         {
+            // Ticks and added rows in the lists belong to the avatar they were made on.
+            _fitRowFlipped.Clear();
+            _foreignToeUnticked.Clear();
+            _foreignToeAdded.Clear();
             RefreshRigState();
             if (_avatarObject == null) return;
             AutoDetectFbx();
@@ -3619,6 +4658,14 @@ namespace ZeroShugan.ShuganUnityTools
             // shape-key location map has to be rebuilt rather than trusted.
             _companionCache.Clear();
             _companionCacheFor = _avatarObject;
+            // The feet caches are keyed by mesh, and a run swaps the meshes out: rebuild them too.
+            _feetVertsByMesh.Clear();
+            _shapeDeltaByMesh.Clear();
+            _scanNoteByMesh.Clear();
+            _fit         = null;
+            _fitKey      = null;
+            _fitInput    = null;
+            _fitInputKey = null;
             if (_avatarObject == null) return;
             _alreadyRigged  = HasFeetRigBones(_avatarObject);
             if (_alreadyRigged) _riggedVersion = GetRiggedScriptVersion(_avatarObject);
@@ -3947,15 +4994,30 @@ namespace ZeroShugan.ShuganUnityTools
         List<(string name, float score)> _footCandR = new List<(string, float)>();
         [SerializeField] string _footOverrideL = "";   // "" = Auto
         [SerializeField] string _footOverrideR = "";
-        string _footCandFbxPath = "";                  // cache key
+        // The FBX the lists and the manual picks belong to. Serialized so a script reload doesn't look
+        // like a new FBX: that used to wipe the user's manual foot pick on every recompile.
+        [SerializeField] string _footCandFbxPath = "";
+        bool   _footCandLoaded;      // lists computed for _footCandFbxPath (recomputed after a reload)
+        int    _footCandAttempts;
+        double _footCandNextTry;
+        const int    FootCandMaxAttempts  = 20;
+        const double FootCandRetrySeconds = 0.5;
+
+        // True while the foot-bone candidates are still waiting for a readable FBX.
+        bool FootCandidatesPending => !_footCandLoaded && !string.IsNullOrEmpty(_footCandFbxPath);
 
         void RefreshFootCandidates()
         {
             string path = _sourceFbxAsset != null ? AssetDatabase.GetAssetPath(_sourceFbxAsset) : "";
-            if (path == _footCandFbxPath) return;
-            _footCandFbxPath = path;
-            _footOverrideL = "";
-            _footOverrideR = "";
+            if (path != _footCandFbxPath)
+            {
+                _footCandFbxPath  = path;
+                _footOverrideL    = "";
+                _footOverrideR    = "";
+                _footCandLoaded   = false;
+                _footCandAttempts = 0;
+            }
+            if (_footCandLoaded) return;
             try
             {
                 _footCandL = HumanoidRigMapping.RankFootCandidates(path, "L");
@@ -3966,6 +5028,14 @@ namespace ZeroShugan.ShuganUnityTools
                 _footCandL = new List<(string, float)>();
                 _footCandR = new List<(string, float)>();
             }
+            // An FBX that can't be read at this moment (Unity still importing it, or reloading scripts)
+            // gives no candidates at all. That answer used to be cached for the path, which left both foot
+            // rows on "Auto / None" until another avatar was clicked. It is retried from Update instead,
+            // and the run button waits for it; after FootCandMaxAttempts it is accepted as it is.
+            _footCandAttempts++;
+            bool empty = !string.IsNullOrEmpty(path) && (_footCandL.Count == 0 || _footCandR.Count == 0);
+            _footCandLoaded  = !empty || _footCandAttempts >= FootCandMaxAttempts;
+            _footCandNextTry = EditorApplication.timeSinceStartup + FootCandRetrySeconds;
         }
 
         // Draw one "Left/Right foot bone" row: ranked popup + linked scene-bone object field.

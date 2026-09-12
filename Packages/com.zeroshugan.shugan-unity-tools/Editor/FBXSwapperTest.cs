@@ -163,10 +163,17 @@ namespace ZeroShugan.ShuganUnityTools
 
                 if (offset) dup.transform.position += Vector3.right * 1f;
                 Undo.RegisterCreatedObjectUndo(dup, "FBX Swapper (Test)");
+                // Unpack the avatar's OWN prefab link only. The duplicate has to stop following the
+                // source prefab — bones are grafted into it and its meshes are relinked, neither of
+                // which a prefab instance may do. Its CHILDREN are a different matter: an avatar
+                // usually carries prefabs from other creators (hand controllers, gesture setups,
+                // props), and `PrefabUnpackMode.Completely` flattened those too, so the copy came out
+                // with frozen duplicates that no longer track their own prefab. OutermostRoot leaves
+                // every nested prefab instance intact.
                 if (PrefabUtility.IsPartOfPrefabInstance(dup))
-                    PrefabUtility.UnpackPrefabInstance(dup, PrefabUnpackMode.Completely, InteractionMode.AutomatedAction);
+                    PrefabUtility.UnpackPrefabInstance(dup, PrefabUnpackMode.OutermostRoot, InteractionMode.AutomatedAction);
                 log.AppendLine("## STEP TRACE");
-                log.AppendLine("- [OK] duplicate avatar + unpack");
+                log.AppendLine("- [OK] duplicate avatar + unpack (outermost root only; nested prefabs kept)");
 
                 // Step 3 — private FBX copy (inherits old FBX import settings via its .meta)
                 EnsureFolder(GeneratedFolder);

@@ -573,6 +573,10 @@ namespace ZeroShugan.ShuganUnityTools
             return HasAny(n, FOOT_PRIMARY) || HasAny(n, FOOT_SECONDARY);
         }
 
+        /// <summary>True when the bone name contains a toe keyword (any supported language).</summary>
+        public static bool NameLooksLikeToe(string name)
+            => HasAny((name ?? "").ToLowerInvariant(), TOE_PRIMARY);
+
         /// <summary>True if the FBX's avatar already has all foot + toe humanoid slots mapped.</summary>
         public static bool AreFeetAndToesMapped(string fbxPath)
         {

@@ -538,7 +538,8 @@ namespace ZeroShugan.ShuganUnityTools
             string autoRigScriptPath, bool headless, float stepDelay,
             string[] garmentNames = null, string backupJsonPath = null,
             string footBoneL = null, string footBoneR = null,
-            string rerigRestoreJsonPath = null, bool skipFootReduction = false)
+            string rerigRestoreJsonPath = null, bool skipFootReduction = false,
+            string rigShapeJson = null, string cleanToeBonesJson = null)
         {
             string d        = stepDelay.ToString("F1", CultureInfo.InvariantCulture);
             string pySrc    = sourceFbxPath.Replace("\\", "/");
@@ -563,6 +564,16 @@ namespace ZeroShugan.ShuganUnityTools
                 rerigEnv += $"os.environ['SHUGAN_RERIG_RESTORE_JSON'] = '{rerigRestoreJsonPath.Replace("\\", "/")}'\n";
             if (skipFootReduction)
                 rerigEnv += "os.environ['SHUGAN_SKIP_FOOT_REDUCTION'] = '1'\n";
+
+            // FOOT SHAPE: the shape keys the rig is built on, as measured in Unity ({} = the Basis).
+            // Absent when the tool's foot-shape option is off, and the script then stays on the Basis.
+            if (rigShapeJson != null)
+                rerigEnv += $"os.environ['SHUGAN_RIG_SHAPE_JSON'] = '{PyEscape(rigShapeJson)}'\n";
+
+            // TOE BONES FROM ANOTHER RIG: the ticked names from the tool's list ([] = clean nothing). Absent
+            // when the cleaning is switched off; the script then only reports such bones.
+            if (cleanToeBonesJson != null)
+                rerigEnv += $"os.environ['SHUGAN_CLEAN_TOE_BONES_JSON'] = '{PyEscape(cleanToeBonesJson)}'\n";
 
             string exportBlock = FbxExportPython(exportPath);
 
