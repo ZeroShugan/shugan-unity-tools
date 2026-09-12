@@ -64,7 +64,10 @@ namespace ZeroShugan.ShuganUnityTools
         static readonly string[] AutoRigFeetBoneKeywords = { "z_CB ", "Toes_a1" };
 
         // ─── Avatar / FBX ──────────────────────────────────────────────────────
-        GameObject   _avatarObject;
+        // Serialized so a script recompile does not empty the Target Avatar field. Everything DERIVED
+        // from it (rig state, the mesh caches, the foot-bone lists) is not serialized and is rebuilt by
+        // the OnEnable re-check below.
+        [SerializeField] GameObject _avatarObject;
         GameObject   _sourceFbxAsset;
         string[]     _meshNames         = new string[0];
         int          _selectedMeshIndex = 0;
@@ -246,7 +249,13 @@ namespace ZeroShugan.ShuganUnityTools
             // The avatar may already be selected in the Hierarchy before this window is opened;
             // adopt it now so the Target Avatar field is filled straight away. Only when the field
             // is empty, so a remembered avatar is never clobbered by an unrelated selection.
+            //
+            // A remembered one is re-checked instead. OnEnable also runs after every script recompile,
+            // which wipes every non-serialized field: the avatar is still in the field but the rig
+            // state, the mesh caches and the foot-bone candidate lists are all gone, and nothing used
+            // to rebuild them until the user clicked another avatar and back.
             if (_avatarObject == null) TryAdoptSelectedAvatar();
+            else OnAvatarChanged();
 
             // Bring back the last run report for this FBX (survives restarts / domain reloads).
             LoadLastReport();
@@ -269,6 +278,10 @@ namespace ZeroShugan.ShuganUnityTools
 
         void OnSelectionChange() => TryAdoptSelectedAvatar();
 
+        // Coming back to the window is the moment to retry whatever could not be read before — after a
+        // script recompile that is usually the foot-bone lists.
+        void OnFocus() => RearmFootCandidates();
+
         // Pull the currently selected scene object into the Target Avatar field.
         // Called on selection change AND when the window opens: OnSelectionChange only fires on a
         // CHANGE, so selecting the avatar first and opening the tool afterwards used to leave the
@@ -289,7 +302,7 @@ namespace ZeroShugan.ShuganUnityTools
             // The foot-shape fit is measured on a worker thread; show its answer as soon as it lands.
             if (_fitTask != null && _fitTask.IsCompleted) Repaint();
             // Foot-bone candidates that couldn't be read yet are retried here, not left empty.
-            if (FootCandidatesPending && EditorApplication.timeSinceStartup >= _footCandNextTry)
+            if (FootCandidatesRetryDue)
             {
                 RefreshFootCandidates();
                 Repaint();
@@ -466,8 +479,8 @@ namespace ZeroShugan.ShuganUnityTools
             switch (_tab)
             {
                 case Tab.Setup:
-                    DrawDependencyStatus();
-                    Separator();
+                    // No separator above Setup when nothing is missing: the block drew nothing.
+                    if (DrawDependencyStatus()) Separator();
                     DrawMainSection();
                     Separator();
                     DrawAdvancedSection();
@@ -547,7 +560,7 @@ namespace ZeroShugan.ShuganUnityTools
             changes.Append("• Your FBX is overwritten with the rigged version:\n     ")
                    .Append(AssetDatabase.GetAssetPath(_sourceFbxAsset)).Append('\n');
             changes.Append("• The avatar in the scene gets the new toe bones, and its foot and toe weights are repainted");
-            if (_garmentMeshNames.Any(g => !string.IsNullOrEmpty(g))) changes.Append(" (on the garments too)");
+            if (_garmentMeshNames.Any(g => !string.IsNullOrEmpty(g))) changes.Append(" (on the outfits too)");
             changes.Append(".\n");
             int prefabs = _prefabsToAdd.Count(p => p != null);
             if (prefabs > 0)
@@ -775,12 +788,24 @@ namespace ZeroShugan.ShuganUnityTools
 
         // ─── Dependency status ─────────────────────────────────────────────────
 
-        void DrawDependencyStatus()
+        // Only what is MISSING is drawn, and when nothing is missing the whole block disappears: a
+        // column of green ticks is noise on every repaint of a project that is already set up. The paid
+        // bundle's update notice is the one thing that still shows through on a complete install.
+        // Returns true when it drew something, so the caller can skip the separator under it.
+        bool DrawDependencyStatus()
         {
+            bool anyMissing = !_depBlender || !_depVRCFury || !_depAutoRigScript;
+            if (!anyMissing)
+            {
+                if (!PyUpdateAvailable(out _, out _)) return false;
+                DrawPaidScriptVersionRow();
+                return true;
+            }
+
             GUILayout.Label("Requirements", EditorStyles.boldLabel);
 
             // Blender
-            DrawDepRow("Blender 4.0+", _depBlender,
+            if (!_depBlender) DrawMissingDep("Blender 4.0+",
                 required: true,
                 notFoundExtra: () =>
                 {
@@ -805,7 +830,7 @@ namespace ZeroShugan.ShuganUnityTools
                 });
 
             // VRCFury
-            DrawDepRow("VRCFury", _depVRCFury,
+            if (!_depVRCFury) DrawMissingDep("VRCFury",
                 required: false,
                 notFoundExtra: () =>
                 {
@@ -820,7 +845,7 @@ namespace ZeroShugan.ShuganUnityTools
                 });
 
             // AutoRig Feet Script (paid bundle)
-            DrawDepRow("AutoRig Feet Script (paid)", _depAutoRigScript,
+            if (!_depAutoRigScript) DrawMissingDep("AutoRig Feet Script (paid)",
                 required: true,
                 notFoundExtra: () =>
                 {
@@ -856,18 +881,18 @@ namespace ZeroShugan.ShuganUnityTools
 
             // Installed paid-script version + store-update notice (VCC can't update this one).
             if (_depAutoRigScript) DrawPaidScriptVersionRow();
+            return true;
         }
 
-        void DrawDepRow(string label, bool found, bool required, Action notFoundExtra)
+        void DrawMissingDep(string label, bool required, Action notFoundExtra)
         {
             EditorGUILayout.BeginHorizontal();
             Color c = GUI.color;
-            GUI.color = found ? Color.green : (required ? Color.red : Color.yellow);
-            GUILayout.Label(found ? $"✓  {label}" : $"✗  {label}",
-                EditorStyles.miniLabel, GUILayout.Width(200));
+            GUI.color = required ? Color.red : Color.yellow;
+            GUILayout.Label($"✗  {label}", EditorStyles.miniLabel, GUILayout.Width(200));
             GUI.color = c;
             EditorGUILayout.EndHorizontal();
-            if (!found) notFoundExtra?.Invoke();
+            notFoundExtra?.Invoke();
         }
 
         // ─── Main section ──────────────────────────────────────────────────────
@@ -964,19 +989,12 @@ namespace ZeroShugan.ShuganUnityTools
             // avatar — so they live in Advanced Settings, and Setup stays the four things that must be
             // right before a run.
 
-            // FBX badge
+            // Only the FBX that could NOT be found is worth a line. The green "auto-detected: <path>"
+            // badge confirmed something the user never doubted, on every repaint.
             if (_avatarObject != null && IsRootObject(_avatarObject))
             {
                 EditorGUILayout.Space(2);
-                if (_sourceFbxAsset != null && _fbxAutoDetected)
-                {
-                    Color c = GUI.color; GUI.color = Color.green;
-                    EditorGUILayout.HelpBox(
-                        $"✓ FBX auto-detected: {AssetDatabase.GetAssetPath(_sourceFbxAsset)}",
-                        MessageType.None);
-                    GUI.color = c;
-                }
-                else if (_sourceFbxAsset == null)
+                if (_sourceFbxAsset == null)
                 {
                     Color c = GUI.color; GUI.color = Color.yellow;
                     EditorGUILayout.HelpBox(
@@ -1292,8 +1310,8 @@ namespace ZeroShugan.ShuganUnityTools
             if (anyCompanion)
                 EditorGUILayout.LabelField(
                     "Other meshes on this avatar have the same shape key switched on (listed under "
-                    + "each one). Fix those too — if the body is set to 0 but a garment is not, the "
-                    + "garment stops lining up with the rigged body the moment it is shown.",
+                    + "each one). Fix those too — if the body is set to 0 but an outfit is not, the "
+                    + "outfit stops lining up with the rigged body the moment it is shown.",
                     EditorStyles.wordWrappedMiniLabel);
 
             EditorGUILayout.Space(2);
@@ -3079,7 +3097,8 @@ namespace ZeroShugan.ShuganUnityTools
             EditorGUILayout.Space(6);
             GUILayout.Label("Transfer Toe Weights To (optional)", EditorStyles.boldLabel);
             EditorGUILayout.LabelField(
-                "Socks / thigh-highs / shoes from the same FBX that should follow the new toe bones.",
+                "Outfit meshes from the same FBX that should follow the new toe bones: socks, "
+                + "thigh-highs, shoes.",
                 EditorStyles.miniLabel);
 
             bool hasFbx = _sourceFbxAsset != null && IsValidFbx(_sourceFbxAsset);
@@ -3125,7 +3144,7 @@ namespace ZeroShugan.ShuganUnityTools
                     // go through SetStatus, which owns the persistent status box at the bottom and
                     // never clears — so the message stuck around long after the garment was removed.
                     else if (string.Equals(dropped, bodyMesh, StringComparison.OrdinalIgnoreCase))
-                        SetGarmentDropWarning($"'{dropped}' is the body mesh — pick a different mesh as a garment.");
+                        SetGarmentDropWarning($"'{dropped}' is the body mesh — pick a different mesh as an outfit.");
                     else
                         SetGarmentDropWarning($"'{dropped}' is not a mesh of the source FBX.");
                 }
@@ -3171,7 +3190,7 @@ namespace ZeroShugan.ShuganUnityTools
                 }
             }
 
-            if (GUILayout.Button("+ Add Garment Mesh", GUILayout.Height(22)))
+            if (GUILayout.Button("+ Add Outfit Mesh", GUILayout.Height(22)))
             {
                 // Default the new slot to the first not-yet-chosen garment mesh, else the first.
                 string next = choices.FirstOrDefault(m => !_garmentMeshNames.Contains(m))
@@ -3183,7 +3202,7 @@ namespace ZeroShugan.ShuganUnityTools
             EditorGUI.EndDisabledGroup();
 
             if (!hasFbx && _garmentMeshNames.Count > 0)
-                EditorGUILayout.HelpBox("Select an avatar / FBX first to pick garment meshes.",
+                EditorGUILayout.HelpBox("Select an avatar / FBX first to pick outfit meshes.",
                     MessageType.Info);
         }
 
@@ -4715,6 +4734,9 @@ namespace ZeroShugan.ShuganUnityTools
             _foreignToeUnticked.Clear();
             _foreignToeAdded.Clear();
             RefreshRigState();
+            // Same moment as the shape-key and bone checks: if the foot-bone lists are empty, ask the
+            // FBX again. A domain reload leaves them empty while the AssetDatabase is still busy.
+            RearmFootCandidates();
             if (_avatarObject == null) return;
             AutoDetectFbx();
             LoadLastReport();   // show the saved report for the newly selected FBX (if any)
@@ -5080,9 +5102,36 @@ namespace ZeroShugan.ShuganUnityTools
         double _footCandNextTry;
         const int    FootCandMaxAttempts  = 20;
         const double FootCandRetrySeconds = 0.5;
+        // After the fast burst the answer is accepted, so the run button stops waiting on it. An EMPTY
+        // answer is not accepted as the truth though: it keeps being retried, slowly, because the way
+        // it usually happens is a script recompile (updating the package from VCC, say) reloading the
+        // domain while the AssetDatabase is still busy. Every fast attempt then comes back empty, and
+        // the empty lists used to stay until the user clicked another avatar and back.
+        const double FootCandSlowSeconds  = 2.0;
+        const int    FootCandSlowAttempts = 90;
 
         // True while the foot-bone candidates are still waiting for a readable FBX.
         bool FootCandidatesPending => !_footCandLoaded && !string.IsNullOrEmpty(_footCandFbxPath);
+
+        // An FBX we have no bones for. Either it has none to rank, or it could not be read yet.
+        bool FootCandidatesEmpty =>
+            !string.IsNullOrEmpty(_footCandFbxPath) && (_footCandL.Count == 0 || _footCandR.Count == 0);
+
+        bool FootCandidatesRetryDue =>
+            FootCandidatesEmpty &&
+            _footCandAttempts < FootCandMaxAttempts + FootCandSlowAttempts &&
+            EditorApplication.timeSinceStartup >= _footCandNextTry;
+
+        // Ask again for lists we never got, without touching the manual picks: the FBX has not changed,
+        // only our answer about it was worthless. Called whenever the avatar is re-checked and when the
+        // window is focused, so a recompile never leaves the two foot rows empty.
+        void RearmFootCandidates()
+        {
+            if (!FootCandidatesEmpty) return;
+            _footCandLoaded   = false;
+            _footCandAttempts = 0;
+            _footCandNextTry  = 0;
+        }
 
         void RefreshFootCandidates()
         {
@@ -5095,7 +5144,7 @@ namespace ZeroShugan.ShuganUnityTools
                 _footCandLoaded   = false;
                 _footCandAttempts = 0;
             }
-            if (_footCandLoaded) return;
+            if (_footCandLoaded && !FootCandidatesEmpty) return;
             try
             {
                 _footCandL = HumanoidRigMapping.RankFootCandidates(path, "L");
@@ -5113,7 +5162,9 @@ namespace ZeroShugan.ShuganUnityTools
             _footCandAttempts++;
             bool empty = !string.IsNullOrEmpty(path) && (_footCandL.Count == 0 || _footCandR.Count == 0);
             _footCandLoaded  = !empty || _footCandAttempts >= FootCandMaxAttempts;
-            _footCandNextTry = EditorApplication.timeSinceStartup + FootCandRetrySeconds;
+            _footCandNextTry = EditorApplication.timeSinceStartup
+                             + (_footCandAttempts < FootCandMaxAttempts ? FootCandRetrySeconds
+                                                                        : FootCandSlowSeconds);
         }
 
         // Draw one "Left/Right foot bone" row: ranked popup + linked scene-bone object field.
