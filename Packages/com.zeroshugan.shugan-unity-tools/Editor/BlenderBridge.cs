@@ -539,7 +539,10 @@ namespace ZeroShugan.ShuganUnityTools
             string[] garmentNames = null, string backupJsonPath = null,
             string footBoneL = null, string footBoneR = null,
             string rerigRestoreJsonPath = null, bool skipFootReduction = false,
-            string rigShapeJson = null, string cleanToeBonesJson = null)
+            string rigShapeJson = null, string cleanToeBonesJson = null,
+            bool? footHelper = null,
+            string backupSearchPrefix = null, bool? rerigProtect = null,
+            string outfitBlendPath = null, bool? shrinkKeys = null)
         {
             string d        = stepDelay.ToString("F1", CultureInfo.InvariantCulture);
             string pySrc    = sourceFbxPath.Replace("\\", "/");
@@ -575,7 +578,34 @@ namespace ZeroShugan.ShuganUnityTools
             if (cleanToeBonesJson != null)
                 rerigEnv += $"os.environ['SHUGAN_CLEAN_TOE_BONES_JSON'] = '{PyEscape(cleanToeBonesJson)}'\n";
 
+            // FOOT HELPER BONE: sent explicitly whenever the tool has an opinion, so the script's own default
+            // never decides for a run started from Unity. Scripts before 3.16.0 ignore it.
+            if (footHelper.HasValue)
+                rerigEnv += $"os.environ['SHUGAN_FOOT_HELPER'] = '{(footHelper.Value ? "1" : "0")}'\n";
+
+            // SHRINK SHAPE KEYS: the tool's own, built from the rig at the end of the run. Sent explicitly
+            // whenever the tool has an opinion; scripts before 3.17.0 ignore it.
+            if (shrinkKeys.HasValue)
+                rerigEnv += $"os.environ['SHUGAN_SHRINK_KEYS'] = '{(shrinkKeys.Value ? "1" : "0")}'\n";
+
+            // WEIGHT BACKUP: the script looks for the original weights inside the FBX first, then in every
+            // "<fbx>_rigbackup_*.json" starting with this prefix. PROTECT '0' = the user chose to re-apply as-is.
+            rerigEnv += BackupSearchEnv(backupSearchPrefix);
+            if (rerigProtect.HasValue)
+                rerigEnv += $"os.environ['SHUGAN_RERIG_PROTECT'] = '{(rerigProtect.Value ? "1" : "0")}'\n";
+
             string exportBlock = FbxExportPython(exportPath);
+
+            // OUTFITS FROM OTHER FBXs (experimental): the rigged body is saved as a .blend before the export, for
+            // the outfit runs that follow. Empty when no such outfit is ticked, so the body run is unchanged.
+            string outfitBlock = string.IsNullOrEmpty(outfitBlendPath) ? "" :
+$@"# ── Keep the rigged body for the outfits from other FBXs ────────────────────────
+if hasattr(_arf_mod, 'save_outfit_rig_source'):
+    if not _arf_mod.save_outfit_rig_source('{PyEscape(outfitBlendPath.Replace("\\", "/"))}'):
+        _shugan_issue('OUTFIT_SOURCE_NOT_SAVED', 'warning', 'The rigged body could not be kept for the outfits from other FBXs, so they were not rigged.', 'Open the run log for details.')
+else:
+    _shugan_issue('OUTFIT_SCRIPT_TOO_OLD', 'warning', 'The AutoRig Feet script is too old to rig outfits from other FBXs.', 'Update the paid script.')
+";
 
             return
 $@"import bpy, sys, time, os, importlib.util
@@ -588,6 +618,7 @@ def load_script(path):
     spec.loader.exec_module(mod)
     if hasattr(mod, 'main'):
         mod.main()
+    return mod
 
 # ── Clean default scene objects ────────────────────────────────────────────────
 for _name in ['Cube', 'Light', 'Camera']:
@@ -624,11 +655,95 @@ print('[BlenderBridge] Selected: ' + obj.name)
 # ── Run user script ────────────────────────────────────────────────────────────
 _script_basename = os.path.basename('{pyScript}')
 print('[BlenderBridge] Running script: ' + _script_basename)
-load_script('{pyScript}')
+_arf_mod = load_script('{pyScript}')
 print('[BlenderBridge] Script complete: ' + _script_basename)
-{delay}
+{delay}{outfitBlock}
 {exportBlock}
 {delay}sys.exit(0)
+";
+        }
+
+        /// <summary>
+        /// One outfit FBX (experimental): open the rigged body saved by the body run, import the outfit FBX next
+        /// to it, let the paid script copy the toe rig into the outfit's armature and transfer the weights
+        /// (outfit_main), take the body out again and export the outfit alone to exportPath.
+        /// </summary>
+        public static string BuildOutfitRigScript(
+            string bodyBlendPath, string outfitFbxPath, string exportPath, string autoRigScriptPath,
+            string[] meshNames, string footBoneL, string footBoneR, string toeBoneL, string toeBoneR,
+            string backupJsonPath, string backupSearchPrefix, bool? rerigProtect)
+        {
+            string env = $"os.environ['SHUGAN_OUTFIT_FBX'] = '{PyEscape(outfitFbxPath.Replace("\\", "/"))}'\n";
+            if (!string.IsNullOrEmpty(footBoneL)) env += $"os.environ['SHUGAN_OUTFIT_FOOT_L'] = '{PyEscape(footBoneL)}'\n";
+            if (!string.IsNullOrEmpty(footBoneR)) env += $"os.environ['SHUGAN_OUTFIT_FOOT_R'] = '{PyEscape(footBoneR)}'\n";
+            if (!string.IsNullOrEmpty(toeBoneL))  env += $"os.environ['SHUGAN_OUTFIT_TOE_L'] = '{PyEscape(toeBoneL)}'\n";
+            if (!string.IsNullOrEmpty(toeBoneR))  env += $"os.environ['SHUGAN_OUTFIT_TOE_R'] = '{PyEscape(toeBoneR)}'\n";
+            if (!string.IsNullOrEmpty(backupJsonPath))
+                env += $"os.environ['SHUGAN_RIG_BACKUP_JSON'] = '{PyEscape(backupJsonPath.Replace("\\", "/"))}'\n";
+            env += BackupSearchEnv(backupSearchPrefix);
+            if (rerigProtect.HasValue)
+                env += $"os.environ['SHUGAN_RERIG_PROTECT'] = '{(rerigProtect.Value ? "1" : "0")}'\n";
+
+            return
+$@"import bpy, sys, os, importlib.util
+{ShuganIssuePython}
+{env}
+print('[BlenderBridge] Opening the rigged body: {PyEscape(bodyBlendPath.Replace("\\", "/"))}')
+bpy.ops.wm.open_mainfile(filepath='{PyEscape(bodyBlendPath.Replace("\\", "/"))}')
+
+spec = importlib.util.spec_from_file_location('blender_script', '{PyEscape(autoRigScriptPath.Replace("\\", "/"))}')
+mod  = importlib.util.module_from_spec(spec)
+mod.__file__ = '{PyEscape(autoRigScriptPath.Replace("\\", "/"))}'
+spec.loader.exec_module(mod)
+if not hasattr(mod, 'outfit_main'):
+    _shugan_issue('OUTFIT_SCRIPT_TOO_OLD', 'fatal', 'The AutoRig Feet script is too old to rig outfits from other FBXs.', 'Update the paid script.', final=True)
+    sys.exit(1)
+
+print('[BlenderBridge] Importing the outfit: {PyEscape(outfitFbxPath.Replace("\\", "/"))}')
+mod.outfit_import('{PyEscape(outfitFbxPath.Replace("\\", "/"))}', {PyStrList(meshNames ?? new string[0])})
+mod.outfit_main()
+print('[BlenderBridge] Outfit rigged, removing the body.')
+mod.outfit_strip_body()
+
+{FbxExportPython(exportPath)}
+sys.exit(0)
+";
+        }
+
+        /// <summary>Restore Original Rig for one outfit FBX: import it, run outfit_restore_main on its armature,
+        /// export it back.</summary>
+        public static string BuildOutfitRestoreScript(
+            string outfitFbxPath, string exportPath, string autoRigScriptPath, string[] meshNames,
+            string backupSearchPrefix)
+        {
+            return
+$@"import bpy, sys, os, importlib.util
+{ShuganIssuePython}
+{BackupSearchEnv(backupSearchPrefix)}
+for _name in ['Cube', 'Light', 'Camera']:
+    _obj = bpy.data.objects.get(_name)
+    if _obj:
+        bpy.data.objects.remove(_obj, do_unlink=True)
+
+print('[BlenderBridge] Importing the outfit: {PyEscape(outfitFbxPath.Replace("\\", "/"))}')
+bpy.ops.import_scene.fbx(filepath='{PyEscape(outfitFbxPath.Replace("\\", "/"))}')
+spec = importlib.util.spec_from_file_location('blender_script', '{PyEscape(autoRigScriptPath.Replace("\\", "/"))}')
+mod  = importlib.util.module_from_spec(spec)
+mod.__file__ = '{PyEscape(autoRigScriptPath.Replace("\\", "/"))}'
+spec.loader.exec_module(mod)
+if not hasattr(mod, 'outfit_restore_main'):
+    _shugan_issue('OUTFIT_SCRIPT_TOO_OLD', 'fatal', 'The AutoRig Feet script is too old to restore outfits from other FBXs.', 'Update the paid script.', final=True)
+    sys.exit(1)
+bpy.ops.object.select_all(action='DESELECT')
+_found = [o for o in bpy.data.objects if o.type == 'MESH' and (o.name in {PyStrList(meshNames ?? new string[0])} or o.data.name in {PyStrList(meshNames ?? new string[0])})]
+for _o in _found:
+    _o.select_set(True)
+if _found:
+    bpy.context.view_layer.objects.active = _found[0]
+mod.outfit_restore_main()
+
+{FbxExportPython(exportPath)}
+sys.exit(0)
 ";
         }
 
@@ -677,7 +792,7 @@ bpy.ops.export_scene.fbx(
     use_mesh_edges=False,
     use_tspace=False,
     use_triangles=False,
-    use_custom_props=False,
+    use_custom_props=True,   # carries AutoRig Feet's original-weight backup inside the FBX
     add_leaf_bones=False,
     primary_bone_axis='Y',
     secondary_bone_axis='X',
@@ -693,23 +808,32 @@ bpy.ops.export_scene.fbx(
 print('[BlenderBridge] Export done.')";
         }
 
+        static string BackupSearchEnv(string backupSearchPrefix) =>
+            string.IsNullOrEmpty(backupSearchPrefix) ? ""
+                : $"os.environ['SHUGAN_RIG_BACKUP_PREFIX'] = '{PyEscape(backupSearchPrefix.Replace("\\", "/"))}'\n";
+
         // Builds the Restore round-trip: import the (current) FBX, select the body, run the paid
-        // script's restore_main() with the chosen backup JSON, then export back over the FBX.
+        // script's restore_main(), then export back over the FBX. The script takes the backup stored
+        // inside the FBX first; jsonPath (may be null) and the other JSON files under backupSearchPrefix
+        // are the fallback.
         public static string BuildRestoreFeetScript(
             string sourceFbxPath, string targetName, string exportPath,
-            string restoreScriptPath, string jsonPath, bool headless, float stepDelay)
+            string restoreScriptPath, string jsonPath, bool headless, float stepDelay,
+            string backupSearchPrefix = null)
         {
             string d        = stepDelay.ToString("F1", CultureInfo.InvariantCulture);
             string pySrc    = sourceFbxPath.Replace("\\", "/");
             string pyScript = restoreScriptPath.Replace("\\", "/");
-            string pyJson   = jsonPath.Replace("\\", "/");
+            string restoreEnv = (string.IsNullOrEmpty(jsonPath) ? ""
+                    : $"os.environ['SHUGAN_RIG_RESTORE_JSON'] = '{PyEscape(jsonPath.Replace("\\", "/"))}'\n")
+                + BackupSearchEnv(backupSearchPrefix);
             string delay    = headless ? "" : $"time.sleep({d})\n";
             string exportBlock = FbxExportPython(exportPath);
 
             return
 $@"import bpy, sys, time, os, importlib.util
 {ShuganIssuePython}
-os.environ['SHUGAN_RIG_RESTORE_JSON'] = '{pyJson}'
+{restoreEnv}
 
 def load_and_run(path, func):
     spec = importlib.util.spec_from_file_location('blender_script', path)
@@ -893,7 +1017,17 @@ print('[BlenderBridge] Restore complete.')
             proc.OutputDataReceived += (_, e) => { if (e.Data != null) onOutputLine?.Invoke(e.Data); };
             // Forward stderr too (Blender/Python tracebacks go here) so logs capture failures.
             proc.ErrorDataReceived  += (_, e) => { if (e.Data != null) onOutputLine?.Invoke("[stderr] " + e.Data); };
-            proc.Start();
+            try
+            {
+                proc.Start();
+            }
+            catch (Exception e)
+            {
+                // A file that exists but is not a runnable Blender (wrong file picked, blocked by antivirus).
+                UnityEngine.Debug.LogError("[BlenderBridge] Blender could not be started: " + e.Message);
+                proc.Dispose();
+                return null;
+            }
             proc.BeginOutputReadLine();
             proc.BeginErrorReadLine();
             return proc;

@@ -432,6 +432,14 @@ namespace ZeroShugan.ShuganUnityTools
                     log.AppendLine("jaw: " + (result.jawRemoved ? "removed" : "not mapped, nothing to remove"));
                 }
 
+                // A slot sitting on the foot helper (Unity's Automap puts LeftFoot there) belongs on the foot.
+                var helperModel = AssetDatabase.LoadAssetAtPath<GameObject>(fbxPath);
+                if (helperModel != null)
+                {
+                    int movedOff = MoveSlotsOffFootHelpers(human, helperModel);
+                    if (movedOff > 0) log.AppendLine($"helper: {movedOff} slot(s) moved off the foot helper onto the foot");
+                }
+
                 // ── THE FIX: write a COMPLETE skeleton[] so every referenced boneName resolves. ──
                 // Without this, Unity fails with "Transform 'X' not found in HumanDescription".
                 desc.human    = human.ToArray();
@@ -466,6 +474,78 @@ namespace ZeroShugan.ShuganUnityTools
 
             WriteLog(fbxPath, logSource, log, logFolderOverride);
             return result;
+        }
+
+        /// <summary>
+        /// Put the humanoid description back together after something changed the FBX's skeleton.
+        ///
+        /// Two things go wrong there. A reimport can come back with an empty human[] — one of the user's own
+        /// FBX copies ended up with "human: []" and a 393-bone skeleton after a bone was added by hand — and
+        /// a slot can be left pointing at a bone that no longer exists, which is what a rig restore leaves
+        /// behind. Both make the avatar invalid, and neither says so anywhere the user looks.
+        /// </summary>
+        /// <returns>What was repaired, or null when nothing needed it.</returns>
+        /// <param name="skeletonOnly">For an outfit FBX: only the skeleton is rewritten, the mapping stays exactly as its
+        /// creator left it. Outfits ship with mappings copied from the avatar that name bones the outfit doesn't have
+        /// (Rollup Shorts &amp; Hoodie: 26 finger slots), and clearing those is not this tool's business.</param>
+        internal static string RepairAfterSkeletonChange(string fbxPath, bool hasBefore, HumanDescription before,
+                                                         bool skeletonOnly = false)
+        {
+            var importer = AssetImporter.GetAtPath(fbxPath) as ModelImporter;
+            var model    = AssetDatabase.LoadAssetAtPath<GameObject>(fbxPath);
+            if (importer == null || model == null) return null;
+            if (importer.animationType != ModelImporterAnimationType.Human) return null;
+
+            var desc  = importer.humanDescription;
+            var human = desc.human != null ? desc.human.ToList() : new List<HumanBone>();
+            var names = new HashSet<string>(model.GetComponentsInChildren<Transform>(true).Select(t => t.name));
+            var notes = new List<string>();
+
+            if (skeletonOnly)
+            {
+                if (hasBefore && before.human != null) human = before.human.ToList();
+                var skel = BuildSkeleton(model.GetComponentsInChildren<Transform>(true));
+                if (desc.skeleton != null && desc.skeleton.Length == skel.Length && human.Count == (desc.human?.Length ?? 0))
+                    return null;
+                desc.human    = human.ToArray();
+                desc.skeleton = skel;
+                importer.humanDescription = desc;
+                importer.SaveAndReimport();
+                var av = AssetDatabase.LoadAllAssetsAtPath(fbxPath).OfType<Avatar>().FirstOrDefault();
+                return "the humanoid skeleton was rewritten with " + skel.Length + " bones, the mapping kept as it was"
+                       + (av != null && av.isValid ? "." : " (the outfit's own mapping was already incomplete, and still is).");
+            }
+
+            if (hasBefore && before.human != null && before.human.Length > human.Count)
+            {
+                human = before.human.ToList();
+                notes.Add("the humanoid mapping was restored (it came back with " +
+                          (desc.human?.Length ?? 0) + " of " + before.human.Length + " bones)");
+            }
+
+            int dropped = human.RemoveAll(h => !string.IsNullOrEmpty(h.boneName) && !names.Contains(h.boneName));
+            if (dropped > 0)
+                notes.Add(dropped + " slot(s) pointing at bones the FBX no longer has were cleared");
+
+            int helperSlots = MoveSlotsOffFootHelpers(human, model);
+            if (helperSlots > 0)
+                notes.Add(helperSlots + " foot slot(s) mapped to the foot helper bone were moved back to the foot");
+
+            var skeleton = BuildSkeleton(model.GetComponentsInChildren<Transform>(true));
+            bool skeletonChanged = desc.skeleton == null || desc.skeleton.Length != skeleton.Length;
+            if (notes.Count == 0 && !skeletonChanged) return null;
+
+            desc.human    = human.ToArray();
+            desc.skeleton = skeleton;
+            importer.humanDescription = desc;
+            importer.SaveAndReimport();
+
+            if (skeletonChanged) notes.Add("the skeleton was rewritten with " + skeleton.Length + " bones");
+
+            var avatar = AssetDatabase.LoadAllAssetsAtPath(fbxPath).OfType<Avatar>().FirstOrDefault();
+            bool valid = avatar != null && avatar.isValid && avatar.isHuman;
+            return "Humanoid description repaired: " + string.Join(", ", notes) +
+                   (valid ? ". The avatar is valid." : ". The avatar is STILL invalid — open Rig → Configure.");
         }
 
         static string RankStr(List<(string name, float score)> ranked)
@@ -560,7 +640,7 @@ namespace ZeroShugan.ShuganUnityTools
             if (string.IsNullOrEmpty(fbxPath)) return result;
             var s = Scorer.FromFbx(fbxPath);
             return s.bones
-                .Where(t => t != null && t.parent != null && SideOf(t) == side)
+                .Where(t => t != null && t.parent != null && SideOf(t) == side && !IsFootHelper(t.name))
                 .Select(t => (t.name, s.ScoreFoot(t, side)))
                 .OrderByDescending(x => x.Item2)
                 .Take(max).ToList();
@@ -572,6 +652,36 @@ namespace ZeroShugan.ShuganUnityTools
             string n = (name ?? "").ToLowerInvariant();
             return HasAny(n, FOOT_PRIMARY) || HasAny(n, FOOT_SECONDARY);
         }
+
+        /// <summary>
+        /// Put any humanoid slot that landed on a foot helper bone back on the bone above it.
+        ///
+        /// Measured in TestLab: Unity's own Automap, run on a fresh copy of a rig with helpers, maps
+        /// LeftFoot/RightFoot to "ARF Helper_L/_R" — it goes by weights and hierarchy, and once the helper
+        /// holds the foot's weights the real foot looks empty to it. VRChat's IK would then drive the helper,
+        /// which is the one bone meant to stay free for animation.
+        /// </summary>
+        static int MoveSlotsOffFootHelpers(List<HumanBone> human, GameObject model)
+        {
+            int moved = 0;
+            var byName = model.GetComponentsInChildren<Transform>(true)
+                              .GroupBy(t => t.name).ToDictionary(g => g.Key, g => g.First());
+            for (int i = 0; i < human.Count; i++)
+            {
+                var hb = human[i];
+                if (!IsFootHelper(hb.boneName)) continue;
+                if (!byName.TryGetValue(hb.boneName, out var helper) || helper.parent == null) continue;
+                hb.boneName = helper.parent.name;
+                human[i] = hb;
+                moved++;
+            }
+            return moved;
+        }
+
+        /// <summary>The helper bone AutoRig Feet 3.16+ puts under each foot. Never a candidate for any
+        /// humanoid slot: it is a child of the foot that the IK must not drive.</summary>
+        public static bool IsFootHelper(string name)
+            => (name ?? "").StartsWith("ARF Helper", StringComparison.Ordinal);
 
         /// <summary>True when the bone name contains a toe keyword (any supported language).</summary>
         public static bool NameLooksLikeToe(string name)
@@ -645,6 +755,15 @@ namespace ZeroShugan.ShuganUnityTools
                     influence.TryGetValue(b[idx], out float cur);
                     influence[b[idx]] = cur + weight;
                 }
+
+                // A foot helper bone carries ALL of the foot's weights, which leaves the real foot looking
+                // unweighted — and an unweighted bone scores -1000 as a foot. What the helper holds is the
+                // foot's own influence, so it is counted there.
+                foreach (var helper in influence.Keys.Where(t => IsFootHelper(t.name) && t.parent != null).ToList())
+                {
+                    influence.TryGetValue(helper.parent, out float cur);
+                    influence[helper.parent] = cur + influence[helper];
+                }
             }
 
             float Influence(Transform t) { influence.TryGetValue(t, out float v); return v; }
@@ -682,7 +801,10 @@ namespace ZeroShugan.ShuganUnityTools
                 score += Mathf.Max(0, 5 - Mathf.Abs(DepthFromHip(t) - IDEAL_TOE_DEPTH)) / 5f * W_DEPTH;
                 if (t.childCount == 0) score += W_LEAF;
                 if (maxInf > 0) score += Influence(t) / maxInf * W_INFLUENCE;
-                if (foot != null && t.parent == foot) score += W_PARENT;
+                // The toe hangs from the foot directly, or through the foot helper bone.
+                if (foot != null && (t.parent == foot ||
+                                     (t.parent != null && IsFootHelper(t.parent.name) && t.parent.parent == foot)))
+                    score += W_PARENT;
                 return score;
             }
 

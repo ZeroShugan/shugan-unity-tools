@@ -21,7 +21,7 @@ namespace ZeroShugan.ShuganUnityTools
         const string TOOL_VERSION = "0.1";
         const string WIKI_URL     = "https://www.notion.so/shugan/FBX-Swapper";
 
-        const string GeneratedFolder = "Assets/! Shugan/!_Lab/Script/FBXSwapper";
+        internal const string GeneratedFolder = "Assets/! Shugan/!_Lab/Script/FBXSwapper";
         const string LogsFolder      = "Assets/! Shugan/!_Lab/Script/FBXSwapper_Logs";
 
         GameObject _targetSceneObject;
@@ -144,7 +144,7 @@ namespace ZeroShugan.ShuganUnityTools
             try
             {
                 // Step 2 — duplicate the scene avatar
-                dup = Object.Instantiate(sceneAvatar);
+                dup = DuplicateKeepingPrefabLinks(sceneAvatar);
                 dup.name = sceneAvatar.name + "_swap";
 
                 // Keep the duplicate in the SOURCE avatar's scene. Object.Instantiate drops a clone
@@ -184,7 +184,7 @@ namespace ZeroShugan.ShuganUnityTools
                 log.AppendLine($"- [OK] copied old FBX → `{dupFbxPath}`");
 
                 // Step 4 — relink the duplicate to the PRIVATE FBX sub-assets (isolates the original)
-                RelinkToFbx(dup, AssetDatabase.LoadAllAssetsAtPath(dupFbxPath), log);
+                RelinkToFbx(dup, AssetDatabase.LoadAllAssetsAtPath(dupFbxPath), oldFbxPath, log);
                 log.AppendLine("- [OK] relinked duplicate → private FBX (original now isolated)");
 
                 // Step 5 — overwrite the private FBX bytes with the NEW FBX, keep its .meta, reimport
@@ -194,7 +194,7 @@ namespace ZeroShugan.ShuganUnityTools
                 log.AppendLine("- [OK] wrote new FBX content into the private FBX + reimported");
 
                 // Step 5b — relink again against the freshly imported sub-assets (covers fileID drift)
-                RelinkToFbx(dup, AssetDatabase.LoadAllAssetsAtPath(dupFbxPath), log);
+                RelinkToFbx(dup, AssetDatabase.LoadAllAssetsAtPath(dupFbxPath), dupFbxPath, log);
                 log.AppendLine("- [OK] re-relinked to reimported sub-assets");
 
                 // Step 6 — graft new bones + rebuild SkinnedMeshRenderer bone arrays
@@ -235,7 +235,36 @@ namespace ZeroShugan.ShuganUnityTools
 
         // ─── Pipeline helpers ────────────────────────────────────────────────────
 
-        static void RelinkToFbx(GameObject dup, Object[] fbxAssets, StringBuilder log)
+        // Object.Instantiate copies a scene object as plain GameObjects: every prefab instance inside the avatar (an
+        // outfit prefab, a hand controller, a gesture setup) came out of it unlinked from its prefab, measured in the
+        // TestLab (P3). The editor's own Duplicate (Ctrl+D) keeps those links, so that is what is used; Instantiate
+        // stays as the fallback if it ever returns nothing.
+        static GameObject DuplicateKeepingPrefabLinks(GameObject source)
+        {
+            var previous = Selection.objects;
+            GameObject copy = null;
+            try
+            {
+                Selection.objects = new Object[] { source };
+                Unsupported.DuplicateGameObjectsUsingPasteboard();
+                copy = Selection.activeGameObject;
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning("[FBX Swapper (Test)] Editor duplicate failed, using a plain copy: " + e.Message);
+            }
+            finally
+            {
+                Selection.objects = previous;
+            }
+            if (copy == null || copy == source) copy = Object.Instantiate(source);
+            return copy;
+        }
+
+        // Only meshes that come from fromFbxPath are relinked. Matching by name across the whole avatar also
+        // caught meshes of OTHER FBXs (an outfit, a hair prefab) whose names happen to match one of the body
+        // FBX's meshes, and swapped the body's mesh in for them.
+        static void RelinkToFbx(GameObject dup, Object[] fbxAssets, string fromFbxPath, StringBuilder log)
         {
             var meshByName = new Dictionary<string, Mesh>();
             foreach (var m in fbxAssets.OfType<Mesh>())
@@ -243,17 +272,25 @@ namespace ZeroShugan.ShuganUnityTools
             var avatar = fbxAssets.OfType<Avatar>().FirstOrDefault();
 
             foreach (var smr in dup.GetComponentsInChildren<SkinnedMeshRenderer>(true))
-                if (smr.sharedMesh != null && meshByName.TryGetValue(smr.sharedMesh.name, out var m))
+                if (smr.sharedMesh != null && IsFrom(smr.sharedMesh, fromFbxPath) &&
+                    meshByName.TryGetValue(smr.sharedMesh.name, out var m))
                     smr.sharedMesh = m;
 
             foreach (var mf in dup.GetComponentsInChildren<MeshFilter>(true))
-                if (mf.sharedMesh != null && meshByName.TryGetValue(mf.sharedMesh.name, out var m))
+                if (mf.sharedMesh != null && IsFrom(mf.sharedMesh, fromFbxPath) &&
+                    meshByName.TryGetValue(mf.sharedMesh.name, out var m))
                     mf.sharedMesh = m;
 
+            // The avatar's own Animator always follows the new FBX; an Animator further down (an outfit prefab
+            // that carries its own) only when its Avatar came from the same FBX.
             if (avatar != null)
                 foreach (var anim in dup.GetComponentsInChildren<Animator>(true))
-                    if (anim.avatar != null) anim.avatar = avatar;
+                    if (anim.avatar != null && (anim.gameObject == dup || IsFrom(anim.avatar, fromFbxPath)))
+                        anim.avatar = avatar;
         }
+
+        static bool IsFrom(Object asset, string fbxPath) =>
+            string.Equals(AssetDatabase.GetAssetPath(asset), fbxPath, System.StringComparison.OrdinalIgnoreCase);
 
         static void GraftBonesAndFixArrays(GameObject dup, string dupFbxPath, StringBuilder log)
         {
@@ -263,7 +300,19 @@ namespace ZeroShugan.ShuganUnityTools
             var refRoot = (GameObject)Object.Instantiate(fbxMain);
             try
             {
-                var dupMap = BuildTransformMap(dup.transform);
+                // The duplicate's bones by name, leaving out the skeletons of meshes from OTHER FBXs (an outfit that
+                // brings its own armature with the body's bone names). Otherwise a bone the body lacks but the
+                // outfit has would be "found" in the outfit, and the body's mesh bound to it.
+                var foreign = new HashSet<Transform>();
+                var bodyArmatures = new HashSet<Transform>();
+                foreach (var smr in dup.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                {
+                    var arm = ArmatureSync.ArmatureOf(smr);
+                    if (arm == null || smr.sharedMesh == null) continue;
+                    if (IsFrom(smr.sharedMesh, dupFbxPath)) bodyArmatures.Add(arm); else foreign.Add(arm);
+                }
+                foreign.ExceptWith(bodyArmatures);
+                var dupMap = BuildTransformMap(dup.transform, foreign);
 
                 // 1) graft bones present in the new FBX but missing in the duplicate (parents first)
                 int grafted = 0;
@@ -291,6 +340,8 @@ namespace ZeroShugan.ShuganUnityTools
                 var refSMRs = refRoot.GetComponentsInChildren<SkinnedMeshRenderer>(true);
                 foreach (var dupSMR in dup.GetComponentsInChildren<SkinnedMeshRenderer>(true))
                 {
+                    // Renderers of other FBXs keep their own bones.
+                    if (dupSMR.sharedMesh == null || !IsFrom(dupSMR.sharedMesh, dupFbxPath)) continue;
                     var refSMR = refSMRs.FirstOrDefault(r => r.name == dupSMR.name)
                               ?? refSMRs.FirstOrDefault(r => r.sharedMesh != null && dupSMR.sharedMesh != null
                                                             && r.sharedMesh.name == dupSMR.sharedMesh.name);
@@ -433,11 +484,14 @@ namespace ZeroShugan.ShuganUnityTools
             return !string.IsNullOrEmpty(p) && p.EndsWith(".fbx", System.StringComparison.OrdinalIgnoreCase);
         }
 
-        static Dictionary<string, Transform> BuildTransformMap(Transform root)
+        static Dictionary<string, Transform> BuildTransformMap(Transform root, HashSet<Transform> skipSubtrees = null)
         {
             var map = new Dictionary<string, Transform>();
             foreach (var t in root.GetComponentsInChildren<Transform>(true))
+            {
+                if (skipSubtrees != null && skipSubtrees.Any(s => t == s || t.IsChildOf(s))) continue;
                 if (!map.ContainsKey(t.name)) map[t.name] = t;
+            }
             return map;
         }
 
@@ -450,16 +504,16 @@ namespace ZeroShugan.ShuganUnityTools
             return string.Join("/", stack);
         }
 
-        static string ToAbs(string assetPath)
+        internal static string ToAbs(string assetPath)
             => Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
 
-        static string Sanitize(string name)
+        internal static string Sanitize(string name)
         {
             foreach (char c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
             return name.Replace(' ', '_');
         }
 
-        static void EnsureFolder(string folder)
+        internal static void EnsureFolder(string folder)
         {
             if (AssetDatabase.IsValidFolder(folder)) return;
             string parent = Path.GetDirectoryName(folder).Replace("\\", "/");

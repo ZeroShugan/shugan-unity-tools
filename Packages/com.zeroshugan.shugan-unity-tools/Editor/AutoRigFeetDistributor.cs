@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 
 namespace ZeroShugan.ShuganUnityTools
 {
-    public class AutoRigFeetDistributor : EditorWindow
+    public partial class AutoRigFeetDistributor : EditorWindow
     {
         enum ExportMode { Duplicate, Replace }
         // Order is load-bearing: the choice is persisted as an INT in EditorPrefs
@@ -18,7 +18,7 @@ namespace ZeroShugan.ShuganUnityTools
         // "Experimental" was renamed to "Standard" in place — it is the mode actually relied on —
         // and keeping its index means nobody's stored preference changed meaning.
         enum SwapMethod { Legacy, Standard }
-        enum State      { Idle, BlenderRunning, FBXSwapping, AddingPrefabs, Restoring, Done, Error }
+        enum State      { Idle, BlenderRunning, OutfitsRunning, FBXSwapping, AddingPrefabs, Restoring, OutfitsRestoring, Done, Error }
         enum Tab        { Setup, Logs, Backups, Report }
 
         // One concern per tab. These three used to share a single "Logs & Support" page, where the
@@ -44,6 +44,9 @@ namespace ZeroShugan.ShuganUnityTools
         const string PrefRigOnBestShape       = "ShuganTools_ARF_RigOnBestShape";
         const string PrefZeroFeetShapeKeys    = "ShuganTools_ARF_ZeroFeetShapeKeys";
         const string PrefCleanForeignToes     = "ShuganTools_ARF_CleanForeignToes";
+        const string PrefUnlinkedPrefabSceneOnly = "ShuganTools_ARF_UnlinkedPrefabSceneOnly";
+        const string PrefFootHelper           = "ShuganTools_ARF_FootHelper";
+        const string PrefMakeShrinkKeys       = "ShuganTools_ARF_MakeShrinkKeys";
 
         // ─── Paid-content paths (installed via Shugan store bundle) ───────────
         const string DefaultAutoRigScriptPath = "Assets/! Shugan/!_Lab/Script/shugan_autorig_feet.py";
@@ -68,6 +71,18 @@ namespace ZeroShugan.ShuganUnityTools
         // from it (rig state, the mesh caches, the foot-bone lists) is not serialized and is rebuilt by
         // the OnEnable re-check below.
         [SerializeField] GameObject _avatarObject;
+
+        // The FBX as it stood before this run, so the re-sync afterwards can tell what the FILE changed
+        // from what the USER changed. Not serialized: a run does not survive a domain reload anyway.
+        ArmatureSync.Snapshot _armatureBefore;
+        HumanDescription      _humanBefore;
+        bool                  _hasHumanBefore;
+        // Where new bones go when the avatar is an instance of a prefab that has no link to the FBX.
+        // Default is to fix the .prefab itself, because its other instances are broken too — measured.
+        bool                  _unlinkedPrefabSceneOnly;
+        // A helper bone under each foot that carries the foot's weights, so feet can be animated without
+        // taking over VRChat's IK. On by default; needs the paid script 3.16.0 or newer.
+        bool                  _footHelper = true;
         GameObject   _sourceFbxAsset;
         string[]     _meshNames         = new string[0];
         int          _selectedMeshIndex = 0;
@@ -205,37 +220,40 @@ namespace ZeroShugan.ShuganUnityTools
 
         void OnEnable()
         {
-            _exportMode    = (ExportMode)EditorPrefs.GetInt(PrefExportMode, (int)ExportMode.Duplicate);
-            _swapMethod     = (SwapMethod)EditorPrefs.GetInt(PrefSwapMethod, (int)SwapMethod.Legacy);
-            _autoSwapMethod = EditorPrefs.GetBool(PrefAutoSwapMethod, true);
-            _exportSuffix  = EditorPrefs.GetString(PrefSuffix, "Rig_Feet");
-            _exportFolder  = EditorPrefs.GetString(PrefExportFolder, "");
-            _advancedFoldout = EditorPrefs.GetBool(PrefAdvanced, false);
+            _exportMode    = (ExportMode)ArfPrefs.GetInt(PrefExportMode, (int)ExportMode.Duplicate);
+            _swapMethod     = (SwapMethod)ArfPrefs.GetInt(PrefSwapMethod, (int)SwapMethod.Legacy);
+            _autoSwapMethod = ArfPrefs.GetBool(PrefAutoSwapMethod, true);
+            _exportSuffix  = ArfPrefs.GetString(PrefSuffix, "Rig_Feet");
+            _exportFolder  = ArfPrefs.GetString(PrefExportFolder, "");
+            _advancedFoldout = ArfPrefs.GetBool(PrefAdvanced, false);
 
-            string fbxPath = EditorPrefs.GetString(PrefFbxPath, "");
+            string fbxPath = ArfPrefs.GetString(PrefFbxPath, "");
             if (!string.IsNullOrEmpty(fbxPath))
             {
                 _sourceFbxAsset = AssetDatabase.LoadAssetAtPath<GameObject>(fbxPath);
                 if (_sourceFbxAsset != null) RefreshMeshNames();
             }
             _selectedMeshIndex = Mathf.Clamp(
-                EditorPrefs.GetInt(PrefMeshIndex, 0), 0, Mathf.Max(0, _meshNames.Length - 1));
+                ArfPrefs.GetInt(PrefMeshIndex, 0), 0, Mathf.Max(0, _meshNames.Length - 1));
 
-            string garments = EditorPrefs.GetString(PrefGarments, "");
+            string garments = ArfPrefs.GetString(PrefGarments, "");
             _garmentMeshNames = string.IsNullOrEmpty(garments)
                 ? new List<string>()
                 : garments.Split('|').Where(s => !string.IsNullOrEmpty(s)).ToList();
 
-            _backupEnabled = EditorPrefs.GetBool(PrefBackupEnabled, true);
-            _autoMapFeet   = EditorPrefs.GetBool(PrefAutoMapFeet, true);
-            _rigOnBestShape = EditorPrefs.GetBool(PrefRigOnBestShape, true);
-            _zeroFeetShapeKeys = EditorPrefs.GetBool(PrefZeroFeetShapeKeys, false);
-            _cleanForeignToes = EditorPrefs.GetBool(PrefCleanForeignToes, true);
-            _timeoutMin    = EditorPrefs.GetInt(PrefTimeoutMin, 10);
-            _tab           = (Tab)EditorPrefs.GetInt(PrefTab, (int)Tab.Setup);
+            _backupEnabled = ArfPrefs.GetBool(PrefBackupEnabled, true);
+            _autoMapFeet   = ArfPrefs.GetBool(PrefAutoMapFeet, true);
+            _rigOnBestShape = ArfPrefs.GetBool(PrefRigOnBestShape, true);
+            _zeroFeetShapeKeys = ArfPrefs.GetBool(PrefZeroFeetShapeKeys, false);
+            _cleanForeignToes = ArfPrefs.GetBool(PrefCleanForeignToes, true);
+            _unlinkedPrefabSceneOnly = ArfPrefs.GetBool(PrefUnlinkedPrefabSceneOnly, false);
+            _footHelper = ArfPrefs.GetBool(PrefFootHelper, true);
+            _makeShrinkKeys = ArfPrefs.GetBool(PrefMakeShrinkKeys, true);
+            _timeoutMin    = ArfPrefs.GetInt(PrefTimeoutMin, 10);
+            _tab           = (Tab)ArfPrefs.GetInt(PrefTab, (int)Tab.Setup);
             // The contact field persists (so a repeat reporter doesn't retype it) but the message
             // and the consent tick never do — consent is per-send, exactly as in the addon.
-            _bugContact    = EditorPrefs.GetString(PrefBugContact, "");
+            _bugContact    = ArfPrefs.GetString(PrefBugContact, "");
             _runsCacheDirty = true;
 
             if (_prefabsToAdd.Count == 0)
@@ -243,7 +261,7 @@ namespace ZeroShugan.ShuganUnityTools
                     _prefabsToAdd.Add(AssetDatabase.LoadAssetAtPath<GameObject>(p));
 
             // Auto-detect Blender if not already set
-            if (!File.Exists(EditorPrefs.GetString(BlenderBridge.PrefBlenderPath, "")))
+            if (!File.Exists(ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, "")))
                 TryAutoDetectBlender(silent: true);
 
             // The avatar may already be selected in the Hierarchy before this window is opened;
@@ -260,6 +278,8 @@ namespace ZeroShugan.ShuganUnityTools
             // Bring back the last run report for this FBX (survives restarts / domain reloads).
             LoadLastReport();
 
+            RegisterInterruptionHandlers();
+
             // Once-per-session check whether a newer paid AutoRig .py is published (GitHub
             // version file; stores can't push updates through VCC).
             StartPyVersionCheck();
@@ -269,6 +289,8 @@ namespace ZeroShugan.ShuganUnityTools
         // handle and the folder would look like a run that never ended.
         void OnDisable()
         {
+            if (Busy) InterruptRun("the AutoRig Feet window was closed or scripts were reloaded");
+            UnregisterInterruptionHandlers();
             if (_runLogger != null)
             {
                 _runLogger.Line("[log] tool window closed or scripts reloaded — log ended here");
@@ -291,6 +313,7 @@ namespace ZeroShugan.ShuganUnityTools
             if (_state != State.Idle && _state != State.Done && _state != State.Error) return;
             var go = Selection.activeGameObject;
             if (go == null || !go.scene.IsValid()) return;
+            go = ResolveAvatarRoot(go);
             if (go == _avatarObject) return;
             _avatarObject = go;
             OnAvatarChanged();
@@ -308,6 +331,8 @@ namespace ZeroShugan.ShuganUnityTools
                 Repaint();
             }
 
+            SyncRecordStage();
+            SyncReloadLock();
             if (_state == State.Idle || _state == State.Done || _state == State.Error) return;
 
             double now = EditorApplication.timeSinceStartup;
@@ -336,7 +361,7 @@ namespace ZeroShugan.ShuganUnityTools
                     WriteRunLog();
                     AssetDatabase.Refresh();
                     if (EvaluateBlenderResult(exitCode, isRestore: false))
-                        _state = State.FBXSwapping;
+                        _state = AfterBodyRun();   // outfits from other FBXs first, when any are ticked
                 }
                 Repaint();
             }
@@ -357,14 +382,40 @@ namespace ZeroShugan.ShuganUnityTools
                     DrainOutputQueue();
                     WriteRunLog();
                     AssetDatabase.Refresh();
-                    if (EvaluateBlenderResult(exitCode, isRestore: true))
+                    if (EvaluateBlenderResult(exitCode, isRestore: true) && CommitRestoreExport())
                     {
                         // A SUCCESSFUL restore goes straight to Done — there is no prefab step to
                         // finalize it — so without this its report was never written and its log
                         // was left open. (Failures were already covered by EvaluateBlenderResult.)
+                        // A restore rewrites the FBX just as a run does, so the avatar needs the same
+                        // treatment — measured, it came back with 376 bones against 350 bind poses and every
+                        // mesh stopped rendering, with the old toe bones still hanging in the armature.
+                        string restoredFbx = AssetDatabase.GetAssetPath(_sourceFbxAsset);
+                        ResyncArmatureAfterRun(_avatarObject, restoredFbx);
+                        RepairHumanoidAfterSkeletonChange(restoredFbx);
+                        foreach (var other in OtherOpenSceneUsers(restoredFbx, _avatarObject))
+                            ReportArmatureResult(ArmatureSync.Sync(other, restoredFbx, _armatureBefore, UnlinkedPrefabMode));
+                        if (_restoreRemoveObjects)
+                        {
+                            int removedObjects = RemoveArfObjects(_avatarObject, ArfRecord.Load(restoredFbx)?.runs ?? new List<ArfRecord.RunEntry>());
+                            if (removedObjects > 0)
+                                _runReport.AddIssue("U_ARF_OBJECTS_REMOVED", "info",
+                                    removedObjects + " object(s) AutoRig Feet had added were removed from the avatar.");
+                        }
+
+                        // Outfits from other FBXs that carry the rig are restored too, one Blender run each.
+                        if (BeginOutfitRestores())
+                        {
+                            SaveRunReport();
+                            _state = State.OutfitsRestoring;
+                            Repaint();
+                            return;
+                        }
+
                         FinishRunReport();
                         _displayProgress  = 1f;
                         _state            = State.Done;
+                    SyncRecordStage();
                         _currentStepLabel = "Restore done!";
                         SetStatus("Restore complete — the FBX was reverted (feet rig removed).",
                             MessageType.Info);
@@ -373,13 +424,62 @@ namespace ZeroShugan.ShuganUnityTools
                 Repaint();
             }
 
+            if (_state == State.OutfitsRunning)
+            {
+                _displayProgress = Mathf.Max(_displayProgress, _exportMode == ExportMode.Duplicate ? 0.70f : 0.88f);
+                try
+                {
+                    if (TickOutfits()) _state = State.FBXSwapping;
+                }
+                catch (Exception ex)
+                {
+                    // An outfit never stops the body: note it and carry on with the swap.
+                    _runReport.AddIssue("U_OUTFIT_FAILED", "warning", "The outfits from other FBXs stopped: " + ex.Message);
+                    _state = State.FBXSwapping;
+                }
+                Repaint();
+            }
+
+            if (_state == State.OutfitsRestoring)
+            {
+                _displayProgress = Mathf.Max(_displayProgress, 0.9f);
+                bool finished;
+                try { finished = TickOutfits(); }
+                catch (Exception ex)
+                {
+                    _runReport.AddIssue("U_OUTFIT_FAILED", "warning", "The outfit restore stopped: " + ex.Message);
+                    finished = true;
+                }
+                if (finished)
+                {
+                    FinishOutfitRestores();
+                    CleanOutfitTemp(keep: false);
+                    FinishRunReport();
+                    _displayProgress  = 1f;
+                    _state            = State.Done;
+                    SyncRecordStage();
+                    _currentStepLabel = "Restore done!";
+                    SetStatus("Restore complete — the FBX and its outfits were reverted (feet rig removed).",
+                        MessageType.Info);
+                }
+                Repaint();
+            }
+
             if (_state == State.FBXSwapping)
             {
+                if (ArfAutomation.Active && ArfAutomation.HaltAt == "swap") { Repaint(); return; }
                 try
                 {
                     _currentStepLabel = "Swapping FBX into prefab…";
                     _displayProgress  = _exportMode == ExportMode.Duplicate ? 0.75f : 0.90f;
+                    SyncRecordStage();
                     Repaint();
+                    if (_avatarObject == null)
+                        throw new Exception("the avatar was deleted, or its scene closed, while Blender was running. "
+                                            + (_exportMode == ExportMode.Replace
+                                                ? "The rigged FBX is in place: select the avatar again and use \"Finish it\", "
+                                                  + "or \"Restore to original\" in the Backups tab."
+                                                : "Your original FBX was not changed."));
                     RunFBXSwap();
                     if (_state != State.Error) _state = State.AddingPrefabs;
                 }
@@ -396,10 +496,37 @@ namespace ZeroShugan.ShuganUnityTools
                 {
                     _currentStepLabel = "Adding prefabs…";
                     _displayProgress  = _exportMode == ExportMode.Duplicate ? 0.92f : 0.95f;
+                    SyncRecordStage();
                     Repaint();
+                    if (_resultInstance == null)
+                        throw new Exception("the avatar was deleted, or its scene closed, during the run.");
                     // The other rig's toe bones go first: the swap carries their GameObjects over from the
                     // avatar even though Blender removed them from the skeleton.
                     RemoveCleanedToeBoneObjects();
+                    // Replace hands the user's own avatar back, and Unity only carries the new bones into it
+                    // while it is still a prefab instance of that FBX. Anything else — unpacked, or saved as
+                    // its own prefab — keeps the old skeleton and its meshes stop rendering. Do this before
+                    // the prefabs are added, so they attach to a complete armature.
+                    // Duplicate/Standard grafts missing bones by name but never re-parents one, so a toe the
+                    // FBX moved under the foot helper stayed under the foot and would ignore the helper. The
+                    // copy points at its own private FBX, which is what it is synced against.
+                    string syncFbx = null;
+                    if (EffectiveSwapMethod() == SwapMethod.Standard)
+                    {
+                        if (_resultInstance != null &&
+                            HumanoidRigMapping.TryResolveRigFbx(_resultInstance, out string duplicateFbx))
+                        {
+                            syncFbx = duplicateFbx;
+                            if (_recRun != null) { _recRun.privateFbx = duplicateFbx; _rec?.Save(); }
+                        }
+                    }
+                    else if (_exportMode == ExportMode.Replace)
+                        syncFbx = ToProjectRelative(_exportPath);
+                    if (syncFbx != null)
+                        ResyncArmatureAfterRun(_resultInstance, syncFbx);
+                    // Outfits from other FBXs: Replace brings each rewritten outfit in step, Duplicate gives the copy
+                    // its own copy of each outfit.
+                    ApplyExternalOutfits();
                     RunAddPrefabs();
                     // Give the finished avatar a name that describes what it IS, not how it was made.
                     RenameResultInstance();
@@ -421,6 +548,15 @@ namespace ZeroShugan.ShuganUnityTools
                     }
                     // End of pipeline: ensure the FINAL scene avatar's FBX has humanoid foot/toes mapped.
                     if (_autoMapFeet) AutoMapHumanoidFeet();
+                    // The auto-map reimports the FBX. That should leave the meshes alone — say so rather
+                    // than assume it.
+                    if (_exportMode == ExportMode.Replace && _resultInstance != null)
+                    {
+                        var after = ArmatureSync.ValidateOnly(_resultInstance, ToProjectRelative(_exportPath));
+                        if (after.unbound.Count > 0) ReportArmatureResult(after);
+                    }
+                    CheckPrefabLinks();
+                    CleanOutfitTemp(keep: false);
                     FinishRunReport();   // re-save: the auto-map may have added warnings
                     // The avatar now HAS a rig (and a fresh version marker). Without this the
                     // "already rigged" notice stayed hidden in Replace mode, where the result is
@@ -429,6 +565,7 @@ namespace ZeroShugan.ShuganUnityTools
                     _backupScanDirty  = true;   // the run just wrote scene and/or FBX backups
                     _displayProgress  = 1f;
                     _state            = State.Done;
+                    SyncRecordStage();
                     _currentStepLabel = "Done!";
                     SetStatus("AutoRig Feet complete! New prefab added to scene.", MessageType.Info);
                 }
@@ -445,7 +582,7 @@ namespace ZeroShugan.ShuganUnityTools
         void OnGUI()
         {
             // Refresh dependency state every frame (cheap checks)
-            string storedBlender = EditorPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
+            string storedBlender = ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
             _depBlender = File.Exists(storedBlender);
             _depVRCFury = HasVRCFury();
             _autoRigScriptResolvedPath = ResolveAutoRigScriptPath();
@@ -470,7 +607,7 @@ namespace ZeroShugan.ShuganUnityTools
             _tab = (Tab)GUILayout.Toolbar((int)_tab, TabLabels, GUILayout.Height(22));
             if (EditorGUI.EndChangeCheck())
             {
-                EditorPrefs.SetInt(PrefTab, (int)_tab);
+                ArfPrefs.SetInt(PrefTab, (int)_tab);
                 _runsCacheDirty = true;
                 GUI.FocusControl(null);
             }
@@ -481,6 +618,7 @@ namespace ZeroShugan.ShuganUnityTools
                 case Tab.Setup:
                     // No separator above Setup when nothing is missing: the block drew nothing.
                     if (DrawDependencyStatus()) Separator();
+                    DrawInterruptedRunPanel();
                     DrawMainSection();
                     Separator();
                     DrawAdvancedSection();
@@ -560,13 +698,22 @@ namespace ZeroShugan.ShuganUnityTools
             changes.Append("• Your FBX is overwritten with the rigged version:\n     ")
                    .Append(AssetDatabase.GetAssetPath(_sourceFbxAsset)).Append('\n');
             changes.Append("• The avatar in the scene gets the new toe bones, and its foot and toe weights are repainted");
-            if (_garmentMeshNames.Any(g => !string.IsNullOrEmpty(g))) changes.Append(" (on the outfits too)");
+            if (TickedOutfits().Any(g => !string.IsNullOrEmpty(g))) changes.Append(" (on the outfits too)");
             changes.Append(".\n");
+            var externalOutfits = ScriptSupportsExternalOutfits() ? TickedExternalOutfits().Keys.ToList() : new List<string>();
+            if (externalOutfits.Count > 0)
+                changes.Append($"• Experimental: {externalOutfits.Count} outfit FBX(s) from other files get the toe bones and "
+                               + "are overwritten too (" + string.Join(", ", externalOutfits.Select(Path.GetFileName)) + "), "
+                               + "each backed up first.\n");
             int prefabs = _prefabsToAdd.Count(p => p != null);
             if (prefabs > 0)
                 changes.Append($"• {prefabs} feet prefab(s) are added under the avatar.\n");
+            if (_rigOnBestShape && MakeShrinkKeysNow)
+                changes.Append($"• Three shrink shape keys ({FootShapeFit.OwnShrinkPrefix}Toes, Toe Base, Foot) are added to "
+                               + "the body mesh, replacing any from an earlier run.\n");
             if (_rigOnBestShape && FootShapeToggle.VRCFuryAvailable)
-                changes.Append($"• The \"{FootShapeToggle.ObjectName}\" toggle is added under the avatar, replacing any earlier one.\n");
+                changes.Append($"• The \"{FootShapeToggle.ObjectName}\" toggle ({FootShapeToggle.MenuPath}) and a Foot Shrink "
+                               + "toggle for each shrink key are added under the avatar, replacing any earlier ones.\n");
             if (_autoMapFeet)
                 changes.Append("• Empty humanoid Foot/Toes slots of the FBX are filled in.\n");
             var cleanToes = ForeignToeBonesToClean();
@@ -574,7 +721,8 @@ namespace ZeroShugan.ShuganUnityTools
                 changes.Append($"• {cleanToes.Count} toe bone(s) from another rig are removed ({FormatBoneList(cleanToes)}); "
                                + "their weights go onto the foot or toe bone they hang from.\n");
 
-            return EditorUtility.DisplayDialog(
+            return ArfAutomation.Confirm(
+                ArfAutomation.AskReplaceMode,
                 "Replace your original avatar?",
                 "Export Mode is set to Replace, so AutoRig Feet will modify your ORIGINAL avatar and its FBX:\n\n"
                 + changes
@@ -905,19 +1053,39 @@ namespace ZeroShugan.ShuganUnityTools
             EditorGUI.BeginChangeCheck();
             _avatarObject = (GameObject)EditorGUILayout.ObjectField(
                 new GUIContent("Target Avatar",
-                    "Root scene object of the avatar. Clicking any scene object auto-fills this."),
+                    "The avatar to rig. Clicking the avatar or anything inside it in the Hierarchy fills this in."),
                 _avatarObject, typeof(GameObject), allowSceneObjects: true);
             if (EditorGUI.EndChangeCheck())
+            {
+                _avatarObject = ResolveAvatarRoot(_avatarObject);
                 OnAvatarChanged();
+            }
 
             // Root check
             if (_avatarObject != null && !IsRootObject(_avatarObject))
             {
                 Color c = GUI.color; GUI.color = Color.red;
                 EditorGUILayout.HelpBox(
-                    "⚠️  The selected object is not a root — select the top-level avatar GameObject.",
+                    "⚠️  This avatar sits inside another object. Drag it to the top level of the Hierarchy first.",
                     MessageType.Error);
                 GUI.color = c;
+            }
+
+            // Out of step with its own FBX: an earlier Replace run on an unpacked avatar, or a file someone
+            // swapped in Explorer. Unity reports neither, so this is the only place the user finds out.
+            string armatureProblem = ArmatureProblem();
+            if (armatureProblem != null)
+            {
+                EditorGUILayout.BeginHorizontal();
+                EditorGUILayout.HelpBox("This avatar no longer matches its FBX. " + armatureProblem,
+                                        MessageType.Warning);
+                if (GUILayout.Button(
+                        new GUIContent("Re-sync\narmature",
+                            "Add the bones the FBX has, re-parent the ones it moved, and re-bind the meshes "
+                            + "to the new skeleton."),
+                        GUILayout.Width(92), GUILayout.Height(40)))
+                    ResyncArmatureManual();
+                EditorGUILayout.EndHorizontal();
             }
 
             // Target Mesh — dropdown + linked scene-object field. The field always mirrors the
@@ -935,12 +1103,12 @@ namespace ZeroShugan.ShuganUnityTools
                     Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1),
                     _meshNames);
                 if (EditorGUI.EndChangeCheck())
-                    EditorPrefs.SetInt(PrefMeshIndex, _selectedMeshIndex);
+                    ArfPrefs.SetInt(PrefMeshIndex, _selectedMeshIndex);
 
                 string curMeshName = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
                 var curSmr = FindAvatarSkinnedMesh(curMeshName);
                 var pickedSmr = (SkinnedMeshRenderer)EditorGUILayout.ObjectField(
-                    curSmr, typeof(SkinnedMeshRenderer), true, GUILayout.Width(150));
+                    curSmr, typeof(SkinnedMeshRenderer), true, GUILayout.Width(RefFieldWidth));
                 if (pickedSmr != curSmr && pickedSmr != null && pickedSmr.sharedMesh != null)
                 {
                     int idx = Array.FindIndex(_meshNames, m => string.Equals(
@@ -948,7 +1116,7 @@ namespace ZeroShugan.ShuganUnityTools
                     if (idx >= 0)
                     {
                         _selectedMeshIndex = idx;
-                        EditorPrefs.SetInt(PrefMeshIndex, _selectedMeshIndex);
+                        ArfPrefs.SetInt(PrefMeshIndex, _selectedMeshIndex);
                     }
                     else
                         SetStatus($"'{pickedSmr.sharedMesh.name}' is not a mesh of the source FBX.",
@@ -979,7 +1147,7 @@ namespace ZeroShugan.ShuganUnityTools
                     "Replace: overwrites original FBX in place (auto-backup created)."),
                 _exportMode);
             if (EditorGUI.EndChangeCheck())
-                EditorPrefs.SetInt(PrefExportMode, (int)_exportMode);
+                ArfPrefs.SetInt(PrefExportMode, (int)_exportMode);
 
             // Garments right under the export settings.
             DrawGarmentSection();
@@ -1433,7 +1601,7 @@ namespace ZeroShugan.ShuganUnityTools
                     + "sets them while the feet are animated."),
                 _zeroFeetShapeKeys, EditorStyles.boldLabel);
             if (EditorGUI.EndChangeCheck())
-                EditorPrefs.SetBool(PrefZeroFeetShapeKeys, _zeroFeetShapeKeys);
+                ArfPrefs.SetBool(PrefZeroFeetShapeKeys, _zeroFeetShapeKeys);
 
             if (!_zeroFeetShapeKeys)
                 EditorGUILayout.LabelField(
@@ -1449,7 +1617,7 @@ namespace ZeroShugan.ShuganUnityTools
                         _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)], BodyMeshLabel);
                 // Garments have their own shape keys, and one that moves the feet breaks the
                 // transferred toe weights the same way it breaks the body.
-                foreach (var g in _garmentMeshNames)
+                foreach (var g in TickedOutfits())
                     if (!string.IsNullOrEmpty(g)) drew |= DrawFeetShapeKeyWarning(g, g);
                 if (!drew)
                     EditorGUILayout.LabelField("No shape key that moves the feet is switched on.",
@@ -1468,7 +1636,7 @@ namespace ZeroShugan.ShuganUnityTools
             var meshNames = new List<string>();
             if (_meshNames.Length > 0)
                 meshNames.Add(_meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)]);
-            foreach (var g in _garmentMeshNames)
+            foreach (var g in TickedOutfits())
                 if (!string.IsNullOrEmpty(g) && !meshNames.Contains(g)) meshNames.Add(g);
 
             // Build the plan first, deduped: the SAME (mesh, shape) pair can be reached twice — once
@@ -1542,6 +1710,12 @@ namespace ZeroShugan.ShuganUnityTools
         string              _fitTaskKey;
         // Rows whose tick was changed from its default, by shape-key name.
         readonly HashSet<string> _fitRowFlipped = new HashSet<string>();
+        // Foot Shrink rows whose tick was changed from its default (ticked when outfits are ticked).
+        readonly HashSet<string> _shrinkRowFlipped = new HashSet<string>();
+        // On: the run builds its own shrink shape keys on the body mesh, so the feet can be flattened under
+        // an outfit whatever the creator did or didn't ship.
+        bool _makeShrinkKeys = true;
+        Vector2 _footShrinkScroll;
         Vector2 _footShapeScroll;
         const float FootShapeListMaxHeight = 150f;   // about seven rows, then it scrolls
 
@@ -1555,6 +1729,7 @@ namespace ZeroShugan.ShuganUnityTools
         // Chosen in Execute, used once the run is back.
         string _rigShapeJson;
         List<FootShapeFit.ToggleRow> _plannedToggleRows;
+        List<string> _plannedShrinkKeys;
         BlendShapeWeightSnapshot.Snapshot _blendShapeSnapshot;
 
         void ResolveFootTransforms(out Transform footL, out Transform footR, out Transform toeL, out Transform toeR)
@@ -1733,8 +1908,36 @@ namespace ZeroShugan.ShuganUnityTools
             var rows = new List<FootShapeFit.ToggleRow>();
             if (fit?.rows != null)
                 foreach (var r in fit.rows)
-                    if (FootShapeRowIncluded(r)) rows.Add(r);
+                    if (!r.IsFootShrink && FootShapeRowIncluded(r)) rows.Add(r);
             return rows;
+        }
+
+        // Foot shrink keys flatten the skin under shoes and socks. They only make sense with an outfit on the feet,
+        // so they are ticked by default exactly when an outfit is ticked for the run.
+        /// <summary>The switch, and a script new enough to act on it (3.17.0). With an older script the switch
+        /// would only hide the creator's keys and add a warning to every run.</summary>
+        bool MakeShrinkKeysNow => _makeShrinkKeys && ScriptSupportsShrinkKeys();
+
+        bool ShrinkRowsTickedByDefault()
+        {
+            // With our own keys on there is no reason to reach for the creator's: they are listed to pick by
+            // hand, not ticked. Off, they are the only shrink there is, and an outfit is what makes them useful.
+            if (MakeShrinkKeysNow) return false;
+            try { return TickedOutfits().Count > 0 || TickedExternalOutfits().Count > 0; }
+            catch { return false; }
+        }
+
+        bool FootShrinkRowIncluded(FootShapeFit.ToggleRow row, bool byDefault) =>
+            byDefault != _shrinkRowFlipped.Contains(row.key);
+
+        List<string> IncludedShrinkKeys(FootShapeFit.Result fit)
+        {
+            var keys = new List<string>();
+            if (fit?.rows == null) return keys;
+            bool byDefault = ShrinkRowsTickedByDefault();
+            foreach (var r in fit.rows)
+                if (r.IsFootShrink && FootShrinkRowIncluded(r, byDefault)) keys.Add(r.key);
+            return keys;
         }
 
         // {"High heeled": 100} for the rows set to 100. The 0 rows are not sent: Blender builds the rig
@@ -1788,7 +1991,7 @@ namespace ZeroShugan.ShuganUnityTools
                     + "only listed under \"Set feet shape keys to 0\", for you to zero yourself."),
                 _rigOnBestShape, EditorStyles.boldLabel);
             if (EditorGUI.EndChangeCheck())
-                EditorPrefs.SetBool(PrefRigOnBestShape, _rigOnBestShape);
+                ArfPrefs.SetBool(PrefRigOnBestShape, _rigOnBestShape);
             EditorGUILayout.LabelField("Toggles the ticked blendshapes when you animate the feet.",
                 EditorStyles.miniLabel);
 
@@ -1808,9 +2011,11 @@ namespace ZeroShugan.ShuganUnityTools
                 return measuring;
             }
 
-            bool hasToggle = FootShapeToggle.Find(_avatarObject) != null;
+            bool hasToggle = FootShapeToggle.FindAll(_avatarObject).Count > 0;
 
-            if (fit.rows.Count == 0)
+            var shapeRows  = fit.rows.Where(r => !r.IsFootShrink).ToList();
+            var shrinkRows = fit.rows.Where(r => r.IsFootShrink).ToList();
+            if (shapeRows.Count == 0)
             {
                 EditorGUILayout.LabelField("No shape key moves the feet.", EditorStyles.miniLabel);
             }
@@ -1820,8 +2025,8 @@ namespace ZeroShugan.ShuganUnityTools
                 // must not push the rest of the settings off the window.
                 float rowHeight = EditorGUIUtility.singleLineHeight + 2f;
                 _footShapeScroll = EditorGUILayout.BeginScrollView(_footShapeScroll,
-                    GUILayout.Height(Mathf.Min(fit.rows.Count * rowHeight + 6f, FootShapeListMaxHeight)));
-                foreach (var row in fit.rows)
+                    GUILayout.Height(Mathf.Min(shapeRows.Count * rowHeight + 6f, FootShapeListMaxHeight)));
+                foreach (var row in shapeRows)
                 {
                     EditorGUILayout.BeginHorizontal();
                     bool on = FootShapeRowIncluded(row);
@@ -1836,6 +2041,46 @@ namespace ZeroShugan.ShuganUnityTools
                 EditorGUILayout.EndScrollView();
             }
 
+            EditorGUILayout.Space(4);
+            EditorGUILayout.LabelField(new GUIContent("Foot Shrink (one menu toggle each)",
+                    "Flattening the skin of the feet under shoes and socks, so it can't poke through. Each one gets "
+                    + "its own VRCFury toggle at " + FootShapeToggle.ShrinkMenuPrefix + "<name>."),
+                EditorStyles.miniBoldLabel);
+            DrawMakeShrinkKeysOption();
+
+            if (shrinkRows.Count > 0)
+            {
+                EditorGUILayout.LabelField(new GUIContent(
+                        MakeShrinkKeysNow ? "The creator's own shrink keys (tick to add one as well)"
+                                        : "The creator's own shrink keys",
+                        "Shrink keys the creator made to flatten the feet or toes under shoes and socks. Each ticked "
+                        + "key gets its own VRCFury toggle that sets it to 100, at "
+                        + FootShapeToggle.ShrinkMenuPrefix + "<key>."),
+                    EditorStyles.miniLabel);
+                bool byDefault = ShrinkRowsTickedByDefault();
+                float shrinkRowHeight = EditorGUIUtility.singleLineHeight + 2f;
+                _footShrinkScroll = EditorGUILayout.BeginScrollView(_footShrinkScroll,
+                    GUILayout.Height(Mathf.Min(shrinkRows.Count * shrinkRowHeight + 6f, FootShapeListMaxHeight)));
+                foreach (var row in shrinkRows)
+                {
+                    EditorGUILayout.BeginHorizontal();
+                    bool on = FootShrinkRowIncluded(row, byDefault);
+                    bool ticked = EditorGUILayout.ToggleLeft(new GUIContent(row.key + "  →  100",
+                        $"Collapses {row.collapsedShare * 100f:0}% of the skin it moves, {row.footShare * 100f:0}% of it "
+                        + "around the feet and toes. Menu: " + FootShapeToggle.ShrinkMenuPath(row.key)), on);
+                    if (ticked != on && !_shrinkRowFlipped.Remove(row.key)) _shrinkRowFlipped.Add(row.key);
+                    GUILayout.Label("foot shrink", EditorStyles.miniLabel, GUILayout.Width(110));
+                    EditorGUILayout.EndHorizontal();
+                }
+                EditorGUILayout.EndScrollView();
+                if (!byDefault && !MakeShrinkKeysNow)
+                    EditorGUILayout.LabelField("Not ticked by default: no outfit is ticked for the run.",
+                        EditorStyles.wordWrappedMiniLabel);
+            }
+            else if (!MakeShrinkKeysNow)
+                EditorGUILayout.LabelField("This body has no shrink shape key of its own.",
+                    EditorStyles.wordWrappedMiniLabel);
+
             if (fit.coarse)
                 EditorGUILayout.LabelField(
                     "There is no toe bone under the feet yet, so the fit is judged from the ankle joints "
@@ -1845,7 +2090,7 @@ namespace ZeroShugan.ShuganUnityTools
             if (fit.NeedsShape)
             {
                 var lacking = new List<string>();
-                foreach (var g in _garmentMeshNames)
+                foreach (var g in TickedOutfits())
                 {
                     if (string.IsNullOrEmpty(g)) continue;
                     var gs = FindAvatarSkinnedMesh(g);
@@ -1875,13 +2120,13 @@ namespace ZeroShugan.ShuganUnityTools
         {
             if (FootShapeToggle.IsLastChild(_avatarObject))
             {
-                EditorGUILayout.LabelField($"✓ \"{FootShapeToggle.ObjectName}\" is on the avatar, as its last object.",
+                EditorGUILayout.LabelField("✓ The AutoRig Feet toggles are the last objects under the avatar.",
                     EditorStyles.miniLabel);
                 return;
             }
             EditorGUILayout.HelpBox(
-                $"\"{FootShapeToggle.ObjectName}\" is no longer the last object under the avatar. A VRCFury "
-                + "toggle below it that sets the same shape keys would override it.",
+                "The AutoRig Feet toggles (Foot Shape, Foot Shrink) are no longer the last objects under the avatar. "
+                + "A VRCFury toggle below them that sets the same shape keys would override them.",
                 MessageType.Warning);
             if (GUILayout.Button("Move to bottom", GUILayout.Height(20)))
                 EditorApplication.delayCall += () =>
@@ -1932,7 +2177,8 @@ namespace ZeroShugan.ShuganUnityTools
             string.Join(", ", bones.Take(6).Select(b => b.name)) + (bones.Count > 6 ? $" and {bones.Count - 6} more" : "");
 
         bool ConfirmForeignToeCleaning(List<Transform> bones) =>
-            EditorUtility.DisplayDialog(
+            ArfAutomation.Confirm(
+                ArfAutomation.AskForeignToes,
                 "Clean existing toe bones?",
                 $"{bones.Count} toe bone(s) from another rig will be removed from the rigged copy:\n\n"
                 + FormatBoneList(bones)
@@ -1957,7 +2203,7 @@ namespace ZeroShugan.ShuganUnityTools
                     + "Off: nothing is removed (the run report warns if such bones are found)."),
                 _cleanForeignToes, EditorStyles.boldLabel);
             if (EditorGUI.EndChangeCheck())
-                EditorPrefs.SetBool(PrefCleanForeignToes, _cleanForeignToes);
+                ArfPrefs.SetBool(PrefCleanForeignToes, _cleanForeignToes);
             EditorGUILayout.LabelField("Removes toe bones from another rig; their weights go to the foot.",
                 EditorStyles.miniLabel);
 
@@ -2024,6 +2270,7 @@ namespace ZeroShugan.ShuganUnityTools
                 case FootShapeFit.RowReason.OnAndFitsWorse: return "on, fits worse";
                 case FootShapeFit.RowReason.HidesGeometry:  return "hides geometry";
                 case FootShapeFit.RowReason.ReshapesBody:   return "reshapes body";
+                case FootShapeFit.RowReason.ShrinksSkin:    return "shrink key";
                 default:                                    return "minor";
             }
         }
@@ -2045,6 +2292,10 @@ namespace ZeroShugan.ShuganUnityTools
                     return "Hides part of the mesh. Left out of the toggle unless you tick it.";
                 case FootShapeFit.RowReason.ReshapesBody:
                     return "Also changes the legs or body. Left out of the toggle unless you tick it.";
+                case FootShapeFit.RowReason.ShrinksSkin:
+                    return $"Collapses {row.collapsedShare * 100f:0}% of the skin it moves: a shrink key the creator made "
+                         + "to hide the body under an outfit. Never used for the rig and left out of the toggle "
+                         + "unless you tick it.";
                 default:
                     return "Barely changes how the feet fit their bones. " + cost
                          + " Left out of the toggle unless you tick it.";
@@ -2149,11 +2400,15 @@ namespace ZeroShugan.ShuganUnityTools
             // Every run starts clean: the toggle object from an earlier run goes first, whatever it held,
             // and a new one is built from this run's list.
             bool hadToggle = FootShapeToggle.Remove(_resultInstance);
+            CreateFootShrinkTogglesAfterRun();
             var rows = new List<(string key, float value)>();
             var rigged = ParseRigShapeStats(_runReport.finalRawJson);
             if (rigged != null)
                 foreach (var kv in rigged)
                     if (kv.Value > 0f) rows.Add((kv.Key, kv.Value));
+            else if (_plannedToggleRows != null)
+                foreach (var r in _plannedToggleRows)
+                    if (r.value > 0f) rows.Add((r.key, r.value));
             if (_plannedToggleRows != null)
                 foreach (var r in _plannedToggleRows)
                     if (r.value <= 0f && !rows.Exists(x => x.key == r.key)) rows.Add((r.key, 0f));
@@ -2188,6 +2443,122 @@ namespace ZeroShugan.ShuganUnityTools
                 + $"the avatar, with the menu toggle {FootShapeToggle.MenuPath}: {list}.",
                 "Turn it on while you use the feet system. Keep the object last under the avatar, so no other "
                 + "toggle overrides it.");
+        }
+
+        static GUIStyle _shrinkOptionTitle;
+
+        // The tool's own shrink shape keys. Drawn in colour because it is the one thing in this box that changes
+        // the body mesh, and because it is what makes flattening the feet possible on a body whose creator
+        // shipped no shrink key at all — which is most of them.
+        void DrawMakeShrinkKeysOption()
+        {
+            if (_shrinkOptionTitle == null)
+                _shrinkOptionTitle = new GUIStyle(EditorStyles.boldLabel)
+                {
+                    normal = { textColor = new Color(0.10f, 0.45f, 0.70f) },
+                    onNormal = { textColor = new Color(0.10f, 0.45f, 0.70f) },
+                };
+            if (EditorGUIUtility.isProSkin)
+            {
+                _shrinkOptionTitle.normal.textColor = new Color(0.45f, 0.80f, 1.00f);
+                _shrinkOptionTitle.onNormal.textColor = new Color(0.45f, 0.80f, 1.00f);
+            }
+
+            var bg = GUI.backgroundColor;
+            GUI.backgroundColor = new Color(0.55f, 0.80f, 1.00f);
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            GUI.backgroundColor = bg;
+
+            bool scriptOk = ScriptSupportsShrinkKeys();
+            EditorGUI.BeginDisabledGroup(!scriptOk);
+            EditorGUI.BeginChangeCheck();
+            _makeShrinkKeys = EditorGUILayout.ToggleLeft(
+                new GUIContent("Make the shrink shape keys (recommended)",
+                    "On: the run adds \"" + FootShapeFit.OwnShrinkPrefix + "Toes\", \"… Toe Base\" and \"… Foot\" to "
+                    + "the body mesh, built from the rig's own weights, each with its own menu toggle. They flatten "
+                    + "the toes, the ball of the foot and the foot, so an outfit can't be poked through.\n\n"
+                    + "Off: nothing is added to the mesh, and only the creator's own shrink keys (if any) can be "
+                    + "toggled."),
+                _makeShrinkKeys && scriptOk, _shrinkOptionTitle);
+            if (EditorGUI.EndChangeCheck()) ArfPrefs.SetBool(PrefMakeShrinkKeys, _makeShrinkKeys);
+            EditorGUI.EndDisabledGroup();
+
+            EditorGUILayout.LabelField(
+                !scriptOk
+                    ? "Needs the AutoRig Feet script 3.17.0 or newer. Until then the creator's own shrink keys are "
+                      + "used, as below."
+                    : MakeShrinkKeysNow
+                    ? "Three shape keys are added to the body mesh and rebuilt on every run — the toes, the ball of "
+                      + "the foot and the foot itself — each with its own toggle under "
+                      + FootShapeToggle.ShrinkMenuPrefix + "."
+                    : "Off: the body mesh is left as it is, and only the creator's own shrink keys can be toggled.",
+                EditorStyles.wordWrappedMiniLabel);
+            EditorGUILayout.EndVertical();
+        }
+
+        /// <summary>The shrink keys the run actually put on the body, read from the mesh that came back rather
+        /// than from what was asked for — so a run finished after an interruption finds them too.</summary>
+        List<string> OwnShrinkKeysOnResult()
+        {
+            var found = new List<string>();
+            if (_resultInstance == null) return found;
+            foreach (var smr in _resultInstance.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+            {
+                var mesh = smr.sharedMesh;
+                if (mesh == null) continue;
+                for (int i = 0; i < mesh.blendShapeCount; i++)
+                {
+                    string name = mesh.GetBlendShapeName(i);
+                    if (FootShapeFit.IsOwnShrinkKey(name) && !found.Contains(name)) found.Add(name);
+                }
+            }
+            return found;
+        }
+
+        // One VRCFury toggle per foot shrink key, each at Animation/Feet/Fix/Foot Shrink <name>. Built before the
+        // Foot Shape toggle, so Foot Shape stays the very last object under the avatar.
+        void CreateFootShrinkTogglesAfterRun()
+        {
+            int removed = FootShapeToggle.RemoveAllShrink(_resultInstance);
+            // Ours first (in the order the script wrote them), then any of the creator's the user ticked.
+            var keys = MakeShrinkKeysNow ? OwnShrinkKeysOnResult() : new List<string>();
+            foreach (string planned in _plannedShrinkKeys ?? new List<string>())
+                if (!keys.Contains(planned)) keys.Add(planned);
+            if (_recRun != null) { _recRun.shrinkKeys = new List<string>(keys); _rec?.Save(); }
+            if (MakeShrinkKeysNow && keys.Count == 0)
+                _runReport.AddIssue("U_FOOT_SHRINK_KEYS_MISSING", "warning",
+                    "The shrink shape keys were asked for, but the rigged body has none.",
+                    "The AutoRig Feet script may be older than 3.17.0, or the run's log says why it could not "
+                    + "build them. The rig itself is finished.");
+            if (keys.Count == 0)
+            {
+                if (removed > 0)
+                    _runReport.AddIssue("U_FOOT_SHRINK_TOGGLES_REMOVED", "info",
+                        $"Removed {removed} Foot Shrink toggle(s) from the earlier run: no foot shrink key is ticked now.");
+                return;
+            }
+            if (!FootShapeToggle.VRCFuryAvailable)
+            {
+                _runReport.AddIssue("U_FOOT_SHAPE_NO_VRCFURY", "warning",
+                    "Foot shrink keys are ticked (" + string.Join(", ", keys) + "), but VRCFury is not installed, so no "
+                    + "toggle was added.", "Install VRCFury and run again, or animate those shape keys yourself.");
+                return;
+            }
+            var made = new List<string>();
+            foreach (var (key, label) in FootShapeToggle.ShrinkLabels(keys))
+            {
+                var go = FootShapeToggle.CreateOrUpdate(_resultInstance, FootShapeToggle.ShrinkObjectNameFor(label),
+                    FootShapeToggle.ShrinkMenuPathFor(label), new List<(string, float)> { (key, 100f) }, out string error);
+                if (go == null)
+                    _runReport.AddIssue("U_FOOT_SHAPE_TOGGLE_FAILED", "warning",
+                        $"The Foot Shrink toggle for {key} could not be added: " + error);
+                else
+                    made.Add(FootShapeToggle.ShrinkMenuPathFor(label));
+            }
+            if (made.Count > 0)
+                _runReport.AddIssue("U_FOOT_SHRINK_TOGGLES", "info",
+                    $"Added {made.Count} Foot Shrink toggle(s), each setting its shrink key to 100: " + string.Join(", ", made) + ".",
+                    "Turn one on while an outfit covers the feet, so the feet don't poke through it.");
         }
 
         // stats.rig_shape from the final report: {"High heeled": 100.0}. JsonUtility can't read a
@@ -2253,6 +2624,55 @@ namespace ZeroShugan.ShuganUnityTools
         // this walks a few hundred transforms.
         string _srcRiggedKey;
         bool   _srcRiggedValue;
+        string _srcBackupKey;
+        bool   _srcBackupValue;
+
+        // Script 3.16.0+ stores the original weights inside the FBX, as a custom property on each mesh
+        // (Blender writes it as a plain FBX user property). Unity never loads those, so the file is
+        // searched for the property name. Cached on path + last-write-time like SourceFbxIsRigged.
+        static readonly byte[] WeightBackupMarker = System.Text.Encoding.ASCII.GetBytes("ARF_WeightBackup");
+
+        bool SourceFbxHasWeightBackup()
+        {
+            if (_sourceFbxAsset == null) return false;
+            string path = AssetDatabase.GetAssetPath(_sourceFbxAsset);
+            if (string.IsNullOrEmpty(path)) return false;
+            string abs = ToAbsPath(path);
+            string key = path;
+            try { if (File.Exists(abs)) key = path + "|" + File.GetLastWriteTimeUtc(abs).Ticks; }
+            catch { }
+            if (key == _srcBackupKey) return _srcBackupValue;
+
+            _srcBackupKey = key;
+            _srcBackupValue = false;
+            try { _srcBackupValue = FileContains(abs, WeightBackupMarker); }
+            catch { }
+            return _srcBackupValue;
+        }
+
+        static bool FileContains(string absPath, byte[] needle)
+        {
+            if (!File.Exists(absPath)) return false;
+            byte[] data = File.ReadAllBytes(absPath);
+            int last = data.Length - needle.Length;
+            for (int i = 0; i <= last; i++)
+            {
+                if (data[i] != needle[0]) continue;
+                int j = 1;
+                while (j < needle.Length && data[i + j] == needle[j]) j++;
+                if (j == needle.Length) return true;
+            }
+            return false;
+        }
+
+        /// <summary>"&lt;fbx folder&gt;/_Backups/&lt;fbx name&gt;_rigbackup_": the script reads every JSON backup
+        /// of this FBX from it, for the meshes the FBX itself holds no backup for.</summary>
+        string BackupSearchPrefix()
+        {
+            if (_sourceFbxAsset == null) return null;
+            string fbxName = Path.GetFileNameWithoutExtension(AssetDatabase.GetAssetPath(_sourceFbxAsset));
+            return Path.Combine(SourceFbxAbsDir(), "_Backups", fbxName + "_rigbackup_");
+        }
 
         bool SourceFbxIsRigged()
         {
@@ -2297,7 +2717,7 @@ namespace ZeroShugan.ShuganUnityTools
             if (!SourceFbxIsRigged())
             {
                 EditorGUILayout.Space(6);
-                GUILayout.Label("Restore Original Rig", EditorStyles.boldLabel);
+                GUILayout.Label("Clean AutoRig Feet from the FBX", EditorStyles.boldLabel);
                 EditorGUILayout.HelpBox(
                     "Not needed for this FBX — it has no AutoRig Feet bones, so nothing has been "
                     + "rigged into it.\n\n"
@@ -2314,30 +2734,45 @@ namespace ZeroShugan.ShuganUnityTools
                 ? Directory.GetFiles(backupDir, fbxName + "_rigbackup_*.json")
                     .OrderByDescending(f => f).ToArray()
                 : new string[0];
-            if (jsons.Length == 0) return;  // nothing to restore
+            bool inFbx = SourceFbxHasWeightBackup();
+            if (jsons.Length == 0 && !inFbx) return;  // nothing to restore
 
             EditorGUILayout.Space(6);
-            GUILayout.Label("Restore Original Rig", EditorStyles.boldLabel);
+            GUILayout.Label("Clean AutoRig Feet from the FBX (keep later FBX edits)", EditorStyles.boldLabel);
             EditorGUILayout.LabelField(
-                "Re-import the FBX, remove the feet rig using a backup, and overwrite the FBX "
-                + "(keeps post-rig mesh edits).", EditorStyles.miniLabel);
+                "Removes the toe rig from the current FBX in Blender and puts the original weights back. The file is "
+                + "not the original one: use this only if you changed the FBX after rigging and want to keep those "
+                + "changes. Otherwise use Restore to original above.", EditorStyles.wordWrappedMiniLabel);
 
-            _restoreIndex = Mathf.Clamp(_restoreIndex, 0, jsons.Length - 1);
-            string[] labels = jsons.Select(Path.GetFileName).ToArray();
-
-            EditorGUILayout.BeginHorizontal();
-            _restoreIndex = EditorGUILayout.Popup(_restoreIndex, labels);
             bool busy = _state != State.Idle && _state != State.Done && _state != State.Error;
+            EditorGUILayout.BeginHorizontal();
+            if (inFbx)
+            {
+                // The backup inside the FBX covers the body and every outfit and wins over any file; the JSON
+                // files are only read for a mesh it has nothing for, so there is nothing to choose here.
+                EditorGUILayout.LabelField(
+                    new GUIContent("Backup stored inside the FBX",
+                        "Original weights of the body, the outfits and the nails, saved in the FBX by the rig. "
+                        + (jsons.Length > 0 ? "The JSON files in _Backups are used for any mesh it doesn't cover." : "")),
+                    EditorStyles.miniLabel);
+            }
+            else
+            {
+                _restoreIndex = Mathf.Clamp(_restoreIndex, 0, jsons.Length - 1);
+                _restoreIndex = EditorGUILayout.Popup(_restoreIndex, jsons.Select(Path.GetFileName).ToArray());
+            }
             EditorGUI.BeginDisabledGroup(busy || !_depAutoRigScript || !_depBlender);
-            if (GUILayout.Button("Restore", GUILayout.Width(90)))
-                RunRestore(jsons[_restoreIndex]);
+            if (GUILayout.Button("Clean", GUILayout.Width(90)))
+                RunRestore(inFbx ? null : jsons[_restoreIndex]);
             EditorGUI.EndDisabledGroup();
             EditorGUILayout.EndHorizontal();
         }
 
-        void RunRestore(string jsonPath)
+        bool _restoreRemoveObjects;
+
+        void RunRestore(string jsonPath, bool removeObjectsAfter = false)
         {
-            string blenderPath = EditorPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
+            string blenderPath = ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
             if (!File.Exists(blenderPath))
             {
                 SetStatus("Blender not found — set its path in Advanced Settings.", MessageType.Error);
@@ -2358,14 +2793,31 @@ namespace ZeroShugan.ShuganUnityTools
             string sourceFbxAbs = ToAbsPath(AssetDatabase.GetAssetPath(_sourceFbxAsset));
             string targetMesh   = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
 
-            bool ok = EditorUtility.DisplayDialog(
-                "Restore original rig?",
+            bool ok = removeObjectsAfter || ArfAutomation.Confirm(
+                ArfAutomation.AskRestoreRig,
+                "Clean AutoRig Feet from the FBX?",
                 "This imports the current FBX into Blender, removes the AutoRig Feet rig using:\n" +
-                Path.GetFileName(jsonPath) +
+                (string.IsNullOrEmpty(jsonPath) ? "the backup stored inside the FBX" : Path.GetFileName(jsonPath)) +
                 "\n\nand OVERWRITES the FBX:\n" + ToProjectRelative(sourceFbxAbs) +
-                "\n\nMesh edits made after rigging are kept; only the feet rig is removed.",
+                "\n\nMesh edits made after rigging are kept; only the feet rig is removed. The FBX is backed up first. "
+                + "The result is NOT byte-identical to the original file: to get that back (for an FBX patch such as "
+                + "face tracking), use \"Restore to original\" instead." + UsersWarning(ToProjectRelative(sourceFbxAbs), _avatarObject) +
+                (ScriptSupportsExternalOutfits() && RiggedExternalOutfits().Count > 0
+                    ? "\n\nThese outfit FBXs carry the rig too and are restored the same way (each backed up first):\n"
+                      + string.Join("\n", RiggedExternalOutfits().Select(o => Path.GetFileName(o.fbx)))
+                    : ""),
                 "Restore", "Cancel");
             if (!ok) return;
+
+            CaptureArmatureBefore();
+            string notWritable = FbxNotWritable(sourceFbxAbs);
+            if (notWritable != null)
+            {
+                SetStatus("The FBX can't be overwritten: " + notWritable + ". Nothing was changed.", MessageType.Error);
+                return;
+            }
+            _restoreRemoveObjects = true;       // cleaning the rig out of the FBX takes the scene objects out too
+            _restoreTempExport = NewTempExport("clean");
 
             _displayProgress  = 0f;
             _currentStepLabel = "Restoring rig in Blender…";
@@ -2375,8 +2827,9 @@ namespace ZeroShugan.ShuganUnityTools
             _runStartTicksUtc = DateTime.UtcNow.Ticks;
 
             string pythonCode = BlenderBridge.BuildRestoreFeetScript(
-                sourceFbxAbs, targetMesh, sourceFbxAbs, scriptPath, jsonPath,
-                headless: true, stepDelay: 0f);
+                sourceFbxAbs, targetMesh, _restoreTempExport, scriptPath, jsonPath,
+                headless: true, stepDelay: 0f, backupSearchPrefix: BackupSearchPrefix());
+            RecordBeginRun("clean");
 
             ArchiveWrapperScript(pythonCode);
 
@@ -2432,7 +2885,7 @@ namespace ZeroShugan.ShuganUnityTools
         void GoToTab(Tab tab)
         {
             _tab = tab;
-            EditorPrefs.SetInt(PrefTab, (int)_tab);
+            ArfPrefs.SetInt(PrefTab, (int)_tab);
             _runsCacheDirty = true;
             GUI.FocusControl(null);
             Repaint();
@@ -2606,7 +3059,11 @@ namespace ZeroShugan.ShuganUnityTools
         {
             EditorGUILayout.LabelField("Backups & Restore", EditorStyles.boldLabel);
 
+            DrawOriginalPanel();
+            EditorGUILayout.Space(6);
+
             var groups = BackupScan();
+            var originals = OriginalBackupFiles();
             long total = 0;
             int  files = 0;
             foreach (var g in groups) { total += g.totalBytes; files += g.entries.Count; }
@@ -2663,6 +3120,8 @@ namespace ZeroShugan.ShuganUnityTools
                 EditorGUILayout.BeginVertical(EditorStyles.helpBox);
                 GUI.backgroundColor = prevBg;
 
+                // The selected avatar's own backups open by themselves, once.
+                if (isSelected && _backupAutoExpanded.Add(g.assetPath)) _backupExpanded.Add(g.assetPath);
                 bool expanded = _backupExpanded.Contains(g.assetPath);
                 using (new EditorGUILayout.HorizontalScope())
                 {
@@ -2687,21 +3146,25 @@ namespace ZeroShugan.ShuganUnityTools
                 if (expanded)
                 {
                     foreach (var e in g.entries)
-                        DrawBackupEntry(g, e);
+                        DrawBackupEntry(g, e, originals.Contains(e.filePath));
                 }
                 EditorGUILayout.EndVertical();
             }
 
-            EditorGUILayout.Space(6);
-            DrawRestoreSection();
         }
 
-        void DrawBackupEntry(ShuganBackups.AssetGroup g, ShuganBackups.Entry e)
+        readonly HashSet<string> _backupAutoExpanded = new HashSet<string>();
+
+        void DrawBackupEntry(ShuganBackups.AssetGroup g, ShuganBackups.Entry e, bool isOriginal = false)
         {
+            Color prevColor = GUI.color;
+            if (isOriginal) GUI.color = new Color(0.65f, 1f, 0.7f);
             using (new EditorGUILayout.HorizontalScope())
             {
+                GUI.color = prevColor;
                 GUILayout.Space(14);
-                string label = e.when.ToString("yyyy-MM-dd HH:mm")
+                string label = (isOriginal ? "★ original, before AutoRig Feet — " : "")
+                             + e.when.ToString("yyyy-MM-dd HH:mm")
                              + (e.isPreSave ? "  (before unsaved changes)" : "");
                 EditorGUILayout.LabelField(new GUIContent(label, e.fileName),
                                            EditorStyles.miniLabel, GUILayout.MinWidth(150));
@@ -2711,7 +3174,7 @@ namespace ZeroShugan.ShuganUnityTools
                 if (e.kind == ShuganBackups.Kind.RigJson)
                 {
                     // Not a file swap — this one is applied through the Blender restore path below.
-                    GUILayout.Label("rig-only — see Restore Original Rig",
+                    GUILayout.Label("rig-only — see Clean AutoRig Feet",
                                     EditorStyles.miniLabel, GUILayout.Width(178));
                 }
                 else if (GUILayout.Button(
@@ -2735,12 +3198,13 @@ namespace ZeroShugan.ShuganUnityTools
             string msg = "Replace\n    " + g.assetPath
                        + "\nwith the backup from " + e.when.ToString("yyyy-MM-dd HH:mm")
                        + (e.isPreSave ? "  (the copy taken before your unsaved changes)" : "")
-                       + "?\n\nThe current file is backed up first, so this is reversible.";
+                       + "?\n\nThe current file is backed up first, so this is reversible."
+                       + (e.kind == ShuganBackups.Kind.Fbx ? UsersWarning(g.assetPath, null) : "");
             if (isOpenScene)
                 msg += "\n\nThat scene is open. It will be reloaded from the restored file, and any "
                      + "unsaved changes in it are lost.";
 
-            if (!EditorUtility.DisplayDialog("Restore backup?", msg, "Restore", "Cancel")) return;
+            if (!ArfAutomation.Confirm(ArfAutomation.AskRestoreBackup, "Restore backup?", msg, "Restore", "Cancel")) return;
 
             // Unity holds the open scene in memory and would write it back over the file we just
             // restored, so close it to an empty scene first and reopen afterwards.
@@ -2755,7 +3219,7 @@ namespace ZeroShugan.ShuganUnityTools
 
             if (!ShuganBackups.Restore(e, g.assetPath, out string safety, out string error))
             {
-                EditorUtility.DisplayDialog("Restore failed", error ?? "Unknown error.", "OK");
+                ArfAutomation.Notify("restore-failed", "Restore failed", error ?? "Unknown error.");
                 return;
             }
 
@@ -2772,6 +3236,10 @@ namespace ZeroShugan.ShuganUnityTools
                         "[AutoRig Feet Distributor] Restored, but could not reopen the scene: " + ex.Message);
                 }
             }
+
+            // The restored file has a different skeleton from the one the avatars in the scene were built
+            // against, so put them back in step before the reference to the avatar is dropped.
+            ResyncSceneAvatarsUsing(g.assetPath);
 
             _backupScanDirty = true;
             _avatarObject    = null;      // the object it pointed at may no longer exist
@@ -2880,7 +3348,7 @@ namespace ZeroShugan.ShuganUnityTools
                 new GUIContent("Contact (optional)",
                     "Email or username if you want a reply — leave empty to stay fully anonymous."),
                 _bugContact);
-            if (EditorGUI.EndChangeCheck()) EditorPrefs.SetString(PrefBugContact, _bugContact ?? "");
+            if (EditorGUI.EndChangeCheck()) ArfPrefs.SetString(PrefBugContact, _bugContact ?? "");
 
             _bugLogsFoldout = EditorGUILayout.Foldout(_bugLogsFoldout, "What gets attached", true);
             if (_bugLogsFoldout)
@@ -3079,135 +3547,370 @@ namespace ZeroShugan.ShuganUnityTools
         }
 
         // ─── Garment meshes (toe-weight transfer targets) ──────────────────────
+        // One table for every outfit mesh of the avatar, wherever it lives. The body FBX's own outfits are
+        // found and ticked for you, because rigging them is the normal case and costs nothing extra. The ones
+        // in a separate FBX are found and listed but never ticked: rigging one is experimental and rewrites a
+        // file that other avatars may share. A column says which is which, and so does the add menu.
 
-        // Transient feedback for a rejected garment drag-and-drop. Self-clearing, and scoped to the
-        // garment section instead of the window-wide status box.
-        string _garmentDropWarning = "";
-        double _garmentDropWarningAt;
-        const double GarmentDropWarningSeconds = 6.0;
-
-        void SetGarmentDropWarning(string msg)
+        struct GarmentRow
         {
-            _garmentDropWarning   = msg;
-            _garmentDropWarningAt = EditorApplication.timeSinceStartup;
+            public string mesh, key, fbxPath, source, why;
+            public bool   external, detected, ticked;
+            public SkinnedMeshRenderer smr;
         }
+
+        struct GarmentChoice
+        {
+            public string mesh, key, menu;
+            public bool   external;
+        }
+
+        /// <summary>Every outfit mesh the table shows, the body FBX's first.</summary>
+        List<GarmentRow> GarmentRows(string body)
+        {
+            var rows = new List<GarmentRow>();
+            string bodyFbx = AssetDatabase.GetAssetPath(_sourceFbxAsset);
+            LoadOutfitChoices(out var unticked, out var added);
+
+            foreach (var c in OutfitDetect.Find(bodyFbx, body, new[] { _footOverrideL, _footOverrideR }))
+                rows.Add(new GarmentRow { mesh = c.meshName, key = c.meshName, fbxPath = bodyFbx,
+                                          source = "body FBX", why = c.Explain(), detected = true,
+                                          ticked = !unticked.Contains(c.meshName),
+                                          smr = FindAvatarSkinnedMesh(c.meshName) });
+            foreach (string m in added)
+            {
+                if (string.Equals(m, body, StringComparison.OrdinalIgnoreCase)) continue;
+                if (rows.Any(r => string.Equals(r.mesh, m, StringComparison.OrdinalIgnoreCase))) continue;
+                rows.Add(new GarmentRow { mesh = m, key = m, fbxPath = bodyFbx, source = "body FBX",
+                                          why = "added by you", ticked = true, smr = FindAvatarSkinnedMesh(m) });
+            }
+
+            LoadExternalChoices(out var tickedExternal);
+            foreach (var r in ExternalOutfitRows())
+                rows.Add(new GarmentRow { mesh = r.mesh, key = r.key, fbxPath = r.fbxPath,
+                                          source = "outfit FBX: " + Path.GetFileName(r.fbxPath), why = r.why,
+                                          external = true, detected = r.detected,
+                                          ticked = tickedExternal.Contains(r.key), smr = r.smr });
+            return rows;
+        }
+
+        /// <summary>What "+ Add Outfit Mesh" offers: every mesh of the avatar that is not in the table yet, from
+        /// the body's FBX or from any other, each under a heading that says where it comes from. The mesh chosen
+        /// as the body in the setup is never offered — that one IS the body.</summary>
+        List<GarmentChoice> GarmentChoices(string body, List<GarmentRow> rows)
+        {
+            var list = new List<GarmentChoice>();
+            foreach (string m in _meshNames)
+            {
+                if (string.Equals(m, body, StringComparison.OrdinalIgnoreCase)) continue;
+                if (rows.Any(r => !r.external && string.Equals(r.mesh, m, StringComparison.OrdinalIgnoreCase))) continue;
+                list.Add(new GarmentChoice { mesh = m, key = m, menu = "From the body FBX/" + MenuSafe(m) });
+            }
+            foreach (var x in ExternalMeshes())
+            {
+                if (rows.Any(r => r.external && r.key == x.key)) continue;
+                list.Add(new GarmentChoice { mesh = x.mesh, key = x.key, external = true,
+                                             menu = "From another FBX/" + MenuSafe(Path.GetFileName(x.fbxPath))
+                                                    + "/" + MenuSafe(x.mesh) });
+            }
+            return list;
+        }
+
+        /// <summary>A menu item's text can't hold a slash: GenericMenu reads it as a submenu.</summary>
+        static string MenuSafe(string name) => (name ?? "").Replace("/", "\u2215");
 
         void DrawGarmentSection()
         {
             EditorGUILayout.Space(6);
-            GUILayout.Label("Transfer Toe Weights To (optional)", EditorStyles.boldLabel);
-            EditorGUILayout.LabelField(
-                "Outfit meshes from the same FBX that should follow the new toe bones: socks, "
-                + "thigh-highs, shoes.",
-                EditorStyles.miniLabel);
+            GUILayout.Label("Transfer Toe Weights To", EditorStyles.boldLabel);
 
             bool hasFbx = _sourceFbxAsset != null && IsValidFbx(_sourceFbxAsset);
-            string bodyMesh = _meshNames.Length > 0
-                ? _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)] : null;
+            if (!hasFbx || _meshNames.Length == 0)
+            {
+                EditorGUILayout.HelpBox("Select an avatar first to see its outfit meshes.", MessageType.Info);
+                return;
+            }
 
-            // Garment choices = all FBX meshes except the body mesh.
-            string[] choices = hasFbx
-                ? _meshNames.Where(m => !string.Equals(m, bodyMesh, StringComparison.OrdinalIgnoreCase)).ToArray()
-                : new string[0];
+            string body = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
+            var rows = GarmentRows(body);
+            bool scriptOk = ScriptSupportsExternalOutfits();
+            bool swapSkips = ExternalOutfitsSkippedBySwap;
+            bool externalUsable = scriptOk && !swapSkips;
+            bool changedBody = false, changedExternal = false;
+            LoadOutfitChoices(out var unticked, out var added);
+            LoadExternalChoices(out var tickedExternal);
 
-            EditorGUI.BeginDisabledGroup(!hasFbx);
-
-            for (int i = 0; i < _garmentMeshNames.Count; i++)
+            if (rows.Count == 0)
+                EditorGUILayout.LabelField("No other mesh of this avatar sits on the feet.", EditorStyles.miniLabel);
+            else
             {
                 EditorGUILayout.BeginHorizontal();
-
-                int cur = Array.IndexOf(choices, _garmentMeshNames[i]);
-                EditorGUI.BeginChangeCheck();
-                int picked = EditorGUILayout.Popup(
-                    cur < 0 ? 0 : cur,
-                    choices.Length > 0 ? choices : new[] { "— no other meshes —" });
-                if (EditorGUI.EndChangeCheck() && choices.Length > 0)
-                {
-                    _garmentMeshNames[i] = choices[Mathf.Clamp(picked, 0, choices.Length - 1)];
-                    SaveGarments();
-                }
-
-                // Linked scene field, same idea as Target Mesh: it mirrors the dropdown (click to
-                // ping the garment in the Hierarchy) and dropping a mesh in picks it in the dropdown.
-                var curGarmentSmr = FindAvatarSkinnedMesh(_garmentMeshNames[i]);
-                var pickedSmr = (SkinnedMeshRenderer)EditorGUILayout.ObjectField(
-                    curGarmentSmr, typeof(SkinnedMeshRenderer), true, GUILayout.Width(140));
-                if (pickedSmr != curGarmentSmr && pickedSmr != null && pickedSmr.sharedMesh != null)
-                {
-                    string dropped = pickedSmr.sharedMesh.name;
-                    if (choices.Contains(dropped, StringComparer.OrdinalIgnoreCase))
-                    {
-                        _garmentMeshNames[i] = dropped;
-                        SaveGarments();
-                    }
-                    // Rejections are transient feedback about one drag, NOT run status: they used to
-                    // go through SetStatus, which owns the persistent status box at the bottom and
-                    // never clears — so the message stuck around long after the garment was removed.
-                    else if (string.Equals(dropped, bodyMesh, StringComparison.OrdinalIgnoreCase))
-                        SetGarmentDropWarning($"'{dropped}' is the body mesh — pick a different mesh as an outfit.");
-                    else
-                        SetGarmentDropWarning($"'{dropped}' is not a mesh of the source FBX.");
-                }
-
-                // Flag a stale name (mesh no longer in this FBX) or an accidental duplicate.
-                if (!string.IsNullOrEmpty(_garmentMeshNames[i]) && cur < 0)
-                {
-                    Color c = GUI.color; GUI.color = Color.yellow;
-                    GUILayout.Label("not in FBX", EditorStyles.miniLabel, GUILayout.Width(70));
-                    GUI.color = c;
-                }
-                else if (_garmentMeshNames.Take(i).Contains(_garmentMeshNames[i]))
-                {
-                    Color c = GUI.color; GUI.color = Color.yellow;
-                    GUILayout.Label("duplicate", EditorStyles.miniLabel, GUILayout.Width(70));
-                    GUI.color = c;
-                }
-
-                if (GUILayout.Button("×", GUILayout.Width(22)))
-                {
-                    _garmentMeshNames.RemoveAt(i);
-                    SaveGarments();
-                    i--;
-                    EditorGUILayout.EndHorizontal();
-                    continue;
-                }
+                GUILayout.Label("Mesh", EditorStyles.miniBoldLabel, GUILayout.MinWidth(120));
+                GUILayout.Label("Comes from", EditorStyles.miniBoldLabel, GUILayout.Width(150));
+                GUILayout.Label("Why it is listed", EditorStyles.miniBoldLabel, GUILayout.Width(110));
+                GUILayout.Label(" ", EditorStyles.miniLabel, GUILayout.Width(GarmentRefWidth));
                 EditorGUILayout.EndHorizontal();
-
-                // A garment shape key that moves the feet is listed with the body's, in the
-                // "Set feet shape keys to 0" section of Advanced Settings.
             }
 
-            // Expires on its own, and disappears immediately once there are no garment slots left.
-            if (!string.IsNullOrEmpty(_garmentDropWarning))
+            foreach (var row in rows)
             {
-                if (_garmentMeshNames.Count == 0 ||
-                    EditorApplication.timeSinceStartup - _garmentDropWarningAt > GarmentDropWarningSeconds)
-                    _garmentDropWarning = "";
-                else
+                bool blocked = row.external && !externalUsable;
+                EditorGUI.BeginDisabledGroup(blocked);
+                EditorGUILayout.BeginHorizontal();
+                bool now = EditorGUILayout.ToggleLeft(
+                    new GUIContent(row.mesh, row.fbxPath), row.ticked && !blocked, GUILayout.MinWidth(120));
+                if (!blocked && now != row.ticked)
                 {
-                    EditorGUILayout.HelpBox(_garmentDropWarning, MessageType.Warning);
-                    Repaint();   // keep ticking so it clears without needing a mouse move
+                    if (row.external)
+                    {
+                        if (now) tickedExternal.Add(row.key); else tickedExternal.Remove(row.key);
+                        changedExternal = true;
+                    }
+                    else if (row.detected)
+                    {
+                        // Off the "added by hand" list either way: it overrides the unticked one, so a mesh
+                        // that is on both would keep running while the box shows it unticked.
+                        added.RemoveAll(m => string.Equals(m, row.mesh, StringComparison.OrdinalIgnoreCase));
+                        if (now) unticked.Remove(row.mesh); else unticked.Add(row.mesh);
+                        changedBody = true;
+                    }
+                    else if (!now) { added.Remove(row.mesh); changedBody = true; }   // added by hand: untick removes it
                 }
+                GUILayout.Label(new GUIContent(row.source, row.external
+                        ? row.fbxPath + "\n\nExperimental: this file is rewritten, "
+                          + OutfitFormLabel(row.smr, row.fbxPath) + "."
+                        : row.fbxPath),
+                    EditorStyles.miniLabel, GUILayout.Width(150));
+                GUILayout.Label(row.why, EditorStyles.miniLabel, GUILayout.Width(110));
+                EditorGUI.BeginDisabledGroup(true);
+                EditorGUILayout.ObjectField(row.smr, typeof(SkinnedMeshRenderer), true, GUILayout.Width(GarmentRefWidth));
+                EditorGUI.EndDisabledGroup();
+                EditorGUILayout.EndHorizontal();
+                EditorGUI.EndDisabledGroup();
+
+                // The warning belongs to the garment that will actually be changed, so it is drawn per ticked row.
+                if (row.external && now && !blocked)
+                    EditorGUILayout.HelpBox(
+                        "Experimental: the toe bones are added to " + row.mesh + "'s own armature and its foot "
+                        + "weights are "
+                        + (_exportMode == ExportMode.Replace
+                            ? "rewritten in " + Path.GetFileName(row.fbxPath) + " (a backup is kept in _Backups). "
+                            : "written to a copy of " + Path.GetFileName(row.fbxPath) + " for the duplicated avatar. ")
+                        + "Any other avatar using that file gets the toe bones too. Restore to original puts it back.",
+                        MessageType.Warning);
             }
 
-            if (GUILayout.Button("+ Add Outfit Mesh", GUILayout.Height(22)))
+            if (rows.Any(r => r.external) && !scriptOk)
+                EditorGUILayout.HelpBox("The meshes from another FBX need a newer AutoRig Feet script (one that "
+                                        + "can rig outfits from other FBXs).", MessageType.Info);
+            else if (rows.Any(r => r.external) && swapSkips)
+                EditorGUILayout.HelpBox("Meshes from another FBX are skipped with the Legacy swap in Duplicate "
+                                        + "mode. Use the Standard swap (the default) to include them.", MessageType.Info);
+
+            var choices = GarmentChoices(body, rows);
+            EditorGUI.BeginDisabledGroup(choices.Count == 0);
+            if (GUILayout.Button(new GUIContent("+ Add Outfit Mesh",
+                    "Every mesh of this avatar that is not in the list yet, grouped by the FBX it comes from."),
+                GUILayout.Height(22)))
             {
-                // Default the new slot to the first not-yet-chosen garment mesh, else the first.
-                string next = choices.FirstOrDefault(m => !_garmentMeshNames.Contains(m))
-                              ?? (choices.Length > 0 ? choices[0] : "");
-                _garmentMeshNames.Add(next);
-                SaveGarments();
+                var menu = new GenericMenu();
+                foreach (var choice in choices)
+                {
+                    var c = choice;   // the menu calls back later, after this list is gone
+                    menu.AddItem(new GUIContent(c.menu), false, () =>
+                    {
+                        if (c.external)
+                        {
+                            LoadExternalChoices(out var set);
+                            set.Add(c.key);
+                            SaveExternalChoices(set);
+                        }
+                        else
+                        {
+                            LoadOutfitChoices(out var off, out var extra);
+                            off.Remove(c.mesh);
+                            if (!extra.Contains(c.mesh)) extra.Add(c.mesh);
+                            SaveOutfitChoices(off, extra);
+                        }
+                        Repaint();
+                    });
+                }
+                menu.ShowAsContext();
             }
-
             EditorGUI.EndDisabledGroup();
 
-            if (!hasFbx && _garmentMeshNames.Count > 0)
-                EditorGUILayout.HelpBox("Select an avatar / FBX first to pick outfit meshes.",
-                    MessageType.Info);
+            if (changedBody) SaveOutfitChoices(unticked, added);
+            if (changedExternal) SaveExternalChoices(tickedExternal);
         }
 
         void SaveGarments()
-            => EditorPrefs.SetString(PrefGarments, string.Join("|", _garmentMeshNames));
+            => ArfPrefs.SetString(PrefGarments, string.Join("|", _garmentMeshNames));
+
+        // ─── Outfits: what a run actually transfers to ─────────────────────────
+        // The list is filled in for you. OutfitDetect reads the FBX and says which meshes sit on the feet,
+        // and those are ticked; the stored setting holds only the DIFFERENCES from that answer, so a mesh
+        // added to the FBX later is picked up on its own instead of waiting for someone to notice.
+        //
+        // Stored per FBX (avatars have different outfits), and seeded once from the single global list the
+        // older versions kept, so nobody loses a selection they made by hand.
+
+        string OutfitPrefKey()
+        {
+            string path = AssetDatabase.GetAssetPath(_sourceFbxAsset);
+            string guid = string.IsNullOrEmpty(path) ? null : AssetDatabase.AssetPathToGUID(path);
+            return string.IsNullOrEmpty(guid) ? null : "ShuganTools_ARF_Outfits_" + guid;
+        }
+
+        /// <summary>Meshes the user unticked, and meshes they added by hand.</summary>
+        void LoadOutfitChoices(out HashSet<string> unticked, out List<string> added)
+        {
+            unticked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            added    = new List<string>();
+
+            string key = OutfitPrefKey();
+            if (key == null) return;
+
+            string stored = ArfPrefs.GetString(key, null);
+            if (stored == null)
+            {
+                // First time for this FBX: carry over anything the old global list named, if this FBX has
+                // those meshes at all.
+                foreach (string legacy in ArfPrefs.GetString(PrefGarments, "").Split('|'))
+                    if (!string.IsNullOrEmpty(legacy) && _meshNames.Contains(legacy, StringComparer.OrdinalIgnoreCase))
+                        added.Add(legacy);
+                return;
+            }
+
+            foreach (string entry in stored.Split('|'))
+            {
+                if (entry.Length < 2) continue;
+                if (entry[0] == '-') unticked.Add(entry.Substring(1));
+                else if (entry[0] == '+') added.Add(entry.Substring(1));
+            }
+        }
+
+        void SaveOutfitChoices(HashSet<string> unticked, List<string> added)
+        {
+            string key = OutfitPrefKey();
+            if (key == null) return;
+            var parts = unticked.Select(n => "-" + n).Concat(added.Select(n => "+" + n));
+            ArfPrefs.SetString(key, string.Join("|", parts));
+        }
+
+        /// <summary>The meshes this run transfers the toe and foot weights onto: everything detected on the
+        /// feet and still ticked, plus anything added by hand. The body mesh is never one of them.</summary>
+        List<string> TickedOutfits()
+        {
+            var list = new List<string>();
+            if (_sourceFbxAsset == null || _meshNames.Length == 0) return list;
+
+            string body = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
+            LoadOutfitChoices(out var unticked, out var added);
+
+            foreach (var c in OutfitDetect.Find(AssetDatabase.GetAssetPath(_sourceFbxAsset), body, new[] { _footOverrideL, _footOverrideR }))
+                if (!unticked.Contains(c.meshName) && !string.Equals(c.meshName, body, StringComparison.OrdinalIgnoreCase))
+                    list.Add(c.meshName);
+
+            foreach (string name in added)
+                if (!string.IsNullOrEmpty(name) && !list.Contains(name, StringComparer.OrdinalIgnoreCase) &&
+                    !string.Equals(name, body, StringComparison.OrdinalIgnoreCase))
+                    list.Add(name);
+
+            return list;
+        }
+
+        // ─── Reset to defaults ─────────────────────────────────────────────────
+        // Every option in Advanced Settings, with the value it ships with. Settings live in EditorPrefs,
+        // which are shared by every Unity project on the machine, so a setting changed once for one avatar
+        // quietly follows the user everywhere — and a panel with no way back is a panel people stop
+        // trusting. Paths and picks are deliberately absent: see ResetAdvancedSettings.
+        static readonly (string key, object value)[] AdvancedDefaults =
+        {
+            (PrefSuffix,                  "Rig_Feet"),
+            (PrefExportFolder,            ""),
+            (PrefSwapMethod,              (int)SwapMethod.Legacy),
+            (PrefAutoSwapMethod,          true),
+            (PrefBackupEnabled,           true),
+            (PrefTimeoutMin,              10),
+            (PrefAutoMapFeet,             true),
+            (PrefRigOnBestShape,          true),
+            (PrefZeroFeetShapeKeys,       false),
+            (PrefCleanForeignToes,        true),
+            (PrefUnlinkedPrefabSceneOnly, false),
+            (PrefFootHelper,              true),
+            (PrefMakeShrinkKeys,          true),
+        };
+
+        void DrawResetToDefaults()
+        {
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField(
+                "Put every option below back to the value it ships with.",
+                EditorStyles.wordWrappedMiniLabel);
+            if (GUILayout.Button(new GUIContent("Reset to defaults",
+                    "Blender and script paths, the source FBX, the target mesh, the foot bones, your outfit "
+                    + "list and your bug-report contact are all left alone."),
+                    GUILayout.Width(130)))
+                ResetAdvancedSettings();
+            EditorGUILayout.EndHorizontal();
+        }
+
+        void ResetAdvancedSettings()
+        {
+            bool go = ArfAutomation.Confirm(
+                "reset-defaults",
+                "Reset AutoRig Feet settings?",
+                "These go back to their defaults:\n\n"
+                + "  • Export suffix and folder\n"
+                + "  • FBX swap method (and choosing it automatically)\n"
+                + "  • Rig JSON backup, Blender timeout\n"
+                + "  • Humanoid auto-map\n"
+                + "  • Foot shape keys, set feet shape keys to 0\n"
+                + "  • Clean existing toe bones\n"
+                + "  • Where bones go for avatars not linked to their FBX\n"
+                + "  • Foot helper bone\n"
+                + "  • The list of prefabs a run adds\n\n"
+                + "These are KEPT:\n\n"
+                + "  • Blender path and paid script path\n"
+                + "  • Source FBX, target mesh and foot bone picks\n"
+                + "  • Export mode, your outfit list, your bug-report contact",
+                "Reset", "Cancel");
+            if (!go) return;
+
+            foreach (var (key, _) in AdvancedDefaults) ArfPrefs.DeleteKey(key);
+
+            _exportSuffix            = "Rig_Feet";
+            _exportFolder            = "";
+            _swapMethod              = SwapMethod.Legacy;
+            _autoSwapMethod          = true;
+            _backupEnabled           = true;
+            _timeoutMin              = 10;
+            _autoMapFeet             = true;
+            _rigOnBestShape          = true;
+            _zeroFeetShapeKeys       = false;
+            _cleanForeignToes        = true;
+            _unlinkedPrefabSceneOnly = false;
+            _footHelper              = true;
+            _makeShrinkKeys          = true;
+
+            // Per-row ticks are choices about one avatar, not settings, and they live only in memory.
+            _foreignToeUnticked.Clear();
+            _foreignToeAdded.Clear();
+            _fitRowFlipped.Clear();
+            _shrinkRowFlipped.Clear();
+
+            _prefabsToAdd.Clear();
+            foreach (string p in DefaultPrefabPaths)
+                _prefabsToAdd.Add(AssetDatabase.LoadAssetAtPath<GameObject>(p));
+
+            // The avatar is re-checked because several of these decide what the panel shows about it.
+            OutfitDetect.Forget();
+            if (_avatarObject != null) OnAvatarChanged();
+
+            SetStatus("Settings are back to their defaults. Blender/script paths, the FBX, the foot bones "
+                      + "and your outfit list were left as they are.", MessageType.Info);
+            Repaint();
+        }
 
         // ─── Advanced section ──────────────────────────────────────────────────
 
@@ -3216,11 +3919,16 @@ namespace ZeroShugan.ShuganUnityTools
             EditorGUI.BeginChangeCheck();
             _advancedFoldout = EditorGUILayout.Foldout(_advancedFoldout, "Advanced Settings", true);
             if (EditorGUI.EndChangeCheck())
-                EditorPrefs.SetBool(PrefAdvanced, _advancedFoldout);
+                ArfPrefs.SetBool(PrefAdvanced, _advancedFoldout);
 
             if (!_advancedFoldout) return;
 
             EditorGUI.indentLevel++;
+
+            // First thing inside the foldout: the way back. These settings are machine-wide, so one changed
+            // for a single avatar otherwise follows the user into every project they open.
+            DrawResetToDefaults();
+            Separator();
 
             // ── What the run does to this avatar ─────────────────────────────
             // Both lists are filled in and ticked for you, so a run is correct without ever opening
@@ -3236,7 +3944,7 @@ namespace ZeroShugan.ShuganUnityTools
             // ── Blender path ─────────────────────────────────────────────────
             GUILayout.Label("Blender", EditorStyles.boldLabel);
 
-            string blenderPath = EditorPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
+            string blenderPath = ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
             bool   blenderOk   = File.Exists(blenderPath);
 
             EditorGUILayout.BeginHorizontal();
@@ -3245,7 +3953,7 @@ namespace ZeroShugan.ShuganUnityTools
                 new GUIContent("blender.exe", "Full path to the Blender executable."),
                 blenderPath);
             if (EditorGUI.EndChangeCheck())
-                EditorPrefs.SetString(BlenderBridge.PrefBlenderPath, newPath);
+                ArfPrefs.SetString(BlenderBridge.PrefBlenderPath, newPath);
 
             Color co = GUI.color;
             GUI.color = blenderOk ? Color.green : (blenderPath.Length > 0 ? Color.red : Color.gray);
@@ -3281,7 +3989,7 @@ namespace ZeroShugan.ShuganUnityTools
             // ── Paid Blender Scripts (override path) ─────────────────────────
             GUILayout.Label("Paid Blender Scripts", EditorStyles.boldLabel);
 
-            string overridePath = EditorPrefs.GetString(PrefAutoRigScriptPath, "");
+            string overridePath = ArfPrefs.GetString(PrefAutoRigScriptPath, "");
 
             // The field shows the script ACTUALLY IN USE, not just a manual override.
             //
@@ -3331,23 +4039,23 @@ namespace ZeroShugan.ShuganUnityTools
                                 StringComparison.OrdinalIgnoreCase);
                         }
                         catch { }
-                        EditorPrefs.SetString(PrefAutoRigScriptPath, isDefault ? "" : abs);
+                        ArfPrefs.SetString(PrefAutoRigScriptPath, isDefault ? "" : abs);
                     }
                     else
                     {
-                        EditorPrefs.SetString(PrefAutoRigScriptPath, "");
+                        ArfPrefs.SetString(PrefAutoRigScriptPath, "");
                     }
                 }
                 else
                 {
-                    EditorPrefs.SetString(PrefAutoRigScriptPath, "");
+                    ArfPrefs.SetString(PrefAutoRigScriptPath, "");
                 }
                 _autoRigScriptResolvedPath = ResolveAutoRigScriptPath();   // reflect it immediately
             }
             if (GUILayout.Button("Browse…", GUILayout.Width(70)))
                 BrowseForAutoRigScript();
             if (!string.IsNullOrEmpty(overridePath) && GUILayout.Button("×", GUILayout.Width(22)))
-                EditorPrefs.SetString(PrefAutoRigScriptPath, "");
+                ArfPrefs.SetString(PrefAutoRigScriptPath, "");
             EditorGUILayout.EndHorizontal();
 
             // A script outside the Unity project can't be shown as an object reference, so fall
@@ -3384,7 +4092,7 @@ namespace ZeroShugan.ShuganUnityTools
                     + "while keeping mesh edits made after rigging. Separate from the full FBX backup."),
                 _backupEnabled);
             if (EditorGUI.EndChangeCheck())
-                EditorPrefs.SetBool(PrefBackupEnabled, _backupEnabled);
+                ArfPrefs.SetBool(PrefBackupEnabled, _backupEnabled);
 
             EditorGUI.BeginChangeCheck();
             _timeoutMin = EditorGUILayout.IntField(
@@ -3396,7 +4104,7 @@ namespace ZeroShugan.ShuganUnityTools
             if (EditorGUI.EndChangeCheck())
             {
                 _timeoutMin = Mathf.Clamp(_timeoutMin, 0, 240);
-                EditorPrefs.SetInt(PrefTimeoutMin, _timeoutMin);
+                ArfPrefs.SetInt(PrefTimeoutMin, _timeoutMin);
             }
 
             Separator();
@@ -3411,7 +4119,56 @@ namespace ZeroShugan.ShuganUnityTools
                     + "never replaces bones you've already mapped. Uses the Humanoid Rig Mapping tool."),
                 _autoMapFeet);
             if (EditorGUI.EndChangeCheck())
-                EditorPrefs.SetBool(PrefAutoMapFeet, _autoMapFeet);
+                ArfPrefs.SetBool(PrefAutoMapFeet, _autoMapFeet);
+
+            Separator();
+
+            // ── Foot helper bone ─────────────────────────────────────────────
+            GUILayout.Label("Foot helper bone", EditorStyles.boldLabel);
+            string helperPyVer = LocalPyVersion();
+            bool helperSupported = string.IsNullOrEmpty(helperPyVer) || !IsOlder(helperPyVer, "3.16.0");
+            EditorGUI.BeginDisabledGroup(!helperSupported);
+            EditorGUI.BeginChangeCheck();
+            _footHelper = EditorGUILayout.ToggleLeft(
+                new GUIContent("Add a helper bone under each foot  (ARF Helper_L / _R)",
+                    "A copy of the foot bone that takes over the foot's weights and becomes the parent of the "
+                    + "toes. VRChat's IK moves the foot; the helper follows it and can be animated on top — "
+                    + "rotate it to flex the whole foot without fighting the IK. At rest nothing looks "
+                    + "different."),
+                _footHelper);
+            if (EditorGUI.EndChangeCheck())
+                ArfPrefs.SetBool(PrefFootHelper, _footHelper);
+            EditorGUI.EndDisabledGroup();
+            if (!helperSupported)
+                EditorGUILayout.LabelField("Needs AutoRig Feet script 3.16.0 or newer (installed: " + helperPyVer + ").",
+                    EditorStyles.wordWrappedMiniLabel);
+
+            Separator();
+
+            // ── Avatars that are not linked to their FBX ─────────────────────
+            GUILayout.Label("Avatars not linked to their FBX", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField(
+                "An avatar you unpacked — or unpacked and saved as your own prefab — has no link to its FBX, "
+                + "so Unity never carries new bones into it. AutoRig Feet adds them itself.",
+                EditorStyles.wordWrappedMiniLabel);
+            EditorGUI.BeginChangeCheck();
+            int unlinkedChoice = EditorGUILayout.Popup(
+                new GUIContent("Add the bones to",
+                    "The prefab itself: every instance of it, in every scene, gets the new bones — its other "
+                    + "instances are broken in exactly the same way.\n\n"
+                    + "This avatar only: the prefab keeps the old skeleton, and each of its other instances "
+                    + "stays broken until you select it and press Re-sync armature."),
+                _unlinkedPrefabSceneOnly ? 1 : 0,
+                new[]
+                {
+                    new GUIContent("The prefab itself  (recommended)"),
+                    new GUIContent("This avatar only"),
+                });
+            if (EditorGUI.EndChangeCheck())
+            {
+                _unlinkedPrefabSceneOnly = unlinkedChoice == 1;
+                ArfPrefs.SetBool(PrefUnlinkedPrefabSceneOnly, _unlinkedPrefabSceneOnly);
+            }
 
             Separator();
 
@@ -3426,7 +4183,7 @@ namespace ZeroShugan.ShuganUnityTools
                     + "duplicate-and-relink swap fails on a particular avatar."),
                 _autoSwapMethod);
             if (EditorGUI.EndChangeCheck())
-                EditorPrefs.SetBool(PrefAutoSwapMethod, _autoSwapMethod);
+                ArfPrefs.SetBool(PrefAutoSwapMethod, _autoSwapMethod);
 
             if (_autoSwapMethod)
             {
@@ -3445,7 +4202,7 @@ namespace ZeroShugan.ShuganUnityTools
                         + "Replace mode."),
                     _swapMethod);
                 if (EditorGUI.EndChangeCheck())
-                    EditorPrefs.SetInt(PrefSwapMethod, (int)_swapMethod);
+                    ArfPrefs.SetInt(PrefSwapMethod, (int)_swapMethod);
 
                 // Only reachable now that the choice is forced — automatic selection can't produce it.
                 if (_swapMethod == SwapMethod.Standard && _exportMode == ExportMode.Replace)
@@ -3485,7 +4242,7 @@ namespace ZeroShugan.ShuganUnityTools
             if (EditorGUI.EndChangeCheck())
             {
                 _fbxAutoDetected = false;
-                EditorPrefs.SetString(PrefFbxPath,
+                ArfPrefs.SetString(PrefFbxPath,
                     _sourceFbxAsset != null ? AssetDatabase.GetAssetPath(_sourceFbxAsset) : "");
                 RefreshMeshNames();
                 _selectedMeshIndex = 0;
@@ -3511,7 +4268,7 @@ namespace ZeroShugan.ShuganUnityTools
                     new GUIContent("Suffix", "Appended to the source FBX filename."),
                     _exportSuffix);
                 if (EditorGUI.EndChangeCheck())
-                    EditorPrefs.SetString(PrefSuffix, _exportSuffix);
+                    ArfPrefs.SetString(PrefSuffix, _exportSuffix);
 
                 EditorGUILayout.BeginHorizontal();
                 GUILayout.Label(new GUIContent("Folder",
@@ -3526,7 +4283,7 @@ namespace ZeroShugan.ShuganUnityTools
                 if (!string.IsNullOrEmpty(_exportFolder) && GUILayout.Button("×", GUILayout.Width(22)))
                 {
                     _exportFolder = "";
-                    EditorPrefs.SetString(PrefExportFolder, "");
+                    ArfPrefs.SetString(PrefExportFolder, "");
                 }
                 EditorGUILayout.EndHorizontal();
 
@@ -3573,6 +4330,10 @@ namespace ZeroShugan.ShuganUnityTools
             Separator();
 
             DrawFootShapeToggleTest();
+
+            // The same button as at the top: after scrolling through every option, the way back is right here.
+            Separator();
+            DrawResetToDefaults();
 
             EditorGUI.indentLevel--;
         }
@@ -3719,6 +4480,7 @@ namespace ZeroShugan.ShuganUnityTools
         {
             bool show = _state == State.BlenderRunning || _state == State.FBXSwapping ||
                         _state == State.AddingPrefabs  || _state == State.Restoring ||
+                        _state == State.OutfitsRunning || _state == State.OutfitsRestoring ||
                         (_displayProgress > 0f && _displayProgress < 1.01f &&
                          (_state == State.Done || _state == State.Error));
             if (!show) return;
@@ -3736,15 +4498,284 @@ namespace ZeroShugan.ShuganUnityTools
             EditorGUI.ProgressBar(r, Mathf.Clamp01(_displayProgress), label);
             if (cancellable && GUILayout.Button("Cancel", GUILayout.Width(64), GUILayout.Height(20)))
                 CancelRun();
+            // The body is already rigged by then: skipping the outfits stops them, and the body run finishes.
+            if ((_state == State.OutfitsRunning || _state == State.OutfitsRestoring) &&
+                GUILayout.Button(new GUIContent("Skip outfits", "Stop rigging the outfits from other FBXs; the body finishes."),
+                                 GUILayout.Width(90), GUILayout.Height(20)))
+                SkipRemainingOutfits();
             EditorGUILayout.EndHorizontal();
             EditorGUILayout.Space(2);
+        }
+
+        // ─── Automation (TestLab) ──────────────────────────────────────────────
+        // The test harness drives this window the way a person does: pick an avatar, wait for the
+        // checks, press Run, then tick until the state machine finishes. Every one of those steps is
+        // private, and Update() only runs while a window is on screen, so these thin wrappers are the
+        // whole seam. They change nothing by themselves — the dialogs are gated by ArfAutomation.Active
+        // and the settings by ArfPrefs.Sandbox, both of which a harness sets before opening the window.
+
+        internal void AutomationSelect(GameObject avatar)
+        {
+            _avatarObject = avatar;
+            OnAvatarChanged();
+            // OnGUI refreshes these every frame; headless there is no OnGUI, and Execute() refuses to
+            // run without _depAutoRigScript.
+            _depBlender                = File.Exists(ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, ""));
+            _depVRCFury                = HasVRCFury();
+            _autoRigScriptResolvedPath = ResolveAutoRigScriptPath();
+            _depAutoRigScript          = !string.IsNullOrEmpty(_autoRigScriptResolvedPath);
+        }
+
+        /// <summary>null when a run can start, otherwise what it is still waiting for.</summary>
+        internal string AutomationNotReady()
+        {
+            if (_avatarObject == null) return "no avatar selected";
+            if (!IsRootObject(_avatarObject)) return "the avatar is not a root object";
+            if (_sourceFbxAsset == null || !IsValidFbx(_sourceFbxAsset)) return "no source FBX";
+            if (_meshNames.Length == 0) return "the FBX has no meshes";
+            if (!File.Exists(ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, ""))) return "Blender not found";
+            if (!_depAutoRigScript) return "the paid AutoRig script was not found";
+            // Running before the foot-bone lists are read would measure a half-loaded window, which is
+            // the very bug the 1.3.2 retry loop exists for.
+            if (FootCandidatesPending) return "the foot-bone lists are still being read";
+            return null;
+        }
+
+        /// <summary>Settings a scenario flips after OnEnable has already read the prefs.</summary>
+        internal void AutomationSetOption(string option, bool value)
+        {
+            switch (option)
+            {
+                case "replaceMode":       _exportMode        = value ? ExportMode.Replace : ExportMode.Duplicate; break;
+                case "autoSwapMethod":    _autoSwapMethod    = value; break;
+                case "legacySwap":        _swapMethod        = value ? SwapMethod.Legacy : SwapMethod.Standard; break;
+                case "backupEnabled":     _backupEnabled     = value; break;
+                case "autoMapFeet":       _autoMapFeet       = value; break;
+                case "rigOnBestShape":    _rigOnBestShape    = value; break;
+                case "zeroFeetShapeKeys": _zeroFeetShapeKeys = value; break;
+                case "cleanForeignToes":  _cleanForeignToes  = value; break;
+                case "footHelper":        _footHelper        = value; break;
+                case "makeShrinkKeys":    _makeShrinkKeys    = value; break;
+                default: throw new ArgumentException("unknown option: " + option);
+            }
+        }
+
+        internal void AutomationRun() => Execute();
+        internal void AutomationResyncArmature() => ResyncArmatureManual();
+        internal List<string> AutomationTickedOutfits() => TickedOutfits();
+        internal string AutomationSourceFbx => AssetDatabase.GetAssetPath(_sourceFbxAsset);
+        internal string AutomationBodyMesh =>
+            _meshNames.Length > 0 ? _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)] : "";
+        internal void AutomationRestoreRig(string rigBackupJson) => RunRestore(rigBackupJson);
+        internal void AutomationRestoreBackup(ShuganBackups.AssetGroup group, ShuganBackups.Entry entry)
+            => RestoreBackup(group, entry);
+        internal void AutomationTick() => Update();
+        internal void AutomationResetDefaults() => ResetAdvancedSettings();
+
+        internal string AutomationState => _state.ToString();
+        internal bool   AutomationBusy  => _state != State.Idle && _state != State.Done && _state != State.Error;
+        internal bool   AutomationFailed => _state == State.Error;
+        internal ShuganTools.RunReport AutomationReport => _runReport;
+        internal GameObject AutomationResult => _resultInstance;
+        internal GameObject AutomationAvatar => _avatarObject;
+
+        /// <summary>What clicking an object in the Hierarchy does: the panel takes the avatar it belongs to.</summary>
+        internal void AutomationClick(GameObject go)
+        {
+            Selection.activeGameObject = go;
+            TryAdoptSelectedAvatar();
+        }
+
+        // ─── Armature re-sync ──────────────────────────────────────────────────
+        // Unity carries new bones into an avatar only while that avatar is still a prefab instance of the
+        // FBX. An unpacked avatar — or one unpacked and saved as a new prefab — keeps the old skeleton and
+        // its renderers stop matching the reimported mesh, at which point Unity quietly stops skinning them
+        // and the meshes disappear. Measured on the Moe base: 276 bones against 376 bind poses, with
+        // nothing at all in the console.
+
+        ArmatureSync.UnlinkedPrefab UnlinkedPrefabMode =>
+            _unlinkedPrefabSceneOnly ? ArmatureSync.UnlinkedPrefab.SceneOnly
+                                     : ArmatureSync.UnlinkedPrefab.PrefabAsset;
+
+        // Asked while the panel draws, so it is throttled and never throws: an avatar out of step with its
+        // FBX is invisible in Unity (no error, no warning — the meshes simply stop being drawn), which is
+        // precisely why the panel has to say it out loud.
+        double _armatureCheckedAt;
+        string _armatureProblem;
+
+        string ArmatureProblem()
+        {
+            if (_avatarObject == null || _sourceFbxAsset == null) return null;
+
+            double now = EditorApplication.timeSinceStartup;
+            if (now - _armatureCheckedAt < 0.5) return _armatureProblem;
+            _armatureCheckedAt = now;
+            _armatureProblem   = null;
+
+            try
+            {
+                string fbx = AssetDatabase.GetAssetPath(_sourceFbxAsset);
+                if (string.IsNullOrEmpty(fbx)) return null;
+
+                var check = ArmatureSync.ValidateOnly(_avatarObject, fbx);
+                if (check.unbound.Count > 0)
+                {
+                    _armatureProblem = check.unbound.Count + " mesh(es) no longer match the skeleton and will "
+                                     + "not render: " + string.Join("; ", check.unbound.Take(2))
+                                     + (check.unbound.Count > 2 ? "…" : "");
+                }
+                else
+                {
+                    int missing = ArmatureSync.CountMissingBones(_avatarObject, fbx);
+                    if (missing > 0)
+                        _armatureProblem = missing + " bone(s) the FBX has are missing from the avatar.";
+                }
+            }
+            catch { _armatureProblem = null; }
+
+            return _armatureProblem;
+        }
+
+        void CaptureArmatureBefore()
+        {
+            _armatureBefore = null;
+            _hasHumanBefore = false;
+            string fbx = AssetDatabase.GetAssetPath(_sourceFbxAsset);
+            if (string.IsNullOrEmpty(fbx)) return;
+
+            _armatureBefore = ArmatureSync.Capture(fbx);
+            if (AssetImporter.GetAtPath(fbx) is ModelImporter importer)
+            {
+                _humanBefore    = importer.humanDescription;
+                _hasHumanBefore = true;
+            }
+        }
+
+        /// <summary>Bring the scene avatar back in step with the FBX the run just rewrote.</summary>
+        void ResyncArmatureAfterRun(GameObject avatar, string fbxPath)
+        {
+            if (avatar == null || string.IsNullOrEmpty(fbxPath)) return;
+            try
+            {
+                var result = ArmatureSync.Sync(avatar, fbxPath, _armatureBefore, UnlinkedPrefabMode);
+                ReportArmatureResult(result);
+            }
+            catch (Exception e)
+            {
+                _runReport?.AddIssue("U_ARMATURE_RESYNC_FAILED", "warning",
+                    "The avatar in the scene could not be brought in step with the FBX: " + e.Message,
+                    "Duplicate mode builds a fresh copy instead of changing your avatar.");
+            }
+        }
+
+        void ReportArmatureResult(ArmatureSync.Result r)
+        {
+            if (_runReport == null || r == null) return;
+
+            if (r.error != null)
+                _runReport.AddIssue("U_ARMATURE_RESYNC_FAILED", "warning",
+                    "The avatar in the scene could not be checked against the FBX: " + r.error);
+            else if (r.Changed)
+                _runReport.AddIssue("U_ARMATURE_RESYNCED", "info",
+                    "The avatar in the scene was brought in step with the FBX: " + r.Summary() +
+                    (r.prefabAssetUpdated != null
+                        ? ". The prefab " + r.prefabAssetUpdated + " was updated too, so its other instances match."
+                        : "."),
+                    r.linked ? null : "Your avatar is not a prefab instance of its FBX, so the new bones were "
+                                    + "added to it directly.");
+
+            if (r.prefabAssetStale != null)
+                _runReport.AddIssue("U_ARMATURE_PREFAB_STALE", "warning",
+                    "The prefab " + r.prefabAssetStale + " still has the old skeleton, so its other instances "
+                    + "will not show the new bones.",
+                    "Select each of them and press Re-sync armature, or switch \"Unlinked prefab\" in "
+                    + "Advanced Settings back to updating the prefab itself.");
+
+            if (r.keptPoses.Count > 0)
+                _runReport.AddIssue("U_ARMATURE_POSE_KEPT", "info",
+                    r.keptPoses.Count + " bone(s) sit where your avatar had them rather than where the new "
+                    + "FBX puts them: " + string.Join(", ", r.keptPoses.Take(6))
+                    + (r.keptPoses.Count > 6 ? "…" : "") + ".",
+                    "Their rest pose in the avatar no longer matches the FBX's, so the run left them alone "
+                    + "instead of overwriting something you may have set on purpose.");
+
+            if (r.unbound.Count > 0)
+                _runReport.AddIssue("U_ARMATURE_BIND_MISMATCH", "fatal",
+                    "These meshes still do not match their skeleton, so they will not render: "
+                    + string.Join("; ", r.unbound.Take(6)) + (r.unbound.Count > 6 ? "…" : "") + ".",
+                    "Restore the FBX from the Backups tab, then rig with Duplicate mode instead.");
+        }
+
+        /// <summary>The panel button: fix an avatar whose FBX changed at some point in the past — an older
+        /// run, or a file someone replaced by hand.</summary>
+        internal void ResyncArmatureManual()
+        {
+            if (_avatarObject == null) { SetStatus("Select the avatar first.", MessageType.Warning); return; }
+            string fbx = AssetDatabase.GetAssetPath(_sourceFbxAsset);
+            if (string.IsNullOrEmpty(fbx)) { SetStatus("No source FBX for this avatar.", MessageType.Warning); return; }
+
+            bool fresh = _runReport == null;
+            if (fresh) _runReport = new ShuganTools.RunReport();
+
+            // No snapshot: nothing here knows what the FBX used to look like, so the sync only adds what the
+            // meshes need and only removes bones this tool owns.
+            var result = ArmatureSync.Sync(_avatarObject, fbx, null, UnlinkedPrefabMode);
+            ReportArmatureResult(result);
+            RepairHumanoidAfterSkeletonChange(fbx);
+
+            SetStatus(result.Ok
+                    ? "Armature re-synced with the FBX: " + result.Summary() + "."
+                    : "Re-sync could not fix every mesh: " + string.Join("; ", result.unbound.Take(3)),
+                result.Ok ? MessageType.Info : MessageType.Error);
+
+            RefreshRigState();
+            Repaint();
+        }
+
+        /// <summary>After a file was put back from the Backups tab: every avatar in the open scene that uses
+        /// it is now measuring itself against a different mesh, whether or not it was the selected one.</summary>
+        void ResyncSceneAvatarsUsing(string assetPath)
+        {
+            if (string.IsNullOrEmpty(assetPath) ||
+                !assetPath.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase)) return;
+
+            int fixedUp = 0;
+            var before = _armatureBefore != null &&
+                         string.Equals(_armatureBefore.fbxPath, assetPath, StringComparison.OrdinalIgnoreCase)
+                ? _armatureBefore : null;
+
+            foreach (var root in OtherOpenSceneUsers(assetPath, null))
+            {
+                var result = ArmatureSync.Sync(root, assetPath, before, UnlinkedPrefabMode);
+                ReportArmatureResult(result);
+                if (result.Changed) fixedUp++;
+            }
+            if (fixedUp > 0)
+                UnityEngine.Debug.Log($"[AutoRig Feet Distributor] Re-synced {fixedUp} avatar(s) in the scene "
+                                      + "with the restored FBX.");
+        }
+
+        void RepairHumanoidAfterSkeletonChange(string fbxPath)
+        {
+            try
+            {
+                string note = HumanoidRigMapping.RepairAfterSkeletonChange(
+                    fbxPath, _hasHumanBefore, _humanBefore);
+                if (!string.IsNullOrEmpty(note))
+                    _runReport?.AddIssue("U_HUMANOID_REPAIRED", "info", note);
+            }
+            catch (Exception e)
+            {
+                _runReport?.AddIssue("U_HUMANOID_MAP", "warning",
+                    "The humanoid mapping could not be checked after the skeleton changed: " + e.Message);
+            }
         }
 
         // ─── Execute ───────────────────────────────────────────────────────────
 
         void Execute()
         {
-            string blenderPath = EditorPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
+            string blenderPath = ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
             if (!File.Exists(blenderPath))
             {
                 SetStatus("Blender not found — set its path in Advanced Settings.", MessageType.Error);
@@ -3763,6 +4794,17 @@ namespace ZeroShugan.ShuganUnityTools
             }
 
             _exportPath = ComputeExportPath();
+            // Replace: Blender writes a temp file, which only goes over the source once it is complete and checked.
+            _blenderExportPath = _exportMode == ExportMode.Replace ? NewTempExport("body") : _exportPath;
+            if (_exportMode == ExportMode.Replace)
+            {
+                string notWritable = FbxNotWritable(_exportPath);
+                if (notWritable != null)
+                {
+                    SetStatus("The FBX can't be overwritten: " + notWritable + ". Nothing was changed.", MessageType.Error);
+                    return;
+                }
+            }
             string targetMesh = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
 
             // ── Unity-side pre-flight (cheap; the Python pre-flight remains source of truth) ──
@@ -3798,13 +4840,14 @@ namespace ZeroShugan.ShuganUnityTools
 
             // RE-RIG: the source FBX already carries a rig, so this run will replace it. Ask how to
             // treat the existing foot weights before anything is written.
-            if (!ConfirmReRigStrategy(out _rerigRestoreJson, out _rerigSkipFootReduction)) return;
+            if (!ConfirmReRigStrategy(out _rerigRestoreJson, out _rerigSkipFootReduction, out _rerigProtect)) return;
 
             // FOOT SHAPE: which shape the rig is built on, what the toggle sets afterwards, and the
             // shape-key values the result must get back. Measured here if the background check hasn't
             // finished yet (a second or two at most).
             _rigShapeJson       = null;
             _plannedToggleRows  = null;
+            _plannedShrinkKeys  = null;
             _blendShapeSnapshot = null;
             if (_rigOnBestShape)
             {
@@ -3813,9 +4856,14 @@ namespace ZeroShugan.ShuganUnityTools
                 {
                     _plannedToggleRows = IncludedFootShapeRows(fit);
                     _rigShapeJson      = RigShapeJson(_plannedToggleRows);
+                    _plannedShrinkKeys = IncludedShrinkKeys(fit);
                 }
                 _blendShapeSnapshot = BlendShapeWeightSnapshot.Capture(_avatarObject);
             }
+
+            // What the FBX looks like BEFORE Blender rewrites it. The re-sync afterwards needs this to tell
+            // a bone the FILE moved from one the USER moved, and to know which bones the run removed.
+            CaptureArmatureBefore();
 
             BackupScene();
             BackupOriginalFbx();
@@ -3829,7 +4877,7 @@ namespace ZeroShugan.ShuganUnityTools
 
             // Garment meshes to also select in Blender (body's toe + foot weights get transferred to
             // them). Drop blanks, the body itself, and duplicates.
-            string[] garmentNames = _garmentMeshNames
+            string[] garmentNames = TickedOutfits()
                 .Where(g => !string.IsNullOrEmpty(g) &&
                             !string.Equals(g, targetMesh, StringComparison.OrdinalIgnoreCase))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -3870,16 +4918,33 @@ namespace ZeroShugan.ShuganUnityTools
             _runReport         = new ShuganTools.RunReport();
             _runStartTicksUtc  = DateTime.UtcNow.Ticks;
 
+            // Outfits from other FBXs (experimental): one Blender run each after the body. Null when none is ticked,
+            // and the body run is then exactly what it was.
+            RecordBeginRun("rig");
+            if (_recRun != null)
+            {
+                _recRun.toggleRows = (_plannedToggleRows ?? new List<FootShapeFit.ToggleRow>())
+                    .Select(r => r.key + "=" + r.value.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToList();
+                _recRun.shrinkKeys = new List<string>(_plannedShrinkKeys ?? new List<string>());
+                _rec?.Save();
+            }
+            string outfitBlendPath = PrepareExternalOutfits(DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+
             string sourceFbxAbs = ToAbsPath(AssetDatabase.GetAssetPath(_sourceFbxAsset));
             string pythonCode   = BlenderBridge.BuildAutoRigFeetScript(
-                sourceFbxAbs, targetMesh, _exportPath, scriptPath,
+                sourceFbxAbs, targetMesh, _blenderExportPath, scriptPath,
                 headless: true, stepDelay: 0f, garmentNames: garmentNames,
                 backupJsonPath: backupJsonPath,
                 footBoneL: _footOverrideL, footBoneR: _footOverrideR,
                 rerigRestoreJsonPath: _rerigRestoreJson,
                 skipFootReduction: _rerigSkipFootReduction,
                 rigShapeJson: _rigShapeJson,
-                cleanToeBonesJson: _cleanToeBonesJson);
+                cleanToeBonesJson: _cleanToeBonesJson,
+                footHelper: _footHelper,
+                backupSearchPrefix: BackupSearchPrefix(),
+                rerigProtect: _rerigProtect,
+                outfitBlendPath: outfitBlendPath,
+                shrinkKeys: MakeShrinkKeysNow);
 
             // Archive the wrapper that actually ran. It goes to a fixed temp filename and is
             // overwritten by the next run, so without this the exact python behind a failure is
@@ -3974,6 +5039,7 @@ namespace ZeroShugan.ShuganUnityTools
                     oldFbxToReplace:    _sourceFbxAsset,
                     outputFolder:       outFolder,
                     instantiateInScene: false);
+                if (_recRun != null) { _recRun.createdPrefab = _createdPrefabPath; _rec?.Save(); }
             }
             finally
             {
@@ -4073,6 +5139,7 @@ namespace ZeroShugan.ShuganUnityTools
                 var child = (GameObject)PrefabUtility.InstantiatePrefab(
                     prefabRef, _resultInstance.transform);
                 Undo.RegisterCreatedObjectUndo(child, "AutoRig Feet — Add Prefab");
+                RecordAdded(child);
             }
             Selection.activeGameObject = _resultInstance;
         }
@@ -4256,8 +5323,11 @@ namespace ZeroShugan.ShuganUnityTools
             _state            = State.Idle;
             _displayProgress  = 0f;
             _currentStepLabel = "";
-            SetStatus("Cancelled — nothing was changed (the FBX is only written at the very end "
-                      + "of the Blender step).", MessageType.Info);
+            SyncRecordStage();
+            SyncReloadLock();
+            CleanOutfitTemp(keep: false);
+            SetStatus("Cancelled — nothing was changed (the FBX is only written once Blender has finished "
+                      + "and the file is complete).", MessageType.Info);
         }
 
         // ─── Blender result evaluation (exit code + typed report + fresh-FBX check) ──
@@ -4295,8 +5365,8 @@ namespace ZeroShugan.ShuganUnityTools
             // launch time (small tolerance for filesystem timestamp granularity). The restore
             // overwrites the source FBX; the rig run writes _exportPath.
             string expected = isRestore
-                ? ToAbsPath(AssetDatabase.GetAssetPath(_sourceFbxAsset))
-                : _exportPath;
+                ? (_restoreTempExport ?? ToAbsPath(AssetDatabase.GetAssetPath(_sourceFbxAsset)))
+                : (_blenderExportPath ?? _exportPath);
             try
             {
                 bool fresh = File.Exists(expected) &&
@@ -4374,7 +5444,7 @@ namespace ZeroShugan.ShuganUnityTools
                     File.WriteAllText(path, json);
                     string guid = AssetDatabase.AssetPathToGUID(fbxPath);
                     if (!string.IsNullOrEmpty(guid))
-                        EditorPrefs.SetString(PrefLastReportPrefix + guid, path);
+                        ArfPrefs.SetString(PrefLastReportPrefix + guid, path);
                 }
             }
             catch { /* persistence is best-effort — the in-memory report still shows */ }
@@ -4415,7 +5485,7 @@ namespace ZeroShugan.ShuganUnityTools
                 if (_runReport != null && _runReport.issues.Count > 0) return;
                 string guid = AssetDatabase.AssetPathToGUID(AssetDatabase.GetAssetPath(_sourceFbxAsset));
                 if (string.IsNullOrEmpty(guid)) return;
-                string path = EditorPrefs.GetString(PrefLastReportPrefix + guid, "");
+                string path = ArfPrefs.GetString(PrefLastReportPrefix + guid, "");
                 if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
                 var rep = JsonUtility.FromJson<ShuganTools.RunReport>(File.ReadAllText(path));
                 if (rep != null && rep.issues != null) _runReport = rep;
@@ -4498,7 +5568,7 @@ namespace ZeroShugan.ShuganUnityTools
                         {
                             string guid = AssetDatabase.AssetPathToGUID(
                                 AssetDatabase.GetAssetPath(_sourceFbxAsset));
-                            EditorPrefs.DeleteKey(PrefLastReportPrefix + guid);
+                            ArfPrefs.DeleteKey(PrefLastReportPrefix + guid);
                         }
                     }
                     catch { }
@@ -4617,7 +5687,7 @@ namespace ZeroShugan.ShuganUnityTools
         {
             try
             {
-                string blenderPath = EditorPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
+                string blenderPath = ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, "");
                 var e = new List<KeyValuePair<string, string>>
                 {
                     new KeyValuePair<string, string>("runKind",        kind),
@@ -4640,14 +5710,14 @@ namespace ZeroShugan.ShuganUnityTools
                     new KeyValuePair<string, string>("footOverrideL",  string.IsNullOrEmpty(_footOverrideL) ? "(auto)" : _footOverrideL),
                     new KeyValuePair<string, string>("footOverrideR",  string.IsNullOrEmpty(_footOverrideR) ? "(auto)" : _footOverrideR),
                     new KeyValuePair<string, string>("targetMesh",     CurrentMeshName()),
-                    new KeyValuePair<string, string>("garments",       string.Join(", ", _garmentMeshNames.ToArray())),
+                    new KeyValuePair<string, string>("garments",       string.Join(", ", TickedOutfits().ToArray())),
                     new KeyValuePair<string, string>("alreadyRigged",  _alreadyRigged.ToString()),
                     new KeyValuePair<string, string>("riggedWithScript",
                         string.IsNullOrEmpty(_riggedVersion) ? "(unknown / pre-3.9.0)" : _riggedVersion),
                     // Which re-rig strategy the user picked, so a bug report explains why the foot
                     // weights look the way they do.
                     new KeyValuePair<string, string>("rerigStrategy",
-                        !string.IsNullOrEmpty(_rerigRestoreJson) ? "restore original weights first"
+                        _rerigProtect == true && !_rerigSkipFootReduction ? "restore original weights first"
                         : _rerigSkipFootReduction               ? "keep current weights (no backup to restore)"
                         : _alreadyRigged                        ? "re-apply as-is (weights reduced again)"
                         : "n/a (first rig)"),
@@ -4664,7 +5734,7 @@ namespace ZeroShugan.ShuganUnityTools
                 var extras = new AutoRigAvatarSnapshot.Extras
                 {
                     bodyMeshName     = CurrentMeshName(),
-                    garmentMeshNames = new List<string>(_garmentMeshNames),
+                    garmentMeshNames = new List<string>(TickedOutfits()),
                 };
                 extras.shapeKeyFindings = CollectShapeKeyFindings();
 
@@ -4683,7 +5753,7 @@ namespace ZeroShugan.ShuganUnityTools
         {
             var findings = new List<string>();
             var meshes   = new List<string> { CurrentMeshName() };
-            meshes.AddRange(_garmentMeshNames);
+            meshes.AddRange(TickedOutfits());
 
             foreach (string mn in meshes)
             {
@@ -4731,6 +5801,8 @@ namespace ZeroShugan.ShuganUnityTools
         {
             // Ticks and added rows in the lists belong to the avatar they were made on.
             _fitRowFlipped.Clear();
+            _shrinkRowFlipped.Clear();
+            _originalPlan = null;
             _foreignToeUnticked.Clear();
             _foreignToeAdded.Clear();
             RefreshRigState();
@@ -4774,6 +5846,7 @@ namespace ZeroShugan.ShuganUnityTools
         // Chosen in ConfirmReRigStrategy, consumed when building the Blender script.
         string _rerigRestoreJson;
         bool   _rerigSkipFootReduction;
+        bool?  _rerigProtect;
 
         /// <summary>
         /// The OLDEST rig backup for the source FBX, or null when there is none.
@@ -4808,15 +5881,18 @@ namespace ZeroShugan.ShuganUnityTools
         /// avatar (re-apply after a script update). The user gets to decide, with the consequence
         /// spelled out, rather than finding out three re-rigs later.
         /// </summary>
-        bool ConfirmReRigStrategy(out string restoreJson, out bool skipFootReduction)
+        bool ConfirmReRigStrategy(out string restoreJson, out bool skipFootReduction, out bool? protect)
         {
             restoreJson       = null;
             skipFootReduction = false;
+            protect           = null;
 
             if (!SourceFbxIsRigged()) return true;   // normal first rig — nothing to ask
 
+            // The backup inside the FBX (script 3.16.0+) comes first; a JSON file in _Backups is the fallback.
             string backup    = OldestRigBackup();
-            bool   hasBackup = !string.IsNullOrEmpty(backup);
+            bool   inFbx     = SourceFbxHasWeightBackup();
+            bool   hasBackup = inFbx || !string.IsNullOrEmpty(backup);
             string riggedVer = GetRiggedScriptVersion(_avatarObject)
                                ?? GetRiggedScriptVersion(_sourceFbxAsset);
 
@@ -4829,8 +5905,9 @@ namespace ZeroShugan.ShuganUnityTools
 
             string protectLabel = hasBackup ? "Protect my weights" : "Keep current weights";
             string protectHow = hasBackup
-                ? "PROTECT: restores the original foot weights from your backup first, then rigs.\n"
-                  + "    " + Path.GetFileName(backup) + "\n"
+                ? "PROTECT: restores the original weights of the body and the outfits from your backup "
+                  + "first, then rigs.\n"
+                  + "    " + (inFbx ? "the backup stored inside the FBX" : Path.GetFileName(backup)) + "\n"
                   + "    Result: the new rig is built from the un-rigged mesh, exactly like the "
                   + "first time.\n\n"
                 : "KEEP: no backup was found for this FBX, so the original weights can't be "
@@ -4838,7 +5915,8 @@ namespace ZeroShugan.ShuganUnityTools
                   + "further. The toe bones and their weights are still fully rebuilt; only the "
                   + "foot/toe blend keeps the earlier run's shaping.\n\n";
 
-            int choice = EditorUtility.DisplayDialogComplex(
+            int choice = ArfAutomation.Choose(
+                ArfAutomation.AskRerigStrategy,
                 "Re-apply AutoRig Feet?",
                 head + protectHow
                      + "RE-APPLY AS-IS: rigs without protecting anything. The foot weights are "
@@ -4849,9 +5927,10 @@ namespace ZeroShugan.ShuganUnityTools
 
             if (choice == 1) return false;
 
+            protect = choice == 0;
             if (choice == 0)
             {
-                if (hasBackup) restoreJson = backup;
+                if (hasBackup) restoreJson = backup;   // null when only the FBX holds one
                 else           skipFootReduction = true;
             }
             return true;
@@ -4902,10 +5981,10 @@ namespace ZeroShugan.ShuganUnityTools
             {
                 _sourceFbxAsset  = AssetDatabase.LoadAssetAtPath<GameObject>(path);
                 _fbxAutoDetected = true;
-                EditorPrefs.SetString(PrefFbxPath, path);
+                ArfPrefs.SetString(PrefFbxPath, path);
                 RefreshMeshNames();
                 _selectedMeshIndex = GuessBodyMeshIndex();
-                EditorPrefs.SetInt(PrefMeshIndex, _selectedMeshIndex);
+                ArfPrefs.SetInt(PrefMeshIndex, _selectedMeshIndex);
             }
             else
             {
@@ -5206,7 +6285,7 @@ namespace ZeroShugan.ShuganUnityTools
             string shownName = string.IsNullOrEmpty(result) ? top : result;
             var curBone = FindAvatarBone(shownName);
             var pickedBone = (Transform)EditorGUILayout.ObjectField(
-                curBone, typeof(Transform), true, GUILayout.Width(150));
+                curBone, typeof(Transform), true, GUILayout.Width(RefFieldWidth));
             if (pickedBone != curBone && pickedBone != null)
                 result = pickedBone.name;
             EditorGUILayout.EndHorizontal();
@@ -5265,7 +6344,8 @@ namespace ZeroShugan.ShuganUnityTools
             }
             if (uncertain.Count == 0) return true;
 
-            return EditorUtility.DisplayDialog(
+            return ArfAutomation.Confirm(
+                ArfAutomation.AskFootBonesUncertain,
                 "Foot bones uncertain",
                 "I'm not sure these are the foot bones (their names don't contain 'foot'/'ankle'):\n\n  "
                 + string.Join("\n  ", uncertain) +
@@ -5309,6 +6389,26 @@ namespace ZeroShugan.ShuganUnityTools
         static bool IsRootObject(GameObject go)
             => go != null && go.transform.parent == null;
 
+        // Width of the fields that show a scene object next to a dropdown, wide enough for long mesh and
+        // bone names.
+        const float RefFieldWidth = 210f;
+        const float GarmentRefWidth = 182f;
+
+        /// <summary>
+        /// The avatar a clicked object belongs to, so selecting a mesh or a bone deep in the hierarchy picks
+        /// the whole avatar. The outermost object carrying an avatar descriptor wins (found by type name:
+        /// this tool doesn't need the VRChat SDK); without one, the top of the hierarchy.
+        /// </summary>
+        static GameObject ResolveAvatarRoot(GameObject go)
+        {
+            if (go == null || !go.scene.IsValid()) return go;
+            GameObject withDescriptor = null;
+            for (var t = go.transform; t != null; t = t.parent)
+                foreach (var c in t.GetComponents<Component>())
+                    if (c != null && c.GetType().Name == "VRCAvatarDescriptor") { withDescriptor = t.gameObject; break; }
+            return withDescriptor != null ? withDescriptor : go.transform.root.gameObject;
+        }
+
         static bool ChildNameExists(GameObject parent, string childName)
         {
             foreach (Transform t in parent.transform)
@@ -5324,7 +6424,7 @@ namespace ZeroShugan.ShuganUnityTools
             string found = FindBlenderExe();
             if (found != null)
             {
-                EditorPrefs.SetString(BlenderBridge.PrefBlenderPath, found);
+                ArfPrefs.SetString(BlenderBridge.PrefBlenderPath, found);
                 if (!silent) SetStatus("Blender auto-detected: " + found, MessageType.Info);
                 Repaint();
             }
@@ -5422,7 +6522,7 @@ namespace ZeroShugan.ShuganUnityTools
         {
             string picked = EditorUtility.OpenFilePanel("Select blender.exe", "", "exe");
             if (string.IsNullOrEmpty(picked)) return;
-            EditorPrefs.SetString(BlenderBridge.PrefBlenderPath, picked.Replace("/", "\\"));
+            ArfPrefs.SetString(BlenderBridge.PrefBlenderPath, picked.Replace("/", "\\"));
             Repaint();
         }
 
@@ -5443,7 +6543,7 @@ namespace ZeroShugan.ShuganUnityTools
         //   3. null if neither exists
         string ResolveAutoRigScriptPath()
         {
-            string overridePath = EditorPrefs.GetString(PrefAutoRigScriptPath, "");
+            string overridePath = ArfPrefs.GetString(PrefAutoRigScriptPath, "");
             if (!string.IsNullOrEmpty(overridePath) && File.Exists(overridePath))
                 return overridePath;
 
@@ -5461,7 +6561,7 @@ namespace ZeroShugan.ShuganUnityTools
                 : Application.dataPath;
             string picked = EditorUtility.OpenFilePanel("Select AutoRig_Feet.py", start, "py");
             if (string.IsNullOrEmpty(picked)) return;
-            EditorPrefs.SetString(PrefAutoRigScriptPath, picked.Replace("/", "\\"));
+            ArfPrefs.SetString(PrefAutoRigScriptPath, picked.Replace("/", "\\"));
             Repaint();
         }
 
@@ -5542,6 +6642,7 @@ namespace ZeroShugan.ShuganUnityTools
 
         void BackupOriginalFbx()
         {
+            _lastFbxBackup = null;
             string srcAbs    = ToAbsPath(AssetDatabase.GetAssetPath(_sourceFbxAsset));
 
             // Only back up a file we are actually about to overwrite.
@@ -5575,6 +6676,7 @@ namespace ZeroShugan.ShuganUnityTools
             // fresh-guid .meta copy (a verbatim .meta duplicates the original's guid and Unity then
             // logs a GUID conflict on every import, forever).
             string dest = ShuganBackups.BackupAsset(AssetDatabase.GetAssetPath(_sourceFbxAsset));
+            _lastFbxBackup = dest;
             if (dest != null)
                 UnityEngine.Debug.Log($"[AutoRig Feet Distributor] Backup: {dest}");
         }
@@ -5645,7 +6747,7 @@ namespace ZeroShugan.ShuganUnityTools
             if (!IsRootObject(_avatarObject)) return false;
             if (_sourceFbxAsset == null || !IsValidFbx(_sourceFbxAsset)) return false;
             if (_meshNames.Length == 0) return false;
-            if (!File.Exists(EditorPrefs.GetString(BlenderBridge.PrefBlenderPath, ""))) return false;
+            if (!File.Exists(ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, ""))) return false;
             if (!_depAutoRigScript) return false;
             return true;
         }
@@ -5658,6 +6760,8 @@ namespace ZeroShugan.ShuganUnityTools
                 case State.FBXSwapping:   return "Swapping FBX…";
                 case State.AddingPrefabs: return "Adding Prefabs…";
                 case State.Restoring:     return "Restoring…";
+                case State.OutfitsRunning:   return "Rigging outfits…";
+                case State.OutfitsRestoring: return "Restoring outfits…";
                 default:                  return "Working…";
             }
         }
@@ -5676,7 +6780,7 @@ namespace ZeroShugan.ShuganUnityTools
                     "FBX not detected. Expand Advanced Settings → Source FBX.", MessageType.Warning);
             else if (_meshNames.Length == 0)
                 EditorGUILayout.HelpBox("No meshes found in the FBX.", MessageType.Warning);
-            else if (!File.Exists(EditorPrefs.GetString(BlenderBridge.PrefBlenderPath, "")))
+            else if (!File.Exists(ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, "")))
                 EditorGUILayout.HelpBox(
                     "Blender not found — expand Advanced Settings to configure or auto-detect it.",
                     MessageType.Warning);
@@ -5694,7 +6798,7 @@ namespace ZeroShugan.ShuganUnityTools
             string picked = EditorUtility.OpenFolderPanel("Select Export Folder", start, "");
             if (string.IsNullOrEmpty(picked)) return;
             _exportFolder = picked.Replace("/", "\\");
-            EditorPrefs.SetString(PrefExportFolder, _exportFolder);
+            ArfPrefs.SetString(PrefExportFolder, _exportFolder);
             Repaint();
         }
 
@@ -5711,6 +6815,7 @@ namespace ZeroShugan.ShuganUnityTools
         {
             SetStatus(msg, MessageType.Error);
             _state = State.Error;
+            SyncRecordStage();
             UnityEngine.Debug.LogError("[AutoRig Feet Distributor] " + msg);
 
             // A run that had started logging must not end with an open log and no report. This

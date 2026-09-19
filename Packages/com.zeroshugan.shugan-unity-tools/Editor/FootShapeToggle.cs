@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -30,7 +31,43 @@ namespace ZeroShugan.ShuganUnityTools
     public static class FootShapeToggle
     {
         public const string ObjectName = "ARF Foot Shape (keep last)";
-        public const string MenuPath   = "Animation/Feet/Foot Shape";
+        public const string MenuPath   = "Animation/Feet/Fix/Foot Shape";
+
+        // Foot Shrink: one toggle per shrink key that works on the feet (the creator's key that flattens the skin
+        // under shoes or socks), each in its own menu entry. They sit just above the Foot Shape toggle.
+        public const string ShrinkObjectPrefix = "ARF Foot Shrink ";
+        public const string ShrinkMenuPrefix   = "Animation/Feet/Fix/Foot Shrink ";
+        public static string ShrinkObjectName(string key) => ShrinkObjectNameFor(ShrinkLabel(key));
+        public static string ShrinkMenuPath(string key)   => ShrinkMenuPathFor(ShrinkLabel(key));
+        public static string ShrinkObjectNameFor(string label) => ShrinkObjectPrefix + label + " (keep last)";
+        public static string ShrinkMenuPathFor(string label)   => ShrinkMenuPrefix + label;
+
+        /// <summary>One menu name per key, all different. "ARF Shrink Foot" wants to be called "Foot", and so
+        /// does a creator key actually named "Foot" — two toggles on one object would lose one of the keys, so
+        /// the second one keeps its own name.</summary>
+        public static List<(string key, string label)> ShrinkLabels(IEnumerable<string> keys)
+        {
+            var used = new HashSet<string>(StringComparer.Ordinal);
+            var list = new List<(string, string)>();
+            foreach (string key in keys)
+            {
+                string label = ShrinkLabel(key);
+                if (!used.Add(label))
+                {
+                    label = key;
+                    for (int i = 2; !used.Add(label); i++) label = key + " " + i;
+                }
+                list.Add((key, label));
+            }
+            return list;
+        }
+
+        /// <summary>What a shrink key is called in the menu. The keys AutoRig Feet builds are already named
+        /// "ARF Shrink Toes", and "Foot Shrink ARF Shrink Toes" reads badly, so that part is dropped.</summary>
+        public static string ShrinkLabel(string key) =>
+            key != null && key.StartsWith(FootShapeFit.OwnShrinkPrefix, StringComparison.Ordinal)
+                ? key.Substring(FootShapeFit.OwnShrinkPrefix.Length) : key;
+        static bool IsShrinkObject(string name) => name.StartsWith(ShrinkObjectPrefix, StringComparison.Ordinal);
 
         const string UndoName    = "AutoRig Feet: foot-shape toggle";
         const string ApiTypeName = "com.vrcfury.api.FuryComponents";
@@ -63,44 +100,88 @@ namespace ZeroShugan.ShuganUnityTools
 
         // Direct children only: the toggle is always created right under the root, and a deeper
         // match would be some other object that merely shares the name.
-        public static Transform Find(GameObject avatarRoot)
+        public static Transform Find(GameObject avatarRoot) => Find(avatarRoot, ObjectName);
+
+        public static Transform Find(GameObject avatarRoot, string objectName)
         {
             if (avatarRoot == null) return null;
             var root = avatarRoot.transform;
             for (int i = 0; i < root.childCount; i++)
             {
                 var child = root.GetChild(i);
-                if (child.name == ObjectName) return child;
+                if (child.name == objectName) return child;
             }
             return null;
         }
 
+        /// <summary>The Foot Shrink toggle objects directly under the avatar.</summary>
+        public static List<Transform> FindShrink(GameObject avatarRoot)
+        {
+            var list = new List<Transform>();
+            if (avatarRoot == null) return list;
+            foreach (Transform child in avatarRoot.transform)
+                if (IsShrinkObject(child.name)) list.Add(child);
+            return list;
+        }
+
+        /// <summary>Every AutoRig Feet toggle object under the avatar (Foot Shrink ones, then Foot Shape).</summary>
+        public static List<Transform> FindAll(GameObject avatarRoot)
+        {
+            var list = FindShrink(avatarRoot);
+            var shape = Find(avatarRoot);
+            if (shape != null) list.Add(shape);
+            return list;
+        }
+
+        /// <summary>True when the AutoRig Feet toggles are the last objects under the avatar, Foot Shape the very
+        /// last. VRCFury gives each toggle its own layer in hierarchy order, and a later one animating the same shape
+        /// key wins.</summary>
         public static bool IsLastChild(GameObject avatarRoot)
         {
-            var t = Find(avatarRoot);
-            return t != null && t.GetSiblingIndex() == avatarRoot.transform.childCount - 1;
+            var all = FindAll(avatarRoot);
+            if (all.Count == 0) return false;
+            int count = avatarRoot.transform.childCount;
+            var shape = Find(avatarRoot);
+            if (shape != null && shape.GetSiblingIndex() != count - 1) return false;
+            return all.All(t => t.GetSiblingIndex() >= count - all.Count);
         }
 
         public static void MoveToBottom(GameObject avatarRoot)
         {
-            var t = Find(avatarRoot);
-            if (t == null) return;
+            var all = FindAll(avatarRoot);
+            if (all.Count == 0) return;
             Undo.RegisterChildrenOrderUndo(avatarRoot.transform, UndoName);
-            t.SetAsLastSibling();
+            foreach (var t in all) t.SetAsLastSibling();      // shrink toggles first, Foot Shape last
             MarkDirty(avatarRoot);
         }
 
-        public static bool Remove(GameObject avatarRoot)
+        public static bool Remove(GameObject avatarRoot) => Remove(avatarRoot, ObjectName);
+
+        public static bool Remove(GameObject avatarRoot, string objectName)
         {
-            var t = Find(avatarRoot);
+            var t = Find(avatarRoot, objectName);
             if (t == null) return false;
             Undo.DestroyObjectImmediate(t.gameObject);
             MarkDirty(avatarRoot);
             return true;
         }
 
+        /// <summary>Remove every Foot Shrink toggle object. Returns how many.</summary>
+        public static int RemoveAllShrink(GameObject avatarRoot)
+        {
+            var list = FindShrink(avatarRoot);
+            foreach (var t in list) Undo.DestroyObjectImmediate(t.gameObject);
+            if (list.Count > 0) MarkDirty(avatarRoot);
+            return list.Count;
+        }
+
         // Builds the toggle, replacing any earlier one. Values use VRCFury's 0-100 scale.
         public static GameObject CreateOrUpdate(GameObject avatarRoot,
+                                                IList<(string key, float value)> actions,
+                                                out string error)
+            => CreateOrUpdate(avatarRoot, ObjectName, MenuPath, actions, out error);
+
+        public static GameObject CreateOrUpdate(GameObject avatarRoot, string objectName, string menuPath,
                                                 IList<(string key, float value)> actions,
                                                 out string error)
         {
@@ -128,10 +209,10 @@ namespace ZeroShugan.ShuganUnityTools
 
             // Rebuilt rather than edited: VRCFury's model types are internal, so an existing toggle
             // cannot be read or changed from here. Destroying through Undo keeps a re-run reversible.
-            var old = Find(avatarRoot);
+            var old = Find(avatarRoot, objectName);
             if (old != null) Undo.DestroyObjectImmediate(old.gameObject);
 
-            var go = new GameObject(ObjectName);
+            var go = new GameObject(objectName);
             go.transform.SetParent(avatarRoot.transform, false);
             go.transform.SetAsLastSibling();
 
@@ -140,7 +221,7 @@ namespace ZeroShugan.ShuganUnityTools
                 object toggle = createToggle.Invoke(null, new object[] { go });
                 if (toggle == null) throw new Exception("CreateToggle returned nothing.");
 
-                Call(toggle, "SetMenuPath", new[] { typeof(string) }, new object[] { MenuPath });
+                Call(toggle, "SetMenuPath", new[] { typeof(string) }, new object[] { menuPath });
 
                 object set = Call(toggle, "GetActions", Type.EmptyTypes, new object[0]);
                 if (set == null) throw new Exception("GetActions returned nothing.");

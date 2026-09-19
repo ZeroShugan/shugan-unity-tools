@@ -165,11 +165,15 @@ namespace ZeroShugan.ShuganUnityTools
             {
                 int frames = mesh.GetBlendShapeFrameCount(i);
                 if (frames == 0) continue;
+                if (FootShapeFit.IsOwnShrinkKey(mesh.GetBlendShapeName(i))) continue;   // ours, from an earlier run
                 mesh.GetBlendShapeFrameVertices(i, frames - 1, dv, null, null);
                 float foot2 = 0f, all2 = 0f, far2 = 0f;
+                float moved2 = (1e-3f * scale) * (1e-3f * scale);
+                int movedAll = 0, movedNear = 0;
                 for (int v = 0; v < n; v++)
                 {
                     float m2 = dv[v].sqrMagnitude;
+                    if (m2 > moved2) { movedAll++; if (near[v]) movedNear++; }
                     if (m2 > all2) all2 = m2;
                     if (near[v] && m2 > foot2) foot2 = m2;
                     if (m2 > far2 && Vector3.Dot(verts[v], up) > farAbove) far2 = m2;
@@ -185,7 +189,10 @@ namespace ZeroShugan.ShuganUnityTools
                     allMove     = Mathf.Sqrt(all2),
                     farMove     = Mathf.Sqrt(far2),
                 };
-                info.kind = info.allMove > HideFactor * scale ? KeyKind.Hide
+                info.collapsedShare = CollapsedAreaShare(verts, tri, dv);
+                info.footShare = movedAll > 0 ? movedNear / (float)movedAll : 0f;
+                info.kind = info.collapsedShare >= CollapsedShare ? KeyKind.Shrink
+                          : info.allMove > HideFactor * scale ? KeyKind.Hide
                           : info.farMove > MaxFarRatio * footMove ? KeyKind.BodyShape
                           : KeyKind.Candidate;
                 // Kept for every key that touches the feet, not only the switched-on ones: a later change
@@ -225,6 +232,28 @@ namespace ZeroShugan.ShuganUnityTools
                 best = Mathf.Max(best, Mathf.Max(size.x, Mathf.Max(size.y, size.z)));
             }
             return best;
+        }
+
+        // Of the faces the key moves (every corner moves), the share of their Basis area that ends up below
+        // CollapsedFaceArea of its size: pulled onto a point or a line. Shrink keys collapse most of what they
+        // touch; a foot pose or a heel key only bends it.
+        static float CollapsedAreaShare(Vector3[] verts, int[] tri, Vector3[] delta)
+        {
+            const float moved2 = 1e-10f;   // (0.01 mm)^2
+            double movedArea = 0, collapsedArea = 0;
+            for (int t = 0; t + 2 < tri.Length; t += 3)
+            {
+                int a = tri[t], b = tri[t + 1], c = tri[t + 2];
+                if (delta[a].sqrMagnitude <= moved2 || delta[b].sqrMagnitude <= moved2 || delta[c].sqrMagnitude <= moved2)
+                    continue;
+                float before = Vector3.Cross(verts[b] - verts[a], verts[c] - verts[a]).magnitude;
+                if (before <= 0f) continue;
+                Vector3 pa = verts[a] + delta[a], pb = verts[b] + delta[b], pc = verts[c] + delta[c];
+                float after = Vector3.Cross(pb - pa, pc - pa).magnitude;
+                movedArea += before;
+                if (after < CollapsedFaceArea * before) collapsedArea += before;
+            }
+            return movedArea > 0 ? (float)(collapsedArea / movedArea) : 0f;
         }
 
         static void MarkWeighted(Transform[] bones, int index, HashSet<Transform> weighted)

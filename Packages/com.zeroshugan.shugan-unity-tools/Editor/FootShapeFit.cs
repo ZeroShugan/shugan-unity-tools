@@ -25,6 +25,21 @@ namespace ZeroShugan.ShuganUnityTools
         public const float MinKeyMove    = 0.02f;   // moves the feet by at least this x foot length
         public const float HideFactor    = 1.5f;    // moves any vertex more than this x foot length = hides geometry
         public const float MaxFarRatio   = 0.25f;   // moves the upper leg or body more than this x its foot move
+        // Shrink keys: creators flatten the skin under an outfit so it can't poke through. Geometry only, never
+        // the name: a face the key moves counts as collapsed when it keeps less than CollapsedFaceArea of its
+        // area, and the key is a shrink key when collapsed faces make up CollapsedShare of the area it moves.
+        public const float CollapsedFaceArea = 0.10f;
+        public const float CollapsedShare    = 0.30f;
+        // A shrink key is a FOOT shrink key (its own menu toggle) when at least this share of the vertices it moves
+        // lies around the foot and toe joints; a key shrinking the chest or the whole body is left alone.
+        public const float FootShrinkShare   = 0.50f;
+
+        // The shrink keys AutoRig Feet builds itself (the Blender script's ARF_SHRINK_PREFIX). They are
+        // toggles, not shapes to rig on, and they are rebuilt on every run — so the measurement skips them
+        // entirely: a re-rig must see the body as its creator shipped it.
+        public const string OwnShrinkPrefix = "ARF Shrink ";
+        public static bool IsOwnShrinkKey(string name) =>
+            !string.IsNullOrEmpty(name) && name.StartsWith(OwnShrinkPrefix, StringComparison.Ordinal);
         // Search and sampling.
         public const int   ExhaustiveMax  = 8;
         public const int   GreedyRounds   = 4;
@@ -47,7 +62,7 @@ namespace ZeroShugan.ShuganUnityTools
             public float depth;     // mean signed distance to the surface, mesh units (+ inside)
         }
 
-        public enum KeyKind { Candidate, Hide, BodyShape }
+        public enum KeyKind { Candidate, Hide, BodyShape, Shrink }
 
         public sealed class KeyInfo
         {
@@ -56,6 +71,8 @@ namespace ZeroShugan.ShuganUnityTools
             public float   sceneWeight;   // 0-100, as set on the scene renderer
             public KeyKind kind;
             public float   footMove, allMove, farMove;
+            public float   collapsedShare;   // share of the moved area the key collapses (see CollapsedShare)
+            public float   footShare;        // share of the vertices it moves that lie around the foot and toe joints
             internal Vector3[] regionDelta;   // kept for candidates and for keys that are switched on
         }
 
@@ -67,6 +84,7 @@ namespace ZeroShugan.ShuganUnityTools
             Minor,           // moves the feet but barely changes the fit
             HidesGeometry,   // listed, never ticked by default
             ReshapesBody,    // listed, never ticked by default
+            ShrinksSkin,     // a shrink key (hides the body under an outfit): listed, never ticked by default
         }
 
         // One row per shape key that moves the feet.
@@ -79,6 +97,10 @@ namespace ZeroShugan.ShuganUnityTools
             public bool      includedByDefault;
             public float     samplesDrop;       // fit lost when this key is flipped away from the best shape
             public float     depthDrop;         // same, mean depth in foot lengths
+            public float     collapsedShare;    // share of the moved skin the key collapses
+            public float     footShare;         // share of the moved vertices around the foot and toe joints
+            /// <summary>A shrink key that works on the feet: gets its own Foot Shrink menu toggle.</summary>
+            public bool IsFootShrink => reason == RowReason.ShrinksSkin && footShare >= FootShrinkShare;
         }
 
         public sealed class Input
@@ -233,7 +255,7 @@ namespace ZeroShugan.ShuganUnityTools
             // flipped away from the best shape to see what it costs. Ticked by default: the best fit, keys
             // whose flip costs real fit, and keys switched on in the scene that fit worse than 0. A toggle
             // holding all of those puts the feet in the rigged shape whatever else switches them.
-            // Keys that hide geometry or reshape the body are listed but never ticked by default.
+            // Keys that hide geometry, reshape the body or shrink the skin are listed but never ticked by default.
             // (Rows are Unity-only; the Blender script only needs the combination.)
             var rowList = new List<(ToggleRow row, float magnitude)>();
             foreach (var k in input.keys)
@@ -266,6 +288,7 @@ namespace ZeroShugan.ShuganUnityTools
                 }
 
                 RowReason reason = inBest ? RowReason.BestFit
+                                 : k.kind == KeyKind.Shrink ? RowReason.ShrinksSkin
                                  : k.kind == KeyKind.Hide ? RowReason.HidesGeometry
                                  : k.kind == KeyKind.BodyShape ? RowReason.ReshapesBody
                                  : onAndWorse ? RowReason.OnAndFitsWorse
@@ -280,6 +303,8 @@ namespace ZeroShugan.ShuganUnityTools
                     includedByDefault = inBest || (k.kind == KeyKind.Candidate && (significant || onAndWorse)),
                     samplesDrop = samplesDrop,
                     depthDrop = depthDrop,
+                    collapsedShare = k.collapsedShare,
+                    footShare = k.footShare,
                 }, samplesDrop + depthDrop));
             }
             int Rank(ToggleRow row) => row.reason == RowReason.BestFit ? 0 : row.includedByDefault ? 1 : 2;
