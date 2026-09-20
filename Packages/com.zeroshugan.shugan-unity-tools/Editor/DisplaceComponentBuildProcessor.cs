@@ -492,7 +492,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
     [InitializeOnLoadMethod]
     private static void RegisterPreCloneHook()
     {
-        Debug.Log("[DisplaceComponent] Registering pre-clone hook (VRCFury pattern)");
+        DisplaceComponentLogger.Log("[DisplaceComponent] Registering pre-clone hook (VRCFury pattern)");
 
         try
         {
@@ -510,12 +510,11 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                     {
                         try
                         {
-                            // Get the builder interface type dynamically
-                            var builderInterfaceType = System.Type.GetType("VRC.SDKBase.Editor.BuildPipeline.IVRCSdkAvatarBuilderApi, VRCSDKBase-Editor");
-                            if (builderInterfaceType == null)
-                            {
-                                builderInterfaceType = System.Type.GetType("VRC.SDKBase.Editor.Api.IVRCSdkAvatarBuilderApi, VRCSDKBase-Editor");
-                            }
+                            // The hook may already be on this builder: the SDK panel raises OnSdkPanelEnable
+                            // every time it is opened, and each pass would add another handler.
+                            if (_preCloneHookRegistered) return;
+
+                            var builderInterfaceType = ResolveAvatarBuilderApiType();
 
                             if (builderInterfaceType != null)
                             {
@@ -526,13 +525,16 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                                 if (result && parameters[0] != null)
                                 {
                                     var builder = parameters[0];
-                                    var onSdkBuildStartEvent = builderInterfaceType.GetEvent("OnSdkBuildStart");
+                                    var onSdkBuildStartEvent = FindEvent(builderInterfaceType, "OnSdkBuildStart");
                                     if (onSdkBuildStartEvent != null)
                                     {
                                         var delegateType = onSdkBuildStartEvent.EventHandlerType;
                                         var handlerDelegate = System.Delegate.CreateDelegate(delegateType, typeof(DisplaceComponentBuildProcessor).GetMethod("OnSdkBuildStart", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static));
                                         onSdkBuildStartEvent.AddEventHandler(builder, handlerDelegate);
-                                        Debug.Log("[DisplaceComponent] ✓ Pre-clone hook registered successfully via reflection");
+                                        _preCloneHookRegistered = true;
+                                        DisplaceComponentLogger.Log(
+                                            "[DisplaceComponent] Pre-clone hook registered (" +
+                                            builderInterfaceType.FullName + ")");
                                         return;
                                     }
                                 }
@@ -540,11 +542,17 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                         }
                         catch (System.Exception ex)
                         {
-                            Debug.LogWarning($"[DisplaceComponent] Could not register via reflection: {ex.Message}");
+                            DisplaceComponentLogger.Log(
+                                $"[DisplaceComponent] Could not register via reflection: {ex.Message}");
                         }
                     }
 
-                    Debug.LogWarning("[DisplaceComponent] Pre-clone hook not available in this SDK version - prefab validation will be limited");
+                    // Not every SDK exposes the builder API. The component still works: the real work runs
+                    // from the ordinary build callback, and only the extra pre-clone check is skipped. That
+                    // is nothing for a user to act on, so it belongs in the log file, not the console.
+                    DisplaceComponentLogger.Log(
+                        "[DisplaceComponent] Pre-clone hook not available in this SDK version - the build "
+                        + "callback does the work, pre-clone validation is skipped");
                 };
 
                 var delegateType = onSdkPanelEnableEvent.EventHandlerType;
@@ -553,14 +561,69 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
             }
             else
             {
-                Debug.LogWarning("[DisplaceComponent] OnSdkPanelEnable event not found - using callback-only approach");
+                DisplaceComponentLogger.Log(
+                    "[DisplaceComponent] OnSdkPanelEnable event not found - using callback-only approach");
             }
         }
         catch (System.Exception e)
         {
-            Debug.LogWarning($"[DisplaceComponent] Pre-clone hook registration failed: {e.Message}");
-            Debug.LogWarning("[DisplaceComponent] Falling back to callback-only approach (still works, but less validation)");
+            DisplaceComponentLogger.Log($"[DisplaceComponent] Pre-clone hook registration failed: {e.Message}");
+            DisplaceComponentLogger.Log("[DisplaceComponent] Falling back to callback-only approach");
         }
+    }
+
+    private static bool _preCloneHookRegistered;
+
+    /// <summary>
+    /// An event on this interface or on one it extends. GetEvent alone does not walk an interface's base
+    /// interfaces, and OnSdkBuildStart is declared on IVRCSdkBuilderApi, which IVRCSdkAvatarBuilderApi
+    /// extends - so asking the avatar interface directly finds nothing.
+    /// </summary>
+    private static System.Reflection.EventInfo FindEvent(System.Type type, string name)
+    {
+        var ev = type.GetEvent(name);
+        if (ev != null) return ev;
+        foreach (var baseInterface in type.GetInterfaces())
+        {
+            ev = baseInterface.GetEvent(name);
+            if (ev != null) return ev;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The SDK's avatar builder interface, whatever package and assembly this SDK keeps it in.
+    ///
+    /// It used to be looked up by two hardcoded names ("VRC.SDKBase.Editor.BuildPipeline..." and
+    /// "...Editor.Api..."), and neither has ever existed: the interface is VRC.SDK3A.Editor
+    /// .IVRCSdkAvatarBuilderApi, in the avatars package. So the lookup failed on every SDK version and
+    /// warned the user about their SDK for a mistake of ours. Searching the loaded assemblies by name
+    /// keeps working if VRChat moves it again.
+    /// </summary>
+    internal static System.Type ResolveAvatarBuilderApiType()
+    {
+        string[] known =
+        {
+            "VRC.SDK3A.Editor.IVRCSdkAvatarBuilderApi, VRC.SDK3A.Editor",
+            "VRC.SDKBase.Editor.BuildPipeline.IVRCSdkAvatarBuilderApi, VRCSDKBase-Editor",
+            "VRC.SDKBase.Editor.Api.IVRCSdkAvatarBuilderApi, VRCSDKBase-Editor",
+        };
+        foreach (string name in known)
+        {
+            var t = System.Type.GetType(name);
+            if (t != null) return t;
+        }
+
+        foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+        {
+            System.Type[] types;
+            try { types = asm.GetTypes(); }
+            catch (System.Reflection.ReflectionTypeLoadException ex) { types = ex.Types; }
+            catch { continue; }
+            foreach (var t in types)
+                if (t != null && t.IsInterface && t.Name == "IVRCSdkAvatarBuilderApi") return t;
+        }
+        return null;
     }
 
     /// <summary>
@@ -572,23 +635,20 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         if (!(target is GameObject avatarObj))
             return;
 
-        Debug.Log("========================================");
-        Debug.Log("[DisplaceComponent] 🎯 PRE-CLONE VALIDATION (VRCFury Pattern)");
-        Debug.Log($"[DisplaceComponent] Avatar: {avatarObj.name}");
-        Debug.Log($"[DisplaceComponent] This runs BEFORE clone is created!");
-        Debug.Log("========================================");
+        // Reads only: it counts what each component points at while the prefab references are still
+        // intact, and says so when one is null. Nothing here changes the avatar.
+        DisplaceComponentLogger.Log("========================================");
+        DisplaceComponentLogger.Log($"[DisplaceComponent] Pre-clone validation: {avatarObj.name}");
 
-        // Find all DisplaceComponents BEFORE clone is created
         var allComponents = avatarObj.GetComponentsInChildren<DisplaceComponent>(true);
-        Debug.Log($"[DisplaceComponent] Found {allComponents.Length} component(s) to pre-validate");
+        DisplaceComponentLogger.Log($"[DisplaceComponent] {allComponents.Length} component(s) to pre-validate");
 
         foreach (var component in allComponents)
         {
             PreValidateComponent(component);
         }
 
-        Debug.Log($"[DisplaceComponent] ✓ Pre-clone validation complete");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Log("[DisplaceComponent] Pre-clone validation complete");
     }
 
     /// <summary>
@@ -630,7 +690,8 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
             }
             else
             {
-                Debug.Log($"[DisplaceComponent]   {prefabMark} {component.gameObject.name}: {validMappings} mappings OK");
+                DisplaceComponentLogger.Log(
+                    $"[DisplaceComponent]   {prefabMark} {component.gameObject.name}: {validMappings} mappings OK");
             }
         }
         else
@@ -652,7 +713,8 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                 DisplaceComponentLogger.Log($"    [{i}] {compRef.component.GetType().Name}");
             }
 
-            Debug.Log($"[DisplaceComponent]   {prefabMark} {component.gameObject.name}: {validComponents} components to move");
+            DisplaceComponentLogger.Log(
+                $"[DisplaceComponent]   {prefabMark} {component.gameObject.name}: {validComponents} components to move");
         }
     }
 

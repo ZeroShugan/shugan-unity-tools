@@ -36,6 +36,7 @@ namespace ZeroShugan.ShuganUnityTools
         const string PrefSwapMethod           = "ShuganTools_ARF_SwapMethod";
         const string PrefAutoSwapMethod       = "ShuganTools_ARF_AutoSwapMethod";
         const string PrefGarments             = "ShuganTools_ARF_Garments";
+        const string PrefPrefabSlots          = "ShuganTools_ARF_PrefabSlots";
         const string PrefBackupEnabled        = "ShuganTools_ARF_BackupEnabled";
         const string PrefAutoMapFeet          = "ShuganTools_ARF_AutoMapFeet";
         const string PrefTimeoutMin           = "ShuganTools_ARF_TimeoutMin";
@@ -160,7 +161,16 @@ namespace ZeroShugan.ShuganUnityTools
         string     _exportFolder = "";
 
         // ─── Prefabs ───────────────────────────────────────────────────────────
-        List<GameObject> _prefabsToAdd = new List<GameObject>();
+        // A slot IS its asset path. The object reference is only a cache: rebuilding a prefab gives it a new
+        // GUID, which turns every reference to it into a dead one, and the run then skipped that slot without
+        // a word. The path never changes, so it is what gets remembered and re-read.
+        class PrefabSlot
+        {
+            public string     path = "";    // project-relative; "" = an empty slot waiting for a drop
+            public GameObject asset;        // resolved from the path, null when nothing is there right now
+            public bool       searched;     // the by-name search already ran for this path
+        }
+        List<PrefabSlot> _prefabSlots = new List<PrefabSlot>();
 
         // ─── Progress ──────────────────────────────────────────────────────────
         const float EstimatedBlenderSec = 120f;
@@ -256,9 +266,7 @@ namespace ZeroShugan.ShuganUnityTools
             _bugContact    = ArfPrefs.GetString(PrefBugContact, "");
             _runsCacheDirty = true;
 
-            if (_prefabsToAdd.Count == 0)
-                foreach (string p in DefaultPrefabPaths)
-                    _prefabsToAdd.Add(AssetDatabase.LoadAssetAtPath<GameObject>(p));
+            LoadPrefabSlots();
 
             // Auto-detect Blender if not already set
             if (!File.Exists(ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, "")))
@@ -302,7 +310,14 @@ namespace ZeroShugan.ShuganUnityTools
 
         // Coming back to the window is the moment to retry whatever could not be read before — after a
         // script recompile that is usually the foot-bone lists.
-        void OnFocus() => RearmFootCandidates();
+        void OnFocus()
+        {
+            RearmFootCandidates();
+            // A prefab deleted and remade in the Project window is found again here: by path, or by its name
+            // somewhere else when it was moved.
+            foreach (var slot in _prefabSlots) slot.searched = false;
+            ResolvePrefabSlots(searchByName: true);
+        }
 
         // Pull the currently selected scene object into the Target Avatar field.
         // Called on selection change AND when the window opens: OnSelectionChange only fires on a
@@ -705,7 +720,7 @@ namespace ZeroShugan.ShuganUnityTools
                 changes.Append($"• Experimental: {externalOutfits.Count} outfit FBX(s) from other files get the toe bones and "
                                + "are overwritten too (" + string.Join(", ", externalOutfits.Select(Path.GetFileName)) + "), "
                                + "each backed up first.\n");
-            int prefabs = _prefabsToAdd.Count(p => p != null);
+            int prefabs = _prefabSlots.Count(s => s.asset != null);
             if (prefabs > 0)
                 changes.Append($"• {prefabs} feet prefab(s) are added under the avatar.\n");
             if (_rigOnBestShape && MakeShrinkKeysNow)
@@ -1045,9 +1060,15 @@ namespace ZeroShugan.ShuganUnityTools
 
         // ─── Main section ──────────────────────────────────────────────────────
 
+        // The label column of the Setup rows. Unity's default grows with the window, which left a third of
+        // a wide panel empty while the names in the fields beside it were still cut off.
+        const float SetupLabelWidth = 118f;
+
         void DrawMainSection()
         {
             GUILayout.Label("Setup", EditorStyles.boldLabel);
+            float labelWidthBefore = EditorGUIUtility.labelWidth;
+            EditorGUIUtility.labelWidth = SetupLabelWidth;
 
             // Target Avatar
             EditorGUI.BeginChangeCheck();
@@ -1107,6 +1128,7 @@ namespace ZeroShugan.ShuganUnityTools
 
                 string curMeshName = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
                 var curSmr = FindAvatarSkinnedMesh(curMeshName);
+                GUILayout.Space(FieldGap);
                 var pickedSmr = (SkinnedMeshRenderer)EditorGUILayout.ObjectField(
                     curSmr, typeof(SkinnedMeshRenderer), true, GUILayout.Width(RefFieldWidth));
                 if (pickedSmr != curSmr && pickedSmr != null && pickedSmr.sharedMesh != null)
@@ -1174,6 +1196,7 @@ namespace ZeroShugan.ShuganUnityTools
 
             // Restore Original Rig now lives on the "Logs & Support" tab, next to the backups it
             // reads and the run logs that explain why you might want it.
+            EditorGUIUtility.labelWidth = labelWidthBefore;
         }
 
 
@@ -3554,15 +3577,15 @@ namespace ZeroShugan.ShuganUnityTools
 
         struct GarmentRow
         {
-            public string mesh, key, fbxPath, source, why;
+            public string mesh, key, fbxPath, source, why, footProblem;
             public bool   external, detected, ticked;
-            public SkinnedMeshRenderer smr;
+            public SkinnedMeshRenderer smr;   // null when the mesh is in its FBX but not in the scene
         }
 
         struct GarmentChoice
         {
             public string mesh, key, menu;
-            public bool   external;
+            public bool   external, listed, inScene;
         }
 
         /// <summary>Every outfit mesh the table shows, the body FBX's first.</summary>
@@ -3587,34 +3610,56 @@ namespace ZeroShugan.ShuganUnityTools
 
             LoadExternalChoices(out var tickedExternal);
             foreach (var r in ExternalOutfitRows())
+            {
+                bool on = tickedExternal.Contains(r.key);
                 rows.Add(new GarmentRow { mesh = r.mesh, key = r.key, fbxPath = r.fbxPath,
                                           source = "outfit FBX: " + Path.GetFileName(r.fbxPath), why = r.why,
                                           external = true, detected = r.detected,
-                                          ticked = tickedExternal.Contains(r.key), smr = r.smr });
+                                          ticked = on, smr = r.smr,
+                                          // Only for what a run will actually touch: it walks an armature.
+                                          footProblem = on ? OutfitFootProblem(r) : null });
+            }
             return rows;
         }
 
-        /// <summary>What "+ Add Outfit Mesh" offers: every mesh of the avatar that is not in the table yet, from
-        /// the body's FBX or from any other, each under a heading that says where it comes from. The mesh chosen
-        /// as the body in the setup is never offered — that one IS the body.</summary>
+        /// <summary>What "+ Add Outfit Mesh" offers: EVERY mesh of the avatar, from the body's FBX or from any
+        /// other, each under a heading that says where it comes from. Meshes already in the table are offered
+        /// too, ticked and greyed out: a mesh simply missing from the menu reads as a mesh the tool can't see.
+        /// The mesh chosen as the body in the setup is never offered — that one IS the body.</summary>
         List<GarmentChoice> GarmentChoices(string body, List<GarmentRow> rows)
         {
             var list = new List<GarmentChoice>();
             foreach (string m in _meshNames)
             {
                 if (string.Equals(m, body, StringComparison.OrdinalIgnoreCase)) continue;
-                if (rows.Any(r => !r.external && string.Equals(r.mesh, m, StringComparison.OrdinalIgnoreCase))) continue;
-                list.Add(new GarmentChoice { mesh = m, key = m, menu = "From the body FBX/" + MenuSafe(m) });
+                string mesh = m;
+                list.Add(new GarmentChoice {
+                    mesh = m, key = m, inScene = FindAvatarSkinnedMesh(m) != null,
+                    listed = rows.Any(r => !r.external &&
+                                           string.Equals(r.mesh, mesh, StringComparison.OrdinalIgnoreCase)),
+                    menu = "From the body FBX/" + MenuSafe(m) });
             }
-            foreach (var x in ExternalMeshes())
-            {
-                if (rows.Any(r => r.external && r.key == x.key)) continue;
-                list.Add(new GarmentChoice { mesh = x.mesh, key = x.key, external = true,
-                                             menu = "From another FBX/" + MenuSafe(Path.GetFileName(x.fbxPath))
-                                                    + "/" + MenuSafe(x.mesh) });
-            }
+            var byName = ExternalMeshChoices();
+            var ambiguous = new HashSet<string>(
+                byName.Select(x => x.fbxPath).Distinct(StringComparer.OrdinalIgnoreCase)
+                      .GroupBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
+                      .Where(g => g.Count() > 1).SelectMany(g => g),
+                StringComparer.OrdinalIgnoreCase);
+            foreach (var x in byName)
+                list.Add(new GarmentChoice {
+                    mesh = x.mesh, key = x.key, external = true, inScene = x.smr != null,
+                    listed = rows.Any(r => r.external && r.key == x.key),
+                    menu = "From another FBX/" + MenuSafe(OutfitFileLabel(x.fbxPath, ambiguous))
+                           + "/" + MenuSafe(x.mesh) + (x.smr == null ? "  (in the FBX only)" : "") });
             return list;
         }
+
+        /// <summary>The file name of an outfit FBX, with its folder when another outfit FBX is called the same:
+        /// GenericMenu merges two submenus with one name, and the two files' meshes would land together.</summary>
+        static string OutfitFileLabel(string fbxPath, HashSet<string> ambiguous) =>
+            ambiguous != null && ambiguous.Contains(fbxPath)
+                ? Path.GetFileName(fbxPath) + " — " + Path.GetFileName(Path.GetDirectoryName(fbxPath))
+                : Path.GetFileName(fbxPath);
 
         /// <summary>A menu item's text can't hold a slash: GenericMenu reads it as a submenu.</summary>
         static string MenuSafe(string name) => (name ?? "").Replace("/", "\u2215");
@@ -3645,10 +3690,13 @@ namespace ZeroShugan.ShuganUnityTools
             else
             {
                 EditorGUILayout.BeginHorizontal();
-                GUILayout.Label("Mesh", EditorStyles.miniBoldLabel, GUILayout.MinWidth(120));
-                GUILayout.Label("Comes from", EditorStyles.miniBoldLabel, GUILayout.Width(150));
-                GUILayout.Label("Why it is listed", EditorStyles.miniBoldLabel, GUILayout.Width(110));
-                GUILayout.Label(" ", EditorStyles.miniLabel, GUILayout.Width(GarmentRefWidth));
+                // The header sits over the tick boxes below it, which start with the box itself.
+                GUILayout.Space(ToggleBoxWidth);
+                GUILayout.Label("Mesh", EditorStyles.miniBoldLabel,
+                                GUILayout.MinWidth(GarmentNameMinWidth - ToggleBoxWidth));
+                GUILayout.Label("Comes from", EditorStyles.miniBoldLabel, GUILayout.Width(GarmentSourceWidth));
+                GUILayout.Label("Why it is listed", EditorStyles.miniBoldLabel, GUILayout.Width(GarmentWhyWidth));
+                GUILayout.Label("Object", EditorStyles.miniBoldLabel, GUILayout.Width(RefFieldWidth));
                 EditorGUILayout.EndHorizontal();
             }
 
@@ -3658,7 +3706,8 @@ namespace ZeroShugan.ShuganUnityTools
                 EditorGUI.BeginDisabledGroup(blocked);
                 EditorGUILayout.BeginHorizontal();
                 bool now = EditorGUILayout.ToggleLeft(
-                    new GUIContent(row.mesh, row.fbxPath), row.ticked && !blocked, GUILayout.MinWidth(120));
+                    new GUIContent(row.mesh, row.mesh + "\n" + row.fbxPath), row.ticked && !blocked,
+                    GUILayout.MinWidth(GarmentNameMinWidth));
                 if (!blocked && now != row.ticked)
                 {
                     if (row.external)
@@ -3680,13 +3729,28 @@ namespace ZeroShugan.ShuganUnityTools
                         ? row.fbxPath + "\n\nExperimental: this file is rewritten, "
                           + OutfitFormLabel(row.smr, row.fbxPath) + "."
                         : row.fbxPath),
-                    EditorStyles.miniLabel, GUILayout.Width(150));
-                GUILayout.Label(row.why, EditorStyles.miniLabel, GUILayout.Width(110));
-                EditorGUI.BeginDisabledGroup(true);
-                EditorGUILayout.ObjectField(row.smr, typeof(SkinnedMeshRenderer), true, GUILayout.Width(GarmentRefWidth));
-                EditorGUI.EndDisabledGroup();
+                    EditorStyles.miniLabel, GUILayout.Width(GarmentSourceWidth));
+                GUILayout.Label(new GUIContent(row.why, row.why), EditorStyles.miniLabel,
+                                GUILayout.Width(GarmentWhyWidth));
+                if (row.smr == null && row.external)
+                    GUILayout.Label(new GUIContent("in the FBX only", row.fbxPath), EditorStyles.miniLabel,
+                                    GUILayout.Width(RefFieldWidth));
+                else
+                {
+                    EditorGUI.BeginDisabledGroup(true);
+                    EditorGUILayout.ObjectField(row.smr, typeof(SkinnedMeshRenderer), true,
+                                                GUILayout.Width(RefFieldWidth));
+                    EditorGUI.EndDisabledGroup();
+                }
                 EditorGUILayout.EndHorizontal();
                 EditorGUI.EndDisabledGroup();
+
+                if (row.external && now && !blocked && row.footProblem != null)
+                    EditorGUILayout.HelpBox(
+                        row.mesh + " can't take the toe weights: " + row.footProblem
+                        + "\n\nRename the outfit's foot bones to the body's, or map them as Foot in the outfit "
+                        + "FBX's Rig tab. As it is, this outfit is skipped and its file left as it is.",
+                        MessageType.Warning);
 
                 // The warning belongs to the garment that will actually be changed, so it is drawn per ticked row.
                 if (row.external && now && !blocked)
@@ -3710,13 +3774,19 @@ namespace ZeroShugan.ShuganUnityTools
             var choices = GarmentChoices(body, rows);
             EditorGUI.BeginDisabledGroup(choices.Count == 0);
             if (GUILayout.Button(new GUIContent("+ Add Outfit Mesh",
-                    "Every mesh of this avatar that is not in the list yet, grouped by the FBX it comes from."),
+                    "Every mesh of this avatar, grouped by the FBX it comes from. The ones already in the list "
+                    + "are ticked and greyed out."),
                 GUILayout.Height(22)))
             {
                 var menu = new GenericMenu();
                 foreach (var choice in choices)
                 {
                     var c = choice;   // the menu calls back later, after this list is gone
+                    if (c.listed)
+                    {
+                        menu.AddDisabledItem(new GUIContent(c.menu + "   (already in the list)"), true);
+                        continue;
+                    }
                     menu.AddItem(new GUIContent(c.menu), false, () =>
                     {
                         if (c.external)
@@ -3899,12 +3969,12 @@ namespace ZeroShugan.ShuganUnityTools
             _fitRowFlipped.Clear();
             _shrinkRowFlipped.Clear();
 
-            _prefabsToAdd.Clear();
-            foreach (string p in DefaultPrefabPaths)
-                _prefabsToAdd.Add(AssetDatabase.LoadAssetAtPath<GameObject>(p));
+            ArfPrefs.DeleteKey(PrefPrefabSlots);
+            LoadPrefabSlots();
 
             // The avatar is re-checked because several of these decide what the panel shows about it.
             OutfitDetect.Forget();
+            ForgetOutfitFootWarnings();
             if (_avatarObject != null) OnAvatarChanged();
 
             SetStatus("Settings are back to their defaults. Blender/script paths, the FBX, the foot bones "
@@ -4309,23 +4379,50 @@ namespace ZeroShugan.ShuganUnityTools
                 EditorStyles.miniLabel);
             EditorGUILayout.Space(2);
 
-            for (int i = 0; i < _prefabsToAdd.Count; i++)
+            ResolvePrefabSlots();
+            for (int i = 0; i < _prefabSlots.Count; i++)
             {
+                var slot = _prefabSlots[i];
                 EditorGUILayout.BeginHorizontal();
-                _prefabsToAdd[i] = (GameObject)EditorGUILayout.ObjectField(
-                    _prefabsToAdd[i], typeof(GameObject), false);
-                if (_prefabsToAdd[i] != null && _resultInstance != null &&
-                    ChildNameExists(_resultInstance, _prefabsToAdd[i].name))
+                var picked = (GameObject)EditorGUILayout.ObjectField(slot.asset, typeof(GameObject), false);
+                if (picked != slot.asset)
+                {
+                    slot.asset = picked;
+                    slot.path  = picked != null ? AssetDatabase.GetAssetPath(picked) ?? "" : "";
+                    slot.searched = false;
+                    SavePrefabSlots();
+                }
+                if (slot.asset != null && _resultInstance != null &&
+                    ChildNameExists(_resultInstance, slot.asset.name))
                 {
                     Color c = GUI.color; GUI.color = Color.yellow;
                     GUILayout.Label("exists", EditorStyles.miniLabel, GUILayout.Width(36));
                     GUI.color = c;
                 }
-                if (GUILayout.Button("×", GUILayout.Width(22))) { _prefabsToAdd.RemoveAt(i); i--; }
+                else if (slot.asset == null && slot.path.Length > 0)
+                {
+                    Color c = GUI.color; GUI.color = Color.red;
+                    GUILayout.Label(new GUIContent("missing", slot.path), EditorStyles.miniLabel,
+                                    GUILayout.Width(48));
+                    GUI.color = c;
+                }
+                if (GUILayout.Button("×", GUILayout.Width(22)))
+                {
+                    _prefabSlots.RemoveAt(i); i--;
+                    SavePrefabSlots();
+                    EditorGUILayout.EndHorizontal();
+                    continue;
+                }
                 EditorGUILayout.EndHorizontal();
+
+                if (slot.asset == null && slot.path.Length > 0)
+                    EditorGUILayout.HelpBox(
+                        "\"" + Path.GetFileName(slot.path) + "\" is not at " + slot.path + " any more, so a run "
+                        + "would skip it. Drop the prefab in again, or remove the slot with ×.",
+                        MessageType.Warning);
             }
             if (GUILayout.Button("+ Add Prefab Slot", GUILayout.Height(22)))
-                _prefabsToAdd.Add(null);
+                AddPrefabSlotMenu();
 
             Separator();
 
@@ -4578,6 +4675,36 @@ namespace ZeroShugan.ShuganUnityTools
         internal ShuganTools.RunReport AutomationReport => _runReport;
         internal GameObject AutomationResult => _resultInstance;
         internal GameObject AutomationAvatar => _avatarObject;
+
+        /// <summary>What "+ Add Outfit Mesh" offers: "mesh [listed|new|fbx-only]" per entry.</summary>
+        internal List<string> AutomationOutfitMenu()
+        {
+            if (_meshNames.Length == 0) return new List<string>();
+            string body = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
+            return GarmentChoices(body, GarmentRows(body))
+                .Select(c => c.mesh + (c.listed ? " [listed]" : c.inScene ? " [new]" : " [fbx-only]"))
+                .ToList();
+        }
+
+        /// <summary>"mesh (fbx): why" for every ticked outfit from another FBX whose feet don't match.</summary>
+        internal List<string> AutomationOutfitFootWarnings()
+        {
+            var list = new List<string>();
+            if (_meshNames.Length == 0) return list;
+            string body = _meshNames[Mathf.Clamp(_selectedMeshIndex, 0, _meshNames.Length - 1)];
+            foreach (var row in GarmentRows(body))
+                if (row.external && row.ticked && row.footProblem != null)
+                    list.Add(row.mesh + " (" + Path.GetFileName(row.fbxPath) + "): " + row.footProblem);
+            return list;
+        }
+
+        /// <summary>"path [ok|missing]" per prefab slot, in order. Resolves first, as a repaint would.</summary>
+        internal List<string> AutomationPrefabSlots()
+        {
+            ResolvePrefabSlots(searchByName: true);
+            return _prefabSlots.Select(s => (s.path.Length == 0 ? "(empty)" : s.path)
+                                            + (s.asset != null ? " [ok]" : " [missing]")).ToList();
+        }
 
         /// <summary>What clicking an object in the Hierarchy does: the panel takes the avatar it belongs to.</summary>
         internal void AutomationClick(GameObject go)
@@ -5105,18 +5232,132 @@ namespace ZeroShugan.ShuganUnityTools
             return null;
         }
 
+
+        // ─── Prefab slots ──────────────────────────────────────────────────────
+        // Remembered as paths, so a prefab rebuilt at the same path (a new asset, a new GUID, the same name)
+        // is still the one a run adds. The list is remembered too: before this it was rebuilt from the two
+        // defaults after every script recompile, which threw away anything the user had added.
+
+        /// <summary>The slots as the user left them, or the two defaults the first time this machine runs.</summary>
+        void LoadPrefabSlots()
+        {
+            _prefabSlots.Clear();
+            string stored = ArfPrefs.GetString(PrefPrefabSlots, null);
+            if (stored == null)
+                foreach (string p in DefaultPrefabPaths) _prefabSlots.Add(new PrefabSlot { path = p });
+            else
+                foreach (string p in stored.Split('|'))
+                    if (p.Length > 0) _prefabSlots.Add(new PrefabSlot { path = p });
+            ResolvePrefabSlots(searchByName: true);
+        }
+
+        /// <summary>Paths only: the objects are found again from these on the next load.</summary>
+        void SavePrefabSlots() =>
+            ArfPrefs.SetString(PrefPrefabSlots, string.Join("|", _prefabSlots.Select(s => s.path)));
+
+        /// <summary>Fill in every slot whose object is gone — by path first, then, once per path, by the same
+        /// file name elsewhere in the project (a prefab that was moved rather than rebuilt).</summary>
+        void ResolvePrefabSlots(bool searchByName = false)
+        {
+            bool moved = false;
+            foreach (var slot in _prefabSlots)
+            {
+                if (slot.asset != null || slot.path.Length == 0) continue;
+                slot.asset = LoadPrefabAsset(slot.path);
+                if (slot.asset != null || !searchByName || slot.searched) continue;
+
+                slot.searched = true;
+                string found = FindPrefabByFileName(slot.path);
+                if (found == null) continue;
+                slot.asset = LoadPrefabAsset(found);
+                if (slot.asset == null) continue;
+                slot.path = found;
+                moved = true;
+            }
+            if (moved) SavePrefabSlots();
+        }
+
+        /// <summary>The prefab at this exact path — a model or a folder at the same path is not one.</summary>
+        static GameObject LoadPrefabAsset(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return null;
+            var go = AssetDatabase.LoadAssetAtPath<GameObject>(path);
+            return go != null && PrefabUtility.GetPrefabAssetType(go) != PrefabAssetType.NotAPrefab &&
+                   path.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase) ? go : null;
+        }
+
+        /// <summary>The one prefab with this file name somewhere else in the project, or null when there is
+        /// none or more than one — guessing between two would be worse than saying nothing.</summary>
+        static string FindPrefabByFileName(string path)
+        {
+            string file = Path.GetFileName(path);
+            string stem = Path.GetFileNameWithoutExtension(path);
+            // Unity's search filter chokes on brackets and punctuation, which "FX Hand_Controller (HaC)" has.
+            string term = new string(stem.Select(c => char.IsLetterOrDigit(c) ? c : ' ').ToArray()).Trim();
+            if (term.Length == 0) return null;
+            var hits = AssetDatabase.FindAssets("t:Prefab " + term)
+                .Select(AssetDatabase.GUIDToAssetPath)
+                .Where(p => !string.IsNullOrEmpty(p) &&
+                            string.Equals(Path.GetFileName(p), file, StringComparison.OrdinalIgnoreCase))
+                .Distinct().ToList();
+            return hits.Count == 1 ? hits[0] : null;
+        }
+
+        /// <summary>"+ Add Prefab Slot": an empty slot, or one of the defaults that is not in the list — the
+        /// way back for someone who removed one, without resetting every other setting.</summary>
+        void AddPrefabSlotMenu()
+        {
+            var menu = new GenericMenu();
+            menu.AddItem(new GUIContent("Empty slot"), false, () =>
+            {
+                _prefabSlots.Add(new PrefabSlot());
+                SavePrefabSlots();
+            });
+            menu.AddSeparator("");
+            foreach (string p in DefaultPrefabPaths)
+            {
+                string path = p;
+                var label = new GUIContent(MenuSafe(Path.GetFileNameWithoutExtension(path)));
+                if (_prefabSlots.Any(s => string.Equals(s.path, path, StringComparison.OrdinalIgnoreCase)))
+                    menu.AddDisabledItem(label, true);
+                else
+                    menu.AddItem(label, false, () =>
+                    {
+                        _prefabSlots.Add(new PrefabSlot { path = path });
+                        ResolvePrefabSlots(searchByName: true);
+                        SavePrefabSlots();
+                    });
+            }
+            menu.ShowAsContext();
+        }
+
         void RunAddPrefabs()
         {
             if (_resultInstance == null) return;
-            foreach (var prefabRef in _prefabsToAdd)
+            // A prefab rebuilt while this window was open resolves again here, so the run uses the file that
+            // is on disk now rather than the reference it read when the panel opened.
+            ResolvePrefabSlots(searchByName: true);
+            foreach (var slot in _prefabSlots)
             {
-                if (prefabRef == null) continue;
+                var prefabRef = slot.asset;
+                if (prefabRef == null)
+                {
+                    if (slot.path.Length > 0)
+                        _runReport?.AddIssue("U_PREFAB_MISSING", "warning",
+                            $"\"{Path.GetFileName(slot.path)}\" was not added to the avatar: there is no prefab "
+                            + $"at {slot.path} any more.",
+                            "Put the prefab back at that path, or remove the slot in Advanced Settings. "
+                            + "Everything else in the run is finished.");
+                    continue;
+                }
 
-                // The avatar may already carry this prefab, and the copy can be in one of two states.
+                // The avatar may already carry this prefab, and the copy can be in one of three states.
                 // A LIVE instance (it came across the swap still linked to its asset) is left exactly
                 // as it is, overrides included. A LOOSE copy — same name, no link, typically flattened
                 // by an older run — is replaced by a real instance, so the finished avatar follows the
-                // prefab instead of holding a frozen snapshot of it.
+                // prefab instead of holding a frozen snapshot of it. So is an instance of a prefab that
+                // has since been REBUILT: same path, same name, new asset, and a link pointing at the
+                // file that used to be there.
                 var existing = FindDirectChild(_resultInstance.transform, prefabRef.name);
                 if (existing != null)
                 {
@@ -5127,12 +5368,16 @@ namespace ZeroShugan.ShuganUnityTools
                             + "as a prefab instance — kept as it is.");
                         continue;
                     }
+                    bool broken = PrefabUtility.IsPartOfPrefabInstance(existing.gameObject) ||
+                                  PrefabUtility.IsPrefabAssetMissing(existing.gameObject);
+                    string why = broken
+                        ? "was an instance of an older version of that prefab"
+                        : "was on the avatar without a prefab link";
                     UnityEngine.Debug.LogWarning(
-                        $"[AutoRig Feet Distributor] '{existing.name}' under '{_resultInstance.name}' had no prefab "
-                        + $"link — replaced with the '{prefabRef.name}' prefab.");
+                        $"[AutoRig Feet Distributor] '{existing.name}' under '{_resultInstance.name}' {why} — "
+                        + $"replaced with the '{prefabRef.name}' prefab.");
                     _runReport?.AddIssue("U_PREFAB_RELINKED", "info",
-                        $"\"{existing.name}\" was on the avatar without a prefab link, so it was replaced with the "
-                        + $"\"{prefabRef.name}\" prefab.",
+                        $"\"{existing.name}\" {why}, so it was replaced with the \"{prefabRef.name}\" prefab.",
                         "Any change you had made to that copy is gone — it now follows the prefab again.");
                     Undo.DestroyObjectImmediate(existing.gameObject);
                 }
@@ -6284,6 +6529,7 @@ namespace ZeroShugan.ShuganUnityTools
             // Linked scene field: shows the currently effective bone (override, or Auto's guess).
             string shownName = string.IsNullOrEmpty(result) ? top : result;
             var curBone = FindAvatarBone(shownName);
+            GUILayout.Space(FieldGap);
             var pickedBone = (Transform)EditorGUILayout.ObjectField(
                 curBone, typeof(Transform), true, GUILayout.Width(RefFieldWidth));
             if (pickedBone != curBone && pickedBone != null)
@@ -6386,13 +6632,29 @@ namespace ZeroShugan.ShuganUnityTools
             return null;
         }
 
+        // A ToggleLeft's box plus the gap before its label.
+        const float ToggleBoxWidth = 16f;
+
+        // Between a dropdown and the object field that mirrors it: without it the two controls touch and
+        // read as one very wide field.
+        const float FieldGap = 4f;
+
         static bool IsRootObject(GameObject go)
             => go != null && go.transform.parent == null;
 
-        // Width of the fields that show a scene object next to a dropdown, wide enough for long mesh and
-        // bone names.
-        const float RefFieldWidth = 210f;
-        const float GarmentRefWidth = 182f;
+        // Setup is one grid: the object field at the end of the mesh row, of each foot-bone row and of each
+        // outfit row is the same width, so they share a right edge and a left one. Fixed pixel widths looked
+        // wrong at every window size but the one they were measured at — mesh names were cut off in a narrow
+        // panel and the columns drifted apart in a wide one — so the object column follows the window and the
+        // name column takes what is left.
+        static float RefFieldWidth =>
+            Mathf.Clamp(EditorGUIUtility.currentViewWidth * 0.30f, 150f, 260f);
+
+        // The two middle columns of the outfit table. They hold short, known text ("body FBX", "weighted to
+        // the feet"), so they are fixed and the mesh name gets the slack.
+        const float GarmentSourceWidth = 118f;
+        const float GarmentWhyWidth    = 116f;
+        const float GarmentNameMinWidth = 150f;
 
         /// <summary>
         /// The avatar a clicked object belongs to, so selecting a mesh or a bone deep in the hierarchy picks

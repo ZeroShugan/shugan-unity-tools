@@ -901,9 +901,12 @@ namespace ZeroShugan.ShuganUnityTools
         // Family 2 used to return null (the delimited scan never sees " left " in "leftfoot"), which
         // left RankFootCandidates returning an EMPTY list on those rigs - so the foot-bone dropdown
         // had nothing in it and BestFoot/BestToe found nothing either.
-        static string SideOf(Transform t)
+        static string SideOf(Transform t) => SideOfName(t.name);
+
+        /// <summary>The L/R side a bone name carries, or null. Name-only, so it also answers for a bone that
+        /// is only in an FBX asset.</summary>
+        public static string SideOfName(string raw)
         {
-            string raw = t.name;
 
             // 1. delimited word
             string n = " " + raw.ToLowerInvariant().Replace("_", " ").Replace(".", " ").Replace("-", " ") + " ";

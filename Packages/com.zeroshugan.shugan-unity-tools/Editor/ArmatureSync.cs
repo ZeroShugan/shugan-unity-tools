@@ -74,7 +74,7 @@ namespace ZeroShugan.ShuganUnityTools
 
         // Bones AutoRig Feet owns. They may be created and removed freely; anything else in the armature
         // belongs to the user and is only touched when the FBX itself changed it.
-        static bool IsOurBone(string name) =>
+        internal static bool IsOurBone(string name) =>
             name.StartsWith("z_CB ", StringComparison.Ordinal) ||
             name.StartsWith("Toes_", StringComparison.Ordinal) ||
             name.StartsWith("ARF Helper", StringComparison.Ordinal);

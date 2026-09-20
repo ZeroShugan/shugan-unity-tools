@@ -41,9 +41,17 @@ namespace ZeroShugan.ShuganUnityTools
         struct ExternalRow
         {
             public string fbxPath, mesh, key, why;
-            public SkinnedMeshRenderer smr;
-            public bool detected;
+            public SkinnedMeshRenderer smr;   // null when the mesh is in the FBX but not in the scene
+            public bool detected, skinned;
             public int hits;
+        }
+
+        /// <summary>A mesh of an outfit FBX the table or the add menu can offer.</summary>
+        struct ExternalMesh
+        {
+            public string fbxPath, mesh, key;
+            public SkinnedMeshRenderer smr;
+            public bool   skinned;            // its FBX skins it: without an armature Blender has nothing to rig
         }
 
         struct PrefabLink
@@ -103,11 +111,11 @@ namespace ZeroShugan.ShuganUnityTools
             return names;
         }
 
-        /// <summary>Every mesh under the avatar that comes from an FBX other than the body's, and every FBX they
-        /// come from. One entry per mesh per FBX.</summary>
-        List<(string fbxPath, string mesh, string key, SkinnedMeshRenderer smr)> ExternalMeshes()
+        /// <summary>Every mesh under the avatar that comes from an FBX other than the body's. One entry per
+        /// mesh per FBX — the renderers, so each entry carries the object it is in the scene.</summary>
+        List<ExternalMesh> ExternalMeshes()
         {
-            var all = new List<(string, string, string, SkinnedMeshRenderer)>();
+            var all = new List<ExternalMesh>();
             if (_avatarObject == null || _sourceFbxAsset == null) return all;
             string bodyFbx = AssetDatabase.GetAssetPath(_sourceFbxAsset);
             var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -118,7 +126,36 @@ namespace ZeroShugan.ShuganUnityTools
                 if (!path.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(path, bodyFbx, StringComparison.OrdinalIgnoreCase)) continue;
                 string key = ExternalKey(path, smr.sharedMesh.name);
-                if (seen.Add(key)) all.Add((path, smr.sharedMesh.name, key, smr));
+                if (seen.Add(key))
+                    all.Add(new ExternalMesh { fbxPath = path, mesh = smr.sharedMesh.name, key = key,
+                                               smr = smr, skinned = true });
+            }
+            return all;
+        }
+
+        /// <summary>Every mesh of every outfit FBX the avatar uses — the ones in the scene AND the ones that
+        /// are only in the file. The body FBX has always offered all of its meshes (they come from the FBX
+        /// asset, not the scene); an outfit FBX offered only what happened to be instantiated, so a mesh the
+        /// avatar doesn't show could never be picked even though a run rigs the FILE.</summary>
+        List<ExternalMesh> ExternalMeshChoices()
+        {
+            var all = ExternalMeshes();
+            var seen = new HashSet<string>(all.Select(x => x.key), StringComparer.Ordinal);
+            foreach (string fbx in all.Select(x => x.fbxPath)
+                                      .Distinct(StringComparer.OrdinalIgnoreCase).ToList())
+            {
+                // The FBX's own skinned renderers, not its Mesh sub-assets: a mesh with no armature behind it
+                // (a prop, a stray cube) makes the Blender outfit pass abort, so it is never offered.
+                var model = AssetDatabase.LoadAssetAtPath<GameObject>(fbx);
+                if (model == null) continue;
+                foreach (var smr in model.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                {
+                    if (smr.sharedMesh == null) continue;
+                    string key = ExternalKey(fbx, smr.sharedMesh.name);
+                    if (!seen.Add(key)) continue;
+                    all.Add(new ExternalMesh { fbxPath = fbx, mesh = smr.sharedMesh.name, key = key,
+                                               smr = null, skinned = true });
+                }
             }
             return all;
         }
@@ -132,7 +169,7 @@ namespace ZeroShugan.ShuganUnityTools
             var feet = BodyFootBoneNames();
             LoadExternalChoices(out var ticked);
 
-            foreach (var g in ExternalMeshes().GroupBy(x => x.fbxPath, StringComparer.OrdinalIgnoreCase))
+            foreach (var g in ExternalMeshChoices().GroupBy(x => x.fbxPath, StringComparer.OrdinalIgnoreCase))
             {
                 var found = OutfitDetect.Find(g.Key, null, feet)
                     .GroupBy(c => c.meshName)
@@ -142,7 +179,7 @@ namespace ZeroShugan.ShuganUnityTools
                     bool det = found.TryGetValue(x.mesh, out var c);
                     if (!det && !ticked.Contains(x.key)) continue;
                     rows.Add(new ExternalRow { fbxPath = x.fbxPath, mesh = x.mesh, key = x.key, smr = x.smr,
-                                               detected = det, hits = det ? c.hits : 0,
+                                               detected = det, hits = det ? c.hits : 0, skinned = x.skinned,
                                                why = det ? c.Explain() : "added by you" });
                 }
             }
@@ -199,7 +236,7 @@ namespace ZeroShugan.ShuganUnityTools
         /// table so it is clear what a run will change.</summary>
         static string OutfitFormLabel(SkinnedMeshRenderer smr, string fbxPath)
         {
-            if (smr == null) return "";
+            if (smr == null) return "in the FBX only, not in this scene";
             if (!PrefabUtility.IsPartOfPrefabInstance(smr.gameObject) || PrefabUtility.IsAddedGameObjectOverride(smr.gameObject))
                 return "unpacked";
             string asset = PrefabUtility.GetPrefabAssetPathOfNearestInstanceRoot(smr.gameObject);
@@ -207,6 +244,142 @@ namespace ZeroShugan.ShuganUnityTools
             var root = PrefabUtility.GetNearestPrefabInstanceRoot(smr.gameObject);
             if (root != null && ArmatureSync.IsLinkedTo(root, fbxPath)) return "prefab linked to the FBX";
             return "prefab (" + Path.GetFileName(asset) + ")";
+        }
+
+
+        // ─── Do the outfit's feet answer to the body's? ────────────────────────
+        // The Blender pass maps the body's foot bone onto one of the outfit's before it changes anything
+        // (_outfit_map_bone): the same name, else the name Unity read from the outfit's humanoid mapping,
+        // else the nearest bone of that side with a foot-ish name within 2 cm of the body's foot. Failing
+        // all three it aborts (OUTFIT_FOOT_NOT_FOUND) - after the run has started and the outfit has been
+        // backed up. The same three rules are checked here, so the answer is on the row before the run.
+        const float OutfitFootSearchM = 0.02f;    // mirrors OUTFIT_FOOT_SEARCH_M in the script
+
+        internal enum OutfitFoot { ByName, ByHumanoid, ByPosition, Unverified, None }
+
+        /// <summary>The bone the run treats as this side's foot on the BODY: the hand-picked one, else the
+        /// humanoid mapping, else the top-ranked candidate - the same order the run itself uses.</summary>
+        string BodyFootBone(string side)
+        {
+            string over = side == "L" ? _footOverrideL : _footOverrideR;
+            if (!string.IsNullOrEmpty(over)) return over;
+            if (AssetImporter.GetAtPath(AssetDatabase.GetAssetPath(_sourceFbxAsset)) is ModelImporter imp &&
+                imp.humanDescription.human != null)
+                foreach (var h in imp.humanDescription.human)
+                    if (h.humanName == (side == "L" ? "LeftFoot" : "RightFoot") && !string.IsNullOrEmpty(h.boneName))
+                        return h.boneName;
+            var cand = side == "L" ? _footCandL : _footCandR;
+            return cand.Count > 0 ? cand[0].name : null;
+        }
+
+        /// <summary>Every bone of the armature behind this outfit mesh - the whole armature, because that is
+        /// what the script searches. From the scene when the mesh is there (positions can then be measured
+        /// against the body's), from the FBX asset when it is only in the file.</summary>
+        Dictionary<string, Transform> OutfitBones(ExternalRow row, out bool positioned)
+        {
+            var bones = new Dictionary<string, Transform>(StringComparer.Ordinal);
+            positioned = false;
+            if (row.smr != null)
+            {
+                var root = ArmatureSync.ArmatureOf(row.smr);
+                if (root != null)
+                    foreach (var t in root.GetComponentsInChildren<Transform>(true)) bones[t.name] = t;
+                else
+                    foreach (var b in row.smr.bones ?? new Transform[0])
+                        if (b != null) bones[b.name] = b;
+                positioned = bones.Count > 0;
+                if (positioned) return bones;
+            }
+            foreach (string n in ArmatureSync.Capture(row.fbxPath).bones.Keys) bones[n] = null;
+            return bones;
+        }
+
+        /// <summary>Which of the script's three rules finds this outfit's foot, if any.</summary>
+        OutfitFoot MatchOutfitFoot(string side, ExternalRow row, Dictionary<string, Transform> bones,
+                                   bool positioned, out string matched, out float gapMm)
+        {
+            matched = null; gapMm = 0f;
+            string bodyFoot = BodyFootBone(side);
+            if (string.IsNullOrEmpty(bodyFoot)) return OutfitFoot.ByName;   // nothing to compare against
+
+            if (bones.ContainsKey(bodyFoot)) { matched = bodyFoot; return OutfitFoot.ByName; }
+
+            OutfitHumanoidBones(row.fbxPath, out string footL, out string footR, out _, out _);
+            string hint = side == "L" ? footL : footR;
+            if (!string.IsNullOrEmpty(hint) && bones.ContainsKey(hint)) { matched = hint; return OutfitFoot.ByHumanoid; }
+
+            var candidates = bones.Where(kv => !ArmatureSync.IsOurBone(kv.Key) &&
+                                               HumanoidRigMapping.NameLooksLikeFoot(kv.Key) &&
+                                               (HumanoidRigMapping.SideOfName(kv.Key) ?? side) == side).ToList();
+            if (candidates.Count == 0) return OutfitFoot.None;
+
+            var bodyBone = FindAvatarBone(bodyFoot);
+            if (!positioned || bodyBone == null)
+            {
+                matched = candidates[0].Key;
+                return OutfitFoot.Unverified;
+            }
+
+            float best = float.MaxValue;
+            foreach (var kv in candidates)
+            {
+                if (kv.Value == null) continue;
+                float d = Vector3.Distance(kv.Value.position, bodyBone.position);
+                if (d < best) { best = d; matched = kv.Key; }
+            }
+            gapMm = best * 1000f;
+            return best <= OutfitFootSearchM ? OutfitFoot.ByPosition : OutfitFoot.None;
+        }
+
+        /// <summary>The outfit FBX's own humanoid mapping for the feet and toes - the hint the run passes to
+        /// Blender, so the panel and the run can never disagree about it.</summary>
+        static void OutfitHumanoidBones(string fbxPath, out string footL, out string footR,
+                                        out string toeL, out string toeR)
+        {
+            footL = footR = toeL = toeR = null;
+            if (!(AssetImporter.GetAtPath(fbxPath) is ModelImporter imp)) return;
+            foreach (var h in imp.humanDescription.human ?? new HumanBone[0])
+            {
+                if (h.humanName == "LeftFoot")  footL = h.boneName;
+                if (h.humanName == "RightFoot") footR = h.boneName;
+                if (h.humanName == "LeftToes")  toeL  = h.boneName;
+                if (h.humanName == "RightToes") toeR  = h.boneName;
+            }
+        }
+
+        readonly Dictionary<string, string> _outfitFootWarning = new Dictionary<string, string>();
+
+        internal void ForgetOutfitFootWarnings() => _outfitFootWarning.Clear();
+
+        /// <summary>Why this outfit can't take the toe weights, or null when it can. Cached per row and body
+        /// foot bone: it walks an armature, and OnGUI asks on every repaint.</summary>
+        string OutfitFootProblem(ExternalRow row)
+        {
+            string ck = row.key + "|" + BodyFootBone("L") + "|" + BodyFootBone("R");
+            if (_outfitFootWarning.TryGetValue(ck, out string cached)) return cached;
+
+            string problem = null;
+            try
+            {
+                var bones = OutfitBones(row, out bool positioned);
+                foreach (string side in new[] { "L", "R" })
+                {
+                    var how = MatchOutfitFoot(side, row, bones, positioned, out string matched, out float gapMm);
+                    if (how != OutfitFoot.None) continue;
+                    string bodyFoot = BodyFootBone(side);
+                    problem = matched == null
+                        ? Path.GetFileName(row.fbxPath) + "'s armature has no bone that could be the body's foot \""
+                          + bodyFoot + "\" (" + side + ")."
+                        : Path.GetFileName(row.fbxPath) + "'s armature has no bone matching the body's foot \""
+                          + bodyFoot + "\" (" + side + ") - the nearest foot-named bone, \"" + matched + "\", is "
+                          + gapMm.ToString("0") + " mm away, further than the 20 mm the rig searches.";
+                    break;
+                }
+            }
+            catch (Exception e) { UnityEngine.Debug.LogWarning("[AutoRig Feet] Outfit foot check failed: " + e.Message); }
+
+            _outfitFootWarning[ck] = problem;
+            return problem;
         }
 
         // ─── Before the run ────────────────────────────────────────────────────
@@ -244,9 +417,24 @@ namespace ZeroShugan.ShuganUnityTools
             Directory.CreateDirectory(Path.Combine(_outfitTempDir, "outfits"));
             _outfitBlendPath = Path.Combine(_outfitTempDir, "body_rigged.blend");
 
+            var rowsByFbx = ExternalOutfitRows();
             foreach (var kv in ticked)
             {
                 string fbx = kv.Key;
+                // An outfit whose armature has no bone for the body's foot would abort in Blender
+                // (OUTFIT_FOOT_NOT_FOUND) after its file had been backed up and opened. Say so here and
+                // leave the file alone.
+                var probeRow = rowsByFbx.FirstOrDefault(
+                    r => string.Equals(r.fbxPath, fbx, StringComparison.OrdinalIgnoreCase));
+                string footProblem = probeRow.fbxPath != null ? OutfitFootProblem(probeRow) : null;
+                if (footProblem != null)
+                {
+                    _runReport.AddIssue("U_OUTFIT_FOOT_MISMATCH", "warning",
+                        Path.GetFileName(fbx) + " was not rigged: " + footProblem,
+                        "Rename the outfit's foot bones to the body's, or map them as Foot in the outfit FBX's "
+                        + "Rig tab, then run again. The file was not changed.");
+                    continue;
+                }
                 var job = new OutfitJob
                 {
                     fbxPath   = fbx,
@@ -258,13 +446,7 @@ namespace ZeroShugan.ShuganUnityTools
                 {
                     job.human    = importer.humanDescription;
                     job.hasHuman = importer.animationType == ModelImporterAnimationType.Human;
-                    foreach (var h in job.human.human ?? new HumanBone[0])
-                    {
-                        if (h.humanName == "LeftFoot")  job.footL = h.boneName;
-                        if (h.humanName == "RightFoot") job.footR = h.boneName;
-                        if (h.humanName == "LeftToes")  job.toeL  = h.boneName;
-                        if (h.humanName == "RightToes") job.toeR  = h.boneName;
-                    }
+                    OutfitHumanoidBones(fbx, out job.footL, out job.footR, out job.toeL, out job.toeR);
                 }
                 if (_backupEnabled)
                 {
@@ -281,6 +463,11 @@ namespace ZeroShugan.ShuganUnityTools
                     RecordOutfitOriginal(fbx, dest);
                 }
                 _outfitJobs.Add(job);
+            }
+            if (_outfitJobs.Count == 0)
+            {
+                _outfitBlendPath = null;   // nothing left to rig: the body run needn't keep its .blend
+                return null;
             }
             _runLogger?.Line("outfits from other FBXs: " + string.Join("; ", _outfitJobs.Select(j =>
                 Path.GetFileName(j.fbxPath) + " (" + string.Join(", ", j.meshes) + ")")));
