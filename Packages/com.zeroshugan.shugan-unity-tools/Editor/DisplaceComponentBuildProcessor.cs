@@ -6,6 +6,7 @@ using UnityEditor;
 using VRC.SDKBase;
 using VRC.SDKBase.Editor.BuildPipeline;
 using System.IO;
+using ZeroShugan.ShuganUnityTools;
 
 /// <summary>
 /// Simple file logger for detailed build logs
@@ -45,11 +46,11 @@ public static class DisplaceComponentLogger
             Log("========================================");
             Log("");
 
-            Debug.Log($"[DisplaceComponent] 📝 Detailed logs will be saved to: {logFilePath}");
+            Log($"Log file: {logFilePath}");
         }
         catch (System.Exception e)
         {
-            Debug.LogError($"[DisplaceComponent] Failed to create log file: {e.Message}");
+            ShuganLog.Error("DisplaceComponent", $"Failed to create log file: {e.Message}");
         }
     }
 
@@ -57,9 +58,30 @@ public static class DisplaceComponentLogger
     {
         if (logWriter != null)
         {
+            // Most steps are logged twice, once for the Console and once here; one copy is enough.
+            string plain = WithoutTag(message);
+            if (plain == lastLine && plain.Trim('=', ' ').Length > 0) return;
+            lastLine = plain;
             string timestamp = System.DateTime.Now.ToString("HH:mm:ss.fff");
             logWriter.WriteLine($"[{timestamp}] {message}");
         }
+    }
+
+    private static string lastLine;
+
+    static string WithoutTag(string m)
+    {
+        m = m ?? "";
+        if (m.StartsWith("[")) { int end = m.IndexOf("] "); if (end > 0) m = m.Substring(end + 2); }
+        return m.Trim();
+    }
+
+    /// <summary>A build step: into this build's log file, and into the Console only with Tools → Shugan →
+    /// Verbose Console Logs. The Console keeps the warnings, errors and where the log was saved.</summary>
+    public static void Detail(string message)
+    {
+        Log(message);
+        if (ShuganLog.Verbose) Debug.Log(message);
     }
 
     public static void CloseLog()
@@ -74,7 +96,7 @@ public static class DisplaceComponentLogger
             logWriter.Close();
             logWriter = null;
 
-            Debug.Log($"[DisplaceComponent] 📄 Detailed log saved to: {logFilePath}");
+            ShuganLog.Info("DisplaceComponent", $"Build log saved to: {logFilePath}");
         }
     }
 
@@ -120,7 +142,7 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
 
     static DisplaceComponentPrefabUnpacker()
     {
-        Debug.Log("[DisplaceComponent Prefab Unpacker] ✓ Prefab unpacker loaded! (callback order: -100000)");
+        DisplaceComponentLogger.Detail("[DisplaceComponent Prefab Unpacker] ✓ Prefab unpacker loaded! (callback order: -100000)");
     }
 
     public bool OnBuildRequested(VRCSDKRequestedBuildType requestedBuildType)
@@ -128,10 +150,10 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
         if (requestedBuildType != VRCSDKRequestedBuildType.Avatar)
             return true;
 
-        Debug.Log("========================================");
-        Debug.Log("[DisplaceComponent Prefab Unpacker] PREFAB UNPACKING PHASE");
-        Debug.Log("[DisplaceComponent Prefab Unpacker] Running BEFORE VRCFury and all other processors");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail("[DisplaceComponent Prefab Unpacker] PREFAB UNPACKING PHASE");
+        DisplaceComponentLogger.Detail("[DisplaceComponent Prefab Unpacker] Running BEFORE VRCFury and all other processors");
+        DisplaceComponentLogger.Detail("========================================");
 
         DisplaceComponentLogger.Log("========================================");
         DisplaceComponentLogger.Log("PREFAB UNPACKING PHASE (callback order: -100000)");
@@ -143,16 +165,16 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
         GameObject avatarRoot = FindAvatarRoot();
         if (avatarRoot == null)
         {
-            Debug.LogWarning("[DisplaceComponent Prefab Unpacker] Could not find avatar root");
+            ShuganLog.Warn("DisplaceComponent Prefab Unpacker", "Could not find avatar root");
             return true;
         }
 
-        Debug.Log($"[DisplaceComponent Prefab Unpacker] Avatar found: {avatarRoot.name}");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker] Avatar found: {avatarRoot.name}");
         DisplaceComponentLogger.Log($"Avatar: {avatarRoot.name}");
 
         // Find all DisplaceComponents on the avatar
         var allDisplaceComponents = avatarRoot.GetComponentsInChildren<DisplaceComponent>(true);
-        Debug.Log($"[DisplaceComponent Prefab Unpacker] Found {allDisplaceComponents.Length} DisplaceComponent(s)");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker] Found {allDisplaceComponents.Length} DisplaceComponent(s)");
         DisplaceComponentLogger.Log($"Found {allDisplaceComponents.Length} DisplaceComponent(s) to check");
 
         // Find unique prefab instances that contain DisplaceComponents
@@ -170,7 +192,7 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
                 if (prefabRoot != null && !prefabRootsToUnpack.Contains(prefabRoot))
                 {
                     prefabRootsToUnpack.Add(prefabRoot);
-                    Debug.Log($"[DisplaceComponent Prefab Unpacker] Detected prefab to unpack: {prefabRoot.name}");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker] Detected prefab to unpack: {prefabRoot.name}");
                     DisplaceComponentLogger.Log($"  Prefab to unpack: {prefabRoot.name}");
                 }
             }
@@ -178,12 +200,12 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
 
         if (prefabRootsToUnpack.Count == 0)
         {
-            Debug.Log("[DisplaceComponent Prefab Unpacker] No prefabs to unpack - all DisplaceComponents are on non-prefab objects");
+            DisplaceComponentLogger.Detail("[DisplaceComponent Prefab Unpacker] No prefabs to unpack - all DisplaceComponents are on non-prefab objects");
             DisplaceComponentLogger.Log("No prefabs to unpack");
             return true;
         }
 
-        Debug.Log($"[DisplaceComponent Prefab Unpacker] Unpacking {prefabRootsToUnpack.Count} prefab(s)...");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker] Unpacking {prefabRootsToUnpack.Count} prefab(s)...");
         DisplaceComponentLogger.Log($"Unpacking {prefabRootsToUnpack.Count} prefab(s)...");
         DisplaceComponentLogger.Log("");
 
@@ -193,11 +215,11 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
             UnpackPrefab(prefabRoot);
         }
 
-        Debug.Log("========================================");
-        Debug.Log($"[DisplaceComponent Prefab Unpacker] ✓ Unpacked {unpackedPrefabs.Count} prefab(s)");
-        Debug.Log("[DisplaceComponent Prefab Unpacker] Prefabs are now regular GameObjects");
-        Debug.Log("[DisplaceComponent Prefab Unpacker] Proceeding with normal build (VRCFury, DisplaceComponent, etc.)");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker] ✓ Unpacked {unpackedPrefabs.Count} prefab(s)");
+        DisplaceComponentLogger.Detail("[DisplaceComponent Prefab Unpacker] Prefabs are now regular GameObjects");
+        DisplaceComponentLogger.Detail("[DisplaceComponent Prefab Unpacker] Proceeding with normal build (VRCFury, DisplaceComponent, etc.)");
+        DisplaceComponentLogger.Detail("========================================");
 
         DisplaceComponentLogger.Log("========================================");
         DisplaceComponentLogger.Log($"✓ Unpacking complete: {unpackedPrefabs.Count} prefab(s) unpacked");
@@ -231,9 +253,9 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
             info.localRotation = transform.localRotation;
             info.localScale = transform.localScale;
 
-            Debug.Log($"[DisplaceComponent Prefab Unpacker]   Unpacking: {prefabInstance.name}");
-            Debug.Log($"[DisplaceComponent Prefab Unpacker]     Asset: {info.prefabAssetPath}");
-            Debug.Log($"[DisplaceComponent Prefab Unpacker]     Parent: {(info.parentTransform != null ? info.parentTransform.name : "Scene Root")}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker]   Unpacking: {prefabInstance.name}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker]     Asset: {info.prefabAssetPath}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker]     Parent: {(info.parentTransform != null ? info.parentTransform.name : "Scene Root")}");
 
             DisplaceComponentLogger.Log($"  Unpacking: {prefabInstance.name}");
             DisplaceComponentLogger.Log($"    Asset path: {info.prefabAssetPath}");
@@ -245,22 +267,22 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
 
             unpackedPrefabs.Add(info);
 
-            Debug.Log($"[DisplaceComponent Prefab Unpacker]     ✓ Unpacked successfully");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker]     ✓ Unpacked successfully");
             DisplaceComponentLogger.Log($"    ✓ Unpacked successfully");
             DisplaceComponentLogger.Log("");
         }
         catch (System.Exception e)
         {
-            Debug.LogError($"[DisplaceComponent Prefab Unpacker] Failed to unpack {prefabInstance.name}: {e.Message}");
+            ShuganLog.Error("DisplaceComponent Prefab Unpacker", $"Failed to unpack {prefabInstance.name}: {e.Message}");
             DisplaceComponentLogger.Log($"  ✗ FAILED to unpack {prefabInstance.name}: {e.Message}");
         }
     }
 
     public void OnPostprocessAvatar()
     {
-        Debug.Log("========================================");
-        Debug.Log("[DisplaceComponent Prefab Unpacker] PREFAB RESTORATION PHASE");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail("[DisplaceComponent Prefab Unpacker] PREFAB RESTORATION PHASE");
+        DisplaceComponentLogger.Detail("========================================");
 
         DisplaceComponentLogger.Log("========================================");
         DisplaceComponentLogger.Log("PREFAB RESTORATION PHASE");
@@ -268,11 +290,11 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
 
         if (unpackedPrefabs.Count == 0)
         {
-            Debug.Log("[DisplaceComponent Prefab Unpacker] No prefabs to restore");
+            DisplaceComponentLogger.Detail("[DisplaceComponent Prefab Unpacker] No prefabs to restore");
             return;
         }
 
-        Debug.Log($"[DisplaceComponent Prefab Unpacker] Restoring {unpackedPrefabs.Count} prefab(s)...");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker] Restoring {unpackedPrefabs.Count} prefab(s)...");
         DisplaceComponentLogger.Log($"Restoring {unpackedPrefabs.Count} prefab(s)...");
 
         int successCount = 0;
@@ -284,26 +306,26 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
             {
                 if (info.unpackedInstance == null)
                 {
-                    Debug.LogWarning($"[DisplaceComponent Prefab Unpacker] Unpacked instance is null, skipping");
+                    ShuganLog.Warn("DisplaceComponent Prefab Unpacker", $"Unpacked instance is null, skipping");
                     failCount++;
                     continue;
                 }
 
                 if (string.IsNullOrEmpty(info.prefabAssetPath))
                 {
-                    Debug.LogWarning($"[DisplaceComponent Prefab Unpacker] No prefab asset path for {info.gameObjectName}, skipping");
+                    ShuganLog.Warn("DisplaceComponent Prefab Unpacker", $"No prefab asset path for {info.gameObjectName}, skipping");
                     failCount++;
                     continue;
                 }
 
-                Debug.Log($"[DisplaceComponent Prefab Unpacker]   Restoring: {info.gameObjectName}");
+                DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker]   Restoring: {info.gameObjectName}");
                 DisplaceComponentLogger.Log($"  Restoring: {info.gameObjectName}");
 
                 // Load the prefab asset
                 GameObject prefabAsset = AssetDatabase.LoadAssetAtPath<GameObject>(info.prefabAssetPath);
                 if (prefabAsset == null)
                 {
-                    Debug.LogWarning($"[DisplaceComponent Prefab Unpacker] Could not load prefab asset at: {info.prefabAssetPath}");
+                    ShuganLog.Warn("DisplaceComponent Prefab Unpacker", $"Could not load prefab asset at: {info.prefabAssetPath}");
                     failCount++;
                     continue;
                 }
@@ -312,7 +334,7 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
                 GameObject newPrefabInstance = (GameObject)PrefabUtility.InstantiatePrefab(prefabAsset);
                 if (newPrefabInstance == null)
                 {
-                    Debug.LogWarning($"[DisplaceComponent Prefab Unpacker] Failed to instantiate prefab");
+                    ShuganLog.Warn("DisplaceComponent Prefab Unpacker", $"Failed to instantiate prefab");
                     failCount++;
                     continue;
                 }
@@ -329,25 +351,25 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
                 // Destroy the unpacked instance
                 GameObject.DestroyImmediate(info.unpackedInstance);
 
-                Debug.Log($"[DisplaceComponent Prefab Unpacker]     ✓ Restored successfully");
+                DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker]     ✓ Restored successfully");
                 DisplaceComponentLogger.Log($"    ✓ Restored successfully");
                 successCount++;
             }
             catch (System.Exception e)
             {
-                Debug.LogError($"[DisplaceComponent Prefab Unpacker] Failed to restore {info.gameObjectName}: {e.Message}");
+                ShuganLog.Error("DisplaceComponent Prefab Unpacker", $"Failed to restore {info.gameObjectName}: {e.Message}");
                 DisplaceComponentLogger.Log($"  ✗ FAILED to restore {info.gameObjectName}: {e.Message}");
                 failCount++;
             }
         }
 
-        Debug.Log("========================================");
-        Debug.Log($"[DisplaceComponent Prefab Unpacker] ✓ Restoration complete: {successCount}/{unpackedPrefabs.Count}");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent Prefab Unpacker] ✓ Restoration complete: {successCount}/{unpackedPrefabs.Count}");
         if (failCount > 0)
         {
-            Debug.LogWarning($"[DisplaceComponent Prefab Unpacker] {failCount} prefab(s) failed to restore");
+            ShuganLog.Warn("DisplaceComponent Prefab Unpacker", $"{failCount} prefab(s) failed to restore");
         }
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
 
         DisplaceComponentLogger.Log($"✓ Restoration complete: {successCount}/{unpackedPrefabs.Count}");
         if (failCount > 0)
@@ -366,7 +388,7 @@ public class DisplaceComponentPrefabUnpacker : IVRCSDKBuildRequestedCallback, IV
 
         if (avatarDescriptors.Length == 0)
         {
-            Debug.LogWarning("[DisplaceComponent Prefab Unpacker] No VRCAvatarDescriptor found in scene");
+            ShuganLog.Warn("DisplaceComponent Prefab Unpacker", "No VRCAvatarDescriptor found in scene");
             return null;
         }
 
@@ -400,23 +422,23 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
     // Add static constructor to verify class is loaded
     static DisplaceComponentBuildProcessor()
     {
-        Debug.Log("========================================");
-        Debug.Log($"[DisplaceComponent] ✓ Build processor class loaded!");
-        Debug.Log($"[DisplaceComponent] Callback order: -1024 (same as VRCFury)");
-        Debug.Log($"[DisplaceComponent] Implements:");
-        Debug.Log($"[DisplaceComponent]   - IVRCSDKBuildRequestedCallback (OnBuildRequested)");
-        Debug.Log($"[DisplaceComponent]   - IVRCSDKPostprocessAvatarCallback (OnPostprocessAvatar)");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] ✓ Build processor class loaded!");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] Callback order: -1024 (same as VRCFury)");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] Implements:");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent]   - IVRCSDKBuildRequestedCallback (OnBuildRequested)");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent]   - IVRCSDKPostprocessAvatarCallback (OnPostprocessAvatar)");
 
         // Verify the interfaces are available
         var buildRequestedType = typeof(IVRCSDKBuildRequestedCallback);
         var postprocessType = typeof(IVRCSDKPostprocessAvatarCallback);
-        Debug.Log($"[DisplaceComponent] ✓ Interfaces found in SDK");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] ✓ Interfaces found in SDK");
 
         // List all methods
         var thisType = typeof(DisplaceComponentBuildProcessor);
         var methods = thisType.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-        Debug.Log($"[DisplaceComponent] Public instance methods: {string.Join(", ", methods.Where(m => m.DeclaringType == thisType).Select(m => m.Name))}");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] Public instance methods: {string.Join(", ", methods.Where(m => m.DeclaringType == thisType).Select(m => m.Name))}");
+        DisplaceComponentLogger.Detail("========================================");
     }
 
     [System.Serializable]
@@ -480,7 +502,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
 
     public static void ForceRestoreAllStates()
     {
-        Debug.Log("[DisplaceComponent] Force restore triggered");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] Force restore triggered");
         RestoreAllStates();
     }
 
@@ -686,7 +708,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
 
             if (nullMappings > 0)
             {
-                Debug.LogWarning($"[DisplaceComponent]   {prefabMark} {component.gameObject.name}: {validMappings}/{component.fieldMappings.Count} mappings valid ({nullMappings} null)");
+                ShuganLog.Warn("DisplaceComponent", $"  {prefabMark} {component.gameObject.name}: {validMappings}/{component.fieldMappings.Count} mappings valid ({nullMappings} null)");
             }
             else
             {
@@ -724,20 +746,20 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
     /// </summary>
     private static GameObject FindAvatarRootBeingBuilt()
     {
-        Debug.Log("[DisplaceComponent] 🔍 Finding avatar root being built...");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] 🔍 Finding avatar root being built...");
 
         // During build, VRChat SDK creates a clone with "(Clone)" in the name
         // Find ALL GameObjects with VRCAvatarDescriptor
         VRC.SDK3.Avatars.Components.VRCAvatarDescriptor[] descriptors =
             Object.FindObjectsOfType<VRC.SDK3.Avatars.Components.VRCAvatarDescriptor>();
 
-        Debug.Log($"[DisplaceComponent] Found {descriptors.Length} avatar descriptor(s):");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] Found {descriptors.Length} avatar descriptor(s):");
         foreach (var descriptor in descriptors)
         {
             bool isClone = descriptor.gameObject.name.Contains("(Clone)");
             bool isPrefab = UnityEditor.PrefabUtility.IsPartOfPrefabInstance(descriptor.gameObject);
             string prefabInfo = isPrefab ? " [PREFAB]" : " [NOT PREFAB]";
-            Debug.Log($"[DisplaceComponent]   • {descriptor.gameObject.name}{prefabInfo} (Clone: {isClone})");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]   • {descriptor.gameObject.name}{prefabInfo} (Clone: {isClone})");
         }
 
         // Prefer the one with "(Clone)" in the name (that's the one being built)
@@ -745,7 +767,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         {
             if (descriptor.gameObject.name.Contains("(Clone)"))
             {
-                Debug.Log($"[DisplaceComponent] ✓ Selected avatar clone: {descriptor.gameObject.name}");
+                DisplaceComponentLogger.Detail($"[DisplaceComponent] ✓ Selected avatar clone: {descriptor.gameObject.name}");
                 return descriptor.gameObject;
             }
         }
@@ -753,11 +775,11 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         // Fallback: return the first one found
         if (descriptors.Length > 0)
         {
-            Debug.Log($"[DisplaceComponent] ⚠ No clone found, using first avatar: {descriptors[0].gameObject.name}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent] ⚠ No clone found, using first avatar: {descriptors[0].gameObject.name}");
             return descriptors[0].gameObject;
         }
 
-        Debug.LogError("[DisplaceComponent] ✗ No avatar root found!");
+        ShuganLog.Error("DisplaceComponent", "✗ No avatar root found!");
         return null;
     }
 
@@ -769,7 +791,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
     {
         if (obj == root)
         {
-            Debug.Log($"[DisplaceComponent]     📍 Path: <ROOT> (object is avatar root)");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]     📍 Path: <ROOT> (object is avatar root)");
             return "";
         }
 
@@ -785,9 +807,9 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
 
         if (current == null)
         {
-            Debug.LogError($"[DisplaceComponent] ✗ {obj.name} is not a child of {root.name}!");
-            Debug.LogError($"[DisplaceComponent]   Object hierarchy: {GetFullHierarchyPath(obj)}");
-            Debug.LogError($"[DisplaceComponent]   Root: {root.name}");
+            ShuganLog.Error("DisplaceComponent", $"✗ {obj.name} is not a child of {root.name}!");
+            ShuganLog.Error("DisplaceComponent", $"  Object hierarchy: {GetFullHierarchyPath(obj)}");
+            ShuganLog.Error("DisplaceComponent", $"  Root: {root.name}");
             return null;
         }
 
@@ -795,7 +817,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         string fullPath = string.Join("/", path);
         bool objIsPrefab = UnityEditor.PrefabUtility.IsPartOfPrefabInstance(obj);
         string prefabMark = objIsPrefab ? " 📦" : "";
-        Debug.Log($"[DisplaceComponent]     📍 Path: {fullPath}{prefabMark}");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent]     📍 Path: {fullPath}{prefabMark}");
         return fullPath;
     }
 
@@ -820,11 +842,11 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
     {
         if (string.IsNullOrEmpty(path))
         {
-            Debug.Log($"[DisplaceComponent]     🔍 FindByPath: <ROOT> (empty path)");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]     🔍 FindByPath: <ROOT> (empty path)");
             return root;
         }
 
-        Debug.Log($"[DisplaceComponent]     🔍 FindByPath: Looking for '{path}' under {root.name}");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent]     🔍 FindByPath: Looking for '{path}' under {root.name}");
 
         Transform current = root.transform;
         string[] parts = path.Split('/');
@@ -835,8 +857,8 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
             string part = parts[i];
             Transform found = null;
 
-            Debug.Log($"[DisplaceComponent]       [{i+1}/{parts.Length}] Looking for child: '{part}' under '{current.name}'");
-            Debug.Log($"[DisplaceComponent]         Current has {current.childCount} children");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]       [{i+1}/{parts.Length}] Looking for child: '{part}' under '{current.name}'");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]         Current has {current.childCount} children");
 
             foreach (Transform child in current)
             {
@@ -845,23 +867,23 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                     found = child;
                     bool isPrefab = UnityEditor.PrefabUtility.IsPartOfPrefabInstance(child.gameObject);
                     string prefabMark = isPrefab ? " 📦" : "";
-                    Debug.Log($"[DisplaceComponent]         ✓ Found: '{child.name}'{prefabMark}");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]         ✓ Found: '{child.name}'{prefabMark}");
                     break;
                 }
             }
 
             if (found == null)
             {
-                Debug.LogError($"[DisplaceComponent]         ✗ NOT FOUND: '{part}'");
-                Debug.LogError($"[DisplaceComponent]       Available children under '{current.name}':");
+                ShuganLog.Error("DisplaceComponent", $"        ✗ NOT FOUND: '{part}'");
+                ShuganLog.Error("DisplaceComponent", $"      Available children under '{current.name}':");
                 foreach (Transform child in current)
                 {
                     bool isPrefab = UnityEditor.PrefabUtility.IsPartOfPrefabInstance(child.gameObject);
                     string prefabMark = isPrefab ? " 📦" : "";
-                    Debug.LogError($"[DisplaceComponent]         • {child.name}{prefabMark}");
+                    ShuganLog.Error("DisplaceComponent", $"        • {child.name}{prefabMark}");
                 }
-                Debug.LogError($"[DisplaceComponent]       Full path attempted: {path}");
-                Debug.LogError($"[DisplaceComponent]       Failed at: {part} (part {i+1}/{parts.Length})");
+                ShuganLog.Error("DisplaceComponent", $"      Full path attempted: {path}");
+                ShuganLog.Error("DisplaceComponent", $"      Failed at: {part} (part {i+1}/{parts.Length})");
                 return null;
             }
 
@@ -871,7 +893,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
 
         bool finalIsPrefab = UnityEditor.PrefabUtility.IsPartOfPrefabInstance(current.gameObject);
         string finalPrefabMark = finalIsPrefab ? " 📦" : "";
-        Debug.Log($"[DisplaceComponent]     ✓ FindByPath SUCCESS: {current.gameObject.name}{finalPrefabMark}");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent]     ✓ FindByPath SUCCESS: {current.gameObject.name}{finalPrefabMark}");
         return current.gameObject;
     }
 
@@ -888,12 +910,12 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         {
             if (!descriptor.gameObject.name.Contains("(Clone)"))
             {
-                Debug.Log($"[DisplaceComponent]       Found original avatar: {descriptor.gameObject.name}");
+                DisplaceComponentLogger.Detail($"[DisplaceComponent]       Found original avatar: {descriptor.gameObject.name}");
                 return descriptor.gameObject;
             }
         }
 
-        Debug.LogWarning("[DisplaceComponent]       Could not find original avatar root!");
+        ShuganLog.Warn("DisplaceComponent", "      Could not find original avatar root!");
         return null;
     }
 
@@ -910,7 +932,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         GameObject originalAvatarRoot = FindOriginalAvatarRoot();
         if (originalAvatarRoot == null)
         {
-            Debug.LogError("[DisplaceComponent] Cannot remap without original avatar root!");
+            ShuganLog.Error("DisplaceComponent", "Cannot remap without original avatar root!");
             return;
         }
 
@@ -937,7 +959,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                     }
                     else
                     {
-                        Debug.LogWarning($"[DisplaceComponent] ✗ Could not find sourceGameObject at: {sourcePath}");
+                        ShuganLog.Warn("DisplaceComponent", $"✗ Could not find sourceGameObject at: {sourcePath}");
                         mappingSuccess = false;
                     }
                 }
@@ -960,13 +982,13 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                         }
                         else
                         {
-                            Debug.LogWarning($"[DisplaceComponent] ✗ Component {componentType.Name} not found on clone");
+                            ShuganLog.Warn("DisplaceComponent", $"✗ Component {componentType.Name} not found on clone");
                             mappingSuccess = false;
                         }
                     }
                     else
                     {
-                        Debug.LogWarning($"[DisplaceComponent] ✗ Could not find GameObject at: {componentPath}");
+                        ShuganLog.Warn("DisplaceComponent", $"✗ Could not find GameObject at: {componentPath}");
                         mappingSuccess = false;
                     }
                 }
@@ -981,7 +1003,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         // Only log summary to console, detailed to file
         if (failCount > 0)
         {
-            Debug.LogWarning($"[DisplaceComponent] Remapped {successCount}/{component.fieldMappings.Count} field mappings ({failCount} failed)");
+            ShuganLog.Warn("DisplaceComponent", $"Remapped {successCount}/{component.fieldMappings.Count} field mappings ({failCount} failed)");
             DisplaceComponentLogger.Log($"  ⚠ Field mapping remapping: {successCount}/{component.fieldMappings.Count} successful, {failCount} failed");
         }
         else
@@ -1003,7 +1025,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         GameObject originalAvatarRoot = FindOriginalAvatarRoot();
         if (originalAvatarRoot == null)
         {
-            Debug.LogError("[DisplaceComponent] Cannot remap without original avatar root!");
+            ShuganLog.Error("DisplaceComponent", "Cannot remap without original avatar root!");
             return;
         }
 
@@ -1033,13 +1055,13 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                     }
                     else
                     {
-                        Debug.LogWarning($"[DisplaceComponent] ✗ Component index mismatch: {componentType.Name}");
+                        ShuganLog.Warn("DisplaceComponent", $"✗ Component index mismatch: {componentType.Name}");
                         failCount++;
                     }
                 }
                 else
                 {
-                    Debug.LogWarning($"[DisplaceComponent] ✗ Could not find GameObject at: {componentPath}");
+                    ShuganLog.Warn("DisplaceComponent", $"✗ Could not find GameObject at: {componentPath}");
                     failCount++;
                 }
             }
@@ -1048,7 +1070,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         // Only log summary to console, detailed to file
         if (failCount > 0)
         {
-            Debug.LogWarning($"[DisplaceComponent] Remapped {successCount}/{component.componentsToMove.Count} components ({failCount} failed)");
+            ShuganLog.Warn("DisplaceComponent", $"Remapped {successCount}/{component.componentsToMove.Count} components ({failCount} failed)");
             DisplaceComponentLogger.Log($"  ⚠ Component remapping: {successCount}/{component.componentsToMove.Count} successful, {failCount} failed");
         }
         else
@@ -1064,17 +1086,17 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
     {
         if (requestedBuildType != VRCSDKRequestedBuildType.Avatar)
         {
-            Debug.Log("[DisplaceComponent] Build processor: Not an avatar build, skipping");
+            DisplaceComponentLogger.Detail("[DisplaceComponent] Build processor: Not an avatar build, skipping");
             return true;
         }
 
         // Start detailed file logging
         DisplaceComponentLogger.StartNewLog();
 
-        Debug.Log("========================================");
-        Debug.Log("[DisplaceComponent] BUILD STARTED - OnBuildRequested");
-        Debug.Log($"[DisplaceComponent] Callback Order: {callbackOrder}");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] BUILD STARTED - OnBuildRequested");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] Callback Order: {callbackOrder}");
+        DisplaceComponentLogger.Detail("========================================");
 
         DisplaceComponentLogger.Log("========================================");
         DisplaceComponentLogger.Log("BUILD STARTED - OnBuildRequested");
@@ -1091,7 +1113,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
             GameObject avatarRoot = FindAvatarRootBeingBuilt();
             if (avatarRoot == null)
             {
-                Debug.LogError("[DisplaceComponent] Cannot find avatar root being built!");
+                ShuganLog.Error("DisplaceComponent", "Cannot find avatar root being built!");
                 isProcessing = false;
                 return false;
             }
@@ -1101,8 +1123,8 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                 .Where(dc => dc != null && dc.gameObject != null && dc.enabled)
                 .ToList();
 
-            Debug.Log($"[DisplaceComponent] Processing avatar: {avatarRoot.name}");
-            Debug.Log($"[DisplaceComponent] Found {displaceComponents.Count} component(s) in this avatar");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent] Processing avatar: {avatarRoot.name}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent] Found {displaceComponents.Count} component(s) in this avatar");
 
             DisplaceComponentLogger.Log($"Processing avatar: {avatarRoot.name}");
             DisplaceComponentLogger.Log($"Found {displaceComponents.Count} component(s) in this avatar");
@@ -1114,7 +1136,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                 int fillFieldsCount = displaceComponents.Count(dc => dc.operationMode == DisplaceComponent.OperationMode.FillFields);
                 int displaceCount = displaceComponents.Count - fillFieldsCount;
 
-                Debug.Log($"[DisplaceComponent] Summary: {prefabCount} prefabs, {fillFieldsCount} FillFields, {displaceCount} Displace");
+                DisplaceComponentLogger.Detail($"[DisplaceComponent] Summary: {prefabCount} prefabs, {fillFieldsCount} FillFields, {displaceCount} Displace");
                 DisplaceComponentLogger.Log($"Summary: {prefabCount} prefabs, {fillFieldsCount} FillFields, {displaceCount} Displace");
                 DisplaceComponentLogger.Log("");
                 DisplaceComponentLogger.Log("Component Details:");
@@ -1141,7 +1163,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
 
             if (displaceComponents.Count == 0)
             {
-                Debug.Log("[DisplaceComponent] No DisplaceComponent instances to process");
+                DisplaceComponentLogger.Detail("[DisplaceComponent] No DisplaceComponent instances to process");
                 isProcessing = false;
                 return true;
             }
@@ -1162,13 +1184,13 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
 
                 if (!proceed)
                 {
-                    Debug.LogWarning("[DisplaceComponent] Build cancelled by user");
+                    ShuganLog.Warn("DisplaceComponent", "Build cancelled by user");
                     isProcessing = false;
                     return false;
                 }
             }
 
-            Debug.Log("[DisplaceComponent] Starting displacement process...");
+            DisplaceComponentLogger.Detail("[DisplaceComponent] Starting displacement process...");
             DisplaceComponentLogger.Log("Starting displacement process...");
             DisplaceComponentLogger.Log("");
 
@@ -1204,14 +1226,14 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                     }
                     else
                     {
-                        Debug.LogWarning($"[DisplaceComponent] ✗ Failed: {component.gameObject.name}");
+                        ShuganLog.Warn("DisplaceComponent", $"✗ Failed: {component.gameObject.name}");
                         DisplaceComponentLogger.Log("  ✗ Displacement FAILED");
                         failCount++;
                     }
                 }
                 else
                 {
-                    Debug.LogError($"[DisplaceComponent] ✗ Backup failed: {component.gameObject.name}");
+                    ShuganLog.Error("DisplaceComponent", $"✗ Backup failed: {component.gameObject.name}");
                     DisplaceComponentLogger.Log("  ✗ Backup creation FAILED");
                     failCount++;
                 }
@@ -1221,17 +1243,17 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
             // Show summary instead of per-component logs
             if (failCount > 0)
             {
-                Debug.LogWarning($"[DisplaceComponent] Processed: {successCount} successful, {failCount} failed");
+                ShuganLog.Warn("DisplaceComponent", $"Processed: {successCount} successful, {failCount} failed");
             }
             else
             {
-                Debug.Log($"[DisplaceComponent] ✓ All {successCount} components processed successfully");
+                DisplaceComponentLogger.Detail($"[DisplaceComponent] ✓ All {successCount} components processed successfully");
             }
 
-            Debug.Log("========================================");
-            Debug.Log($"[DisplaceComponent] DISPLACEMENT COMPLETED: {successCount}/{displaceComponents.Count}");
-            Debug.Log($"[DisplaceComponent] Waiting for build to complete...");
-            Debug.Log("========================================");
+            DisplaceComponentLogger.Detail("========================================");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent] DISPLACEMENT COMPLETED: {successCount}/{displaceComponents.Count}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent] Waiting for build to complete...");
+            DisplaceComponentLogger.Detail("========================================");
 
             DisplaceComponentLogger.Log("========================================");
             DisplaceComponentLogger.Log($"DISPLACEMENT COMPLETED: {successCount}/{displaceComponents.Count}");
@@ -1246,11 +1268,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         }
         catch (System.Exception e)
         {
-            Debug.LogError("========================================");
-            Debug.LogError($"[DisplaceComponent] ERROR during displacement:");
-            Debug.LogError($"{e.Message}");
-            Debug.LogError($"{e.StackTrace}");
-            Debug.LogError("========================================");
+            ShuganLog.Error("DisplaceComponent", $"Error during displacement: {e.Message}\n{e.StackTrace}");
 
             DisplaceComponentLogger.Log("");
             DisplaceComponentLogger.Log("========================================");
@@ -1278,10 +1296,10 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
     /// </summary>
     public void OnPostprocessAvatar()
     {
-        Debug.Log("========================================");
-        Debug.Log("[DisplaceComponent] BUILD COMPLETED - OnPostprocessAvatar");
-        Debug.Log("[DisplaceComponent] SDK build finished, starting restoration...");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] BUILD COMPLETED - OnPostprocessAvatar");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] SDK build finished, starting restoration...");
+        DisplaceComponentLogger.Detail("========================================");
 
         DisplaceComponentLogger.Log("");
         DisplaceComponentLogger.Log("========================================");
@@ -1312,13 +1330,13 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
 
             bool isPrefab = UnityEditor.PrefabUtility.IsPartOfPrefabInstance(component.gameObject);
             string prefabMark = isPrefab ? " 📦" : "";
-            Debug.Log($"[DisplaceComponent]   Creating backup{prefabMark} (index: {backup.componentIndex})");
-            Debug.Log($"[DisplaceComponent]   GameObject: {component.gameObject.name}");
-            Debug.Log($"[DisplaceComponent]   GameObject Path: {backup.targetGameObjectPath}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]   Creating backup{prefabMark} (index: {backup.componentIndex})");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]   GameObject: {component.gameObject.name}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]   GameObject Path: {backup.targetGameObjectPath}");
 
             // Store operation mode
             backup.operationMode = component.operationMode;
-            Debug.Log($"[DisplaceComponent]   Operation Mode: {backup.operationMode}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]   Operation Mode: {backup.operationMode}");
 
             // Store DisplaceComponent configuration
             if (component.linkFrom != null)
@@ -1349,7 +1367,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                 // Store components to move data (Displace mode)
                 if (component.componentsToMove != null)
                 {
-                    Debug.Log($"[DisplaceComponent]   Backing up {component.componentsToMove.Count} component reference(s)");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]   Backing up {component.componentsToMove.Count} component reference(s)");
                     foreach (var compRef in component.componentsToMove)
                     {
                         if (compRef != null && compRef.component != null)
@@ -1367,7 +1385,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
 
                             backup.componentsToMoveData.Add(data);
 
-                            Debug.Log($"[DisplaceComponent]     • {data.componentTypeName} at {data.sourceGameObjectPath}");
+                            DisplaceComponentLogger.Detail($"[DisplaceComponent]     • {data.componentTypeName} at {data.sourceGameObjectPath}");
                         }
                     }
                 }
@@ -1377,45 +1395,45 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                 // Store field mappings data (FillFields mode)
                 if (component.fieldMappings != null)
                 {
-                    Debug.Log($"[DisplaceComponent]   Backing up {component.fieldMappings.Count} field mapping(s) for FillFields mode");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]   Backing up {component.fieldMappings.Count} field mapping(s) for FillFields mode");
                     int mappingIndex = 0;
                     foreach (var mapping in component.fieldMappings)
                     {
                         mappingIndex++;
-                        Debug.Log($"[DisplaceComponent]     --- Field Mapping [{mappingIndex}/{component.fieldMappings.Count}] ---");
+                        DisplaceComponentLogger.Detail($"[DisplaceComponent]     --- Field Mapping [{mappingIndex}/{component.fieldMappings.Count}] ---");
 
                         if (mapping == null)
                         {
-                            Debug.LogWarning($"[DisplaceComponent]       ✗ Mapping is null, skipping");
+                            ShuganLog.Warn("DisplaceComponent", $"      ✗ Mapping is null, skipping");
                             continue;
                         }
 
                         if (mapping.targetComponent == null)
                         {
-                            Debug.LogWarning($"[DisplaceComponent]       ✗ Target component is null, skipping");
+                            ShuganLog.Warn("DisplaceComponent", $"      ✗ Target component is null, skipping");
                             continue;
                         }
 
                         if (string.IsNullOrEmpty(mapping.fieldPath))
                         {
-                            Debug.LogWarning($"[DisplaceComponent]       ✗ Field path is empty, skipping");
+                            ShuganLog.Warn("DisplaceComponent", $"      ✗ Field path is empty, skipping");
                             continue;
                         }
 
                         FieldMappingBackup data = new FieldMappingBackup();
 
                         // CRITICAL CHANGES: Store paths instead of references
-                        Debug.Log($"[DisplaceComponent]       Target Component: {mapping.targetComponent.GetType().Name}");
-                        Debug.Log($"[DisplaceComponent]       On GameObject: {mapping.targetComponent.gameObject.name}");
+                        DisplaceComponentLogger.Detail($"[DisplaceComponent]       Target Component: {mapping.targetComponent.GetType().Name}");
+                        DisplaceComponentLogger.Detail($"[DisplaceComponent]       On GameObject: {mapping.targetComponent.gameObject.name}");
 
                         if (mapping.sourceGameObject != null)
                         {
-                            Debug.Log($"[DisplaceComponent]       Source GameObject: {mapping.sourceGameObject.name}");
+                            DisplaceComponentLogger.Detail($"[DisplaceComponent]       Source GameObject: {mapping.sourceGameObject.name}");
                             data.sourceGameObjectPath = GetPathFromRoot(mapping.sourceGameObject, backup.avatarRoot);
                         }
                         else
                         {
-                            Debug.Log($"[DisplaceComponent]       Source GameObject: <none>");
+                            DisplaceComponentLogger.Detail($"[DisplaceComponent]       Source GameObject: <none>");
                         }
 
                         data.componentGameObjectPath = GetPathFromRoot(mapping.targetComponent.gameObject, backup.avatarRoot);
@@ -1434,11 +1452,11 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                                         !string.IsNullOrEmpty(mapping.textValue) ? $"\"{mapping.textValue}\"" :
                                         !string.IsNullOrEmpty(mapping.searchPath) ? $"[search path: {mapping.searchPath}]" :
                                         mapping.targetBone.ToString();
-                        Debug.Log($"[DisplaceComponent]       Field: {mapping.fieldPath}");
-                        Debug.Log($"[DisplaceComponent]       Fill Value: {fillInfo}");
-                        Debug.Log($"[DisplaceComponent]       ✓ Backup stored");
+                        DisplaceComponentLogger.Detail($"[DisplaceComponent]       Field: {mapping.fieldPath}");
+                        DisplaceComponentLogger.Detail($"[DisplaceComponent]       Fill Value: {fillInfo}");
+                        DisplaceComponentLogger.Detail($"[DisplaceComponent]       ✓ Backup stored");
                     }
-                    Debug.Log($"[DisplaceComponent]   Total field mappings backed up: {backup.fieldMappingBackups.Count}");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]   Total field mappings backed up: {backup.fieldMappingBackups.Count}");
                 }
             }
 
@@ -1446,7 +1464,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         }
         catch (System.Exception e)
         {
-            Debug.LogError($"[DisplaceComponent] Failed to create backup: {e.Message}");
+            ShuganLog.Error("DisplaceComponent", $"Failed to create backup: {e.Message}");
             return null;
         }
     }
@@ -1455,22 +1473,22 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
     {
         if (!isProcessing)
         {
-            Debug.Log("[DisplaceComponent] Not processing, nothing to restore");
+            DisplaceComponentLogger.Detail("[DisplaceComponent] Not processing, nothing to restore");
             return;
         }
 
         if (processedComponents.Count == 0 && componentBackups.Count == 0)
         {
-            Debug.Log("[DisplaceComponent] No components to restore");
+            DisplaceComponentLogger.Detail("[DisplaceComponent] No components to restore");
             isProcessing = false;
             return;
         }
 
-        Debug.Log("========================================");
-        Debug.Log($"[DisplaceComponent] RESTORATION STARTING");
-        Debug.Log($"[DisplaceComponent]   - Components to restore: {processedComponents.Count}");
-        Debug.Log($"[DisplaceComponent]   - Backups available: {componentBackups.Count}");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] RESTORATION STARTING");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent]   - Components to restore: {processedComponents.Count}");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent]   - Backups available: {componentBackups.Count}");
+        DisplaceComponentLogger.Detail("========================================");
 
         int restoredCount = 0;
         int displaceComponentsRestored = 0;
@@ -1478,14 +1496,14 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         List<GameObject> affectedObjects = new List<GameObject>();
 
         // STEP 1: Restore displaced components
-        Debug.Log("[DisplaceComponent] STEP 1: Restoring displaced components...");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] STEP 1: Restoring displaced components...");
         foreach (var component in processedComponents)
         {
             if (component != null)
             {
                 try
                 {
-                    Debug.Log($"[DisplaceComponent]   Restoring: {component.gameObject.name}");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]   Restoring: {component.gameObject.name}");
                     component.RestoreBuildTimeState();
                     restoredCount++;
                     
@@ -1496,40 +1514,40 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                 }
                 catch (System.Exception e)
                 {
-                    Debug.LogError($"[DisplaceComponent]   ✗ Failed: {e.Message}");
+                    ShuganLog.Error("DisplaceComponent", $"  ✗ Failed: {e.Message}");
                     failedCount++;
                 }
             }
         }
 
         // STEP 2: Restore DisplaceComponent instances
-        Debug.Log("[DisplaceComponent] STEP 2: Restoring DisplaceComponent instances...");
-        Debug.Log($"[DisplaceComponent] Total backups to restore: {componentBackups.Count}");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] STEP 2: Restoring DisplaceComponent instances...");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] Total backups to restore: {componentBackups.Count}");
 
         int backupIndex = 0;
         foreach (var backup in componentBackups)
         {
             backupIndex++;
-            Debug.Log($"[DisplaceComponent] ==================== Backup [{backupIndex}/{componentBackups.Count}] ====================");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent] ==================== Backup [{backupIndex}/{componentBackups.Count}] ====================");
 
             // CRITICAL FIX: Find GameObject by path in the CURRENT avatar (the clone)
             GameObject currentAvatarRoot = backup.avatarRoot;
 
             if (currentAvatarRoot == null)
             {
-                Debug.LogError("[DisplaceComponent]   ✗ Avatar root is null, cannot restore!");
+                ShuganLog.Error("DisplaceComponent", "  ✗ Avatar root is null, cannot restore!");
                 failedCount++;
                 continue;
             }
 
-            Debug.Log($"[DisplaceComponent]   Avatar root: {currentAvatarRoot.name}");
-            Debug.Log($"[DisplaceComponent]   Target path: {backup.targetGameObjectPath}");
-            Debug.Log($"[DisplaceComponent]   Operation mode: {backup.operationMode}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]   Avatar root: {currentAvatarRoot.name}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]   Target path: {backup.targetGameObjectPath}");
+            DisplaceComponentLogger.Detail($"[DisplaceComponent]   Operation mode: {backup.operationMode}");
 
             GameObject targetGameObject = FindByPath(currentAvatarRoot, backup.targetGameObjectPath);
             if (targetGameObject == null)
             {
-                Debug.LogError($"[DisplaceComponent]   ✗ Cannot find GameObject at path: {backup.targetGameObjectPath}");
+                ShuganLog.Error("DisplaceComponent", $"  ✗ Cannot find GameObject at path: {backup.targetGameObjectPath}");
                 failedCount++;
                 continue;
             }
@@ -1538,13 +1556,13 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
             {
                 bool isPrefab = UnityEditor.PrefabUtility.IsPartOfPrefabInstance(targetGameObject);
                 string prefabMark = isPrefab ? " 📦" : "";
-                Debug.Log($"[DisplaceComponent]   ✓ Found target: {targetGameObject.name}{prefabMark}");
+                DisplaceComponentLogger.Detail($"[DisplaceComponent]   ✓ Found target: {targetGameObject.name}{prefabMark}");
 
                 DisplaceComponent existingComponent = targetGameObject.GetComponent<DisplaceComponent>();
 
                 if (existingComponent == null)
                 {
-                    Debug.Log($"[DisplaceComponent]     Re-adding component...");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]     Re-adding component...");
                     existingComponent = targetGameObject.AddComponent<DisplaceComponent>();
                     displaceComponentsRestored++;
                 }
@@ -1565,7 +1583,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                 }
                 existingComponent.enableAdvancedLinkTargetMode = backup.enableAdvancedLinkTargetMode;
 
-                Debug.Log($"[DisplaceComponent]     Restoring mode: {backup.operationMode}");
+                DisplaceComponentLogger.Detail($"[DisplaceComponent]     Restoring mode: {backup.operationMode}");
 
                 // Restore offset paths
                 existingComponent.offsetPaths.Clear();
@@ -1578,7 +1596,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                 {
                     // Restore components to move list (Displace mode)
                     existingComponent.componentsToMove.Clear();
-                    Debug.Log($"[DisplaceComponent]     Restoring {backup.componentsToMoveData.Count} component reference(s)");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]     Restoring {backup.componentsToMoveData.Count} component reference(s)");
 
                     foreach (var data in backup.componentsToMoveData)
                     {
@@ -1594,73 +1612,73 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                                 {
                                     Component comp = compsOfType[data.componentIndex];
                                     existingComponent.componentsToMove.Add(new DisplaceComponent.ComponentReference(comp));
-                                    Debug.Log($"[DisplaceComponent]       ✓ {data.componentTypeName}");
+                                    DisplaceComponentLogger.Detail($"[DisplaceComponent]       ✓ {data.componentTypeName}");
                                 }
                                 else
                                 {
-                                    Debug.LogWarning($"[DisplaceComponent]       ✗ Component index out of range: {data.componentTypeName}");
+                                    ShuganLog.Warn("DisplaceComponent", $"      ✗ Component index out of range: {data.componentTypeName}");
                                 }
                             }
                         }
                         else
                         {
-                            Debug.LogWarning($"[DisplaceComponent]       ✗ GameObject not found at path: {data.sourceGameObjectPath}");
+                            ShuganLog.Warn("DisplaceComponent", $"      ✗ GameObject not found at path: {data.sourceGameObjectPath}");
                         }
                     }
 
-                    Debug.Log($"[DisplaceComponent]     Final component count: {existingComponent.componentsToMove.Count}");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]     Final component count: {existingComponent.componentsToMove.Count}");
                 }
                 else // FillFields mode
                 {
                     // Restore field mappings list (FillFields mode)
                     existingComponent.fieldMappings.Clear();
-                    Debug.Log($"[DisplaceComponent]     === FillFields Mode Restoration ===");
-                    Debug.Log($"[DisplaceComponent]     Restoring {backup.fieldMappingBackups.Count} field mapping(s)");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]     === FillFields Mode Restoration ===");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]     Restoring {backup.fieldMappingBackups.Count} field mapping(s)");
 
                     int restoreIndex = 0;
                     foreach (var data in backup.fieldMappingBackups)
                     {
                         restoreIndex++;
-                        Debug.Log($"[DisplaceComponent]     --- Restoring Field Mapping [{restoreIndex}/{backup.fieldMappingBackups.Count}] ---");
-                        Debug.Log($"[DisplaceComponent]       Looking for component at path: {data.componentGameObjectPath}");
+                        DisplaceComponentLogger.Detail($"[DisplaceComponent]     --- Restoring Field Mapping [{restoreIndex}/{backup.fieldMappingBackups.Count}] ---");
+                        DisplaceComponentLogger.Detail($"[DisplaceComponent]       Looking for component at path: {data.componentGameObjectPath}");
 
                         // CRITICAL FIX: Find GameObjects by path in the CURRENT avatar (the clone)
                         GameObject componentGameObject = FindByPath(currentAvatarRoot, data.componentGameObjectPath);
                         if (componentGameObject == null)
                         {
-                            Debug.LogError($"[DisplaceComponent]       ✗ Cannot find GameObject at path: {data.componentGameObjectPath}");
+                            ShuganLog.Error("DisplaceComponent", $"      ✗ Cannot find GameObject at path: {data.componentGameObjectPath}");
                             continue;
                         }
 
                         bool compGoPrefab = UnityEditor.PrefabUtility.IsPartOfPrefabInstance(componentGameObject);
                         string compGoPrefabMark = compGoPrefab ? " 📦" : "";
-                        Debug.Log($"[DisplaceComponent]       ✓ Found GameObject: {componentGameObject.name}{compGoPrefabMark}");
+                        DisplaceComponentLogger.Detail($"[DisplaceComponent]       ✓ Found GameObject: {componentGameObject.name}{compGoPrefabMark}");
 
                         // Find the specific component by type
-                        Debug.Log($"[DisplaceComponent]       Looking for component type: {data.componentTypeFullName}");
+                        DisplaceComponentLogger.Detail($"[DisplaceComponent]       Looking for component type: {data.componentTypeFullName}");
                         System.Type componentType = System.Type.GetType(data.componentTypeFullName);
                         if (componentType == null)
                         {
-                            Debug.LogError($"[DisplaceComponent]       ✗ Cannot find type: {data.componentTypeFullName}");
+                            ShuganLog.Error("DisplaceComponent", $"      ✗ Cannot find type: {data.componentTypeFullName}");
                             continue;
                         }
 
                         Component comp = componentGameObject.GetComponent(componentType);
                         if (comp != null)
                         {
-                            Debug.Log($"[DisplaceComponent]       ✓ Found component: {comp.GetType().Name}");
+                            DisplaceComponentLogger.Detail($"[DisplaceComponent]       ✓ Found component: {comp.GetType().Name}");
 
                             DisplaceComponent.FieldMapping mapping = new DisplaceComponent.FieldMapping();
 
                             // Restore sourceGameObject if it had one
                             if (!string.IsNullOrEmpty(data.sourceGameObjectPath))
                             {
-                                Debug.Log($"[DisplaceComponent]       Source GameObject path: {data.sourceGameObjectPath}");
+                                DisplaceComponentLogger.Detail($"[DisplaceComponent]       Source GameObject path: {data.sourceGameObjectPath}");
                                 mapping.sourceGameObject = FindByPath(currentAvatarRoot, data.sourceGameObjectPath);
                             }
                             else
                             {
-                                Debug.Log($"[DisplaceComponent]       No source GameObject");
+                                DisplaceComponentLogger.Detail($"[DisplaceComponent]       No source GameObject");
                             }
 
                             mapping.targetComponent = comp;
@@ -1677,23 +1695,23 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                                             !string.IsNullOrEmpty(data.textValue) ? $"\"{data.textValue}\"" :
                                             !string.IsNullOrEmpty(data.searchPath) ? $"[search path: {data.searchPath}]" :
                                             data.targetBone.ToString();
-                            Debug.Log($"[DisplaceComponent]       Field: {data.fieldPath}");
-                            Debug.Log($"[DisplaceComponent]       Fill Value: {fillInfo}");
-                            Debug.Log($"[DisplaceComponent]       ✓ Field mapping restored successfully");
+                            DisplaceComponentLogger.Detail($"[DisplaceComponent]       Field: {data.fieldPath}");
+                            DisplaceComponentLogger.Detail($"[DisplaceComponent]       Fill Value: {fillInfo}");
+                            DisplaceComponentLogger.Detail($"[DisplaceComponent]       ✓ Field mapping restored successfully");
                         }
                         else
                         {
-                            Debug.LogError($"[DisplaceComponent]       ✗ Component type {componentType.Name} not found on GameObject: {componentGameObject.name}");
-                            Debug.LogError($"[DisplaceComponent]         Available components on {componentGameObject.name}:");
+                            ShuganLog.Error("DisplaceComponent", $"      ✗ Component type {componentType.Name} not found on GameObject: {componentGameObject.name}");
+                            ShuganLog.Error("DisplaceComponent", $"        Available components on {componentGameObject.name}:");
                             foreach (Component c in componentGameObject.GetComponents<Component>())
                             {
-                                Debug.LogError($"[DisplaceComponent]           • {c.GetType().Name}");
+                                ShuganLog.Error("DisplaceComponent", $"          • {c.GetType().Name}");
                             }
                         }
                     }
 
-                    Debug.Log($"[DisplaceComponent]     === FillFields Restoration Complete ===");
-                    Debug.Log($"[DisplaceComponent]     Final mapping count: {existingComponent.fieldMappings.Count}");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]     === FillFields Restoration Complete ===");
+                    DisplaceComponentLogger.Detail($"[DisplaceComponent]     Final mapping count: {existingComponent.fieldMappings.Count}");
                 }
                 
                 // Restore component order
@@ -1709,7 +1727,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                         {
                             UnityEditorInternal.ComponentUtility.MoveComponentUp(existingComponent);
                         }
-                        Debug.Log($"[DisplaceComponent]     Moved up {movesNeeded} positions");
+                        DisplaceComponentLogger.Detail($"[DisplaceComponent]     Moved up {movesNeeded} positions");
                     }
                 }
 
@@ -1720,22 +1738,22 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
                     affectedObjects.Add(targetGameObject);
                 }
                 
-                Debug.Log($"[DisplaceComponent]     ✓ Complete");
+                DisplaceComponentLogger.Detail($"[DisplaceComponent]     ✓ Complete");
                 
             }
             catch (System.Exception e)
             {
-                Debug.LogError($"[DisplaceComponent]   ✗ Failed: {e.Message}");
+                ShuganLog.Error("DisplaceComponent", $"  ✗ Failed: {e.Message}");
                 failedCount++;
             }
         }
 
-        Debug.Log("========================================");
-        Debug.Log($"[DisplaceComponent] RESTORATION COMPLETED:");
-        Debug.Log($"  - Displaced components: {restoredCount}");
-        Debug.Log($"  - DisplaceComponents: {displaceComponentsRestored}");
-        Debug.Log($"  - Failed: {failedCount}");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] RESTORATION COMPLETED:");
+        DisplaceComponentLogger.Detail($"  - Displaced components: {restoredCount}");
+        DisplaceComponentLogger.Detail($"  - DisplaceComponents: {displaceComponentsRestored}");
+        DisplaceComponentLogger.Detail($"  - Failed: {failedCount}");
+        DisplaceComponentLogger.Detail("========================================");
         
         foreach (var obj in affectedObjects)
         {
@@ -1772,7 +1790,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         {
             if (state == PlayModeStateChange.ExitingEditMode && isProcessing)
             {
-                Debug.LogWarning("[DisplaceComponent] Entering play mode during build - forcing restore");
+                ShuganLog.Warn("DisplaceComponent", "Entering play mode during build - forcing restore");
                 RestoreAllStates();
             }
         };
@@ -1781,7 +1799,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         {
             if (isProcessing)
             {
-                Debug.LogWarning("[DisplaceComponent] Editor quitting during build - forcing restore");
+                ShuganLog.Warn("DisplaceComponent", "Editor quitting during build - forcing restore");
                 RestoreAllStates();
             }
         };
@@ -1790,7 +1808,7 @@ public class DisplaceComponentBuildProcessor : IVRCSDKBuildRequestedCallback, IV
         {
             if (isProcessing)
             {
-                Debug.LogWarning("[DisplaceComponent] Scene changed during build - forcing restore");
+                ShuganLog.Warn("DisplaceComponent", "Scene changed during build - forcing restore");
                 RestoreAllStates();
             }
         };
@@ -1803,14 +1821,14 @@ public class DisplaceComponentPreprocessor : IVRCSDKPreprocessAvatarCallback
 
     public bool OnPreprocessAvatar(GameObject avatarGameObject)
     {
-        Debug.Log("========================================");
-        Debug.Log("[DisplaceComponent] PREPROCESSOR");
-        Debug.Log($"[DisplaceComponent] Avatar: {avatarGameObject.name}");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] PREPROCESSOR");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] Avatar: {avatarGameObject.name}");
         
         var displaceComponents = avatarGameObject.GetComponentsInChildren<DisplaceComponent>(true);
-        Debug.Log($"[DisplaceComponent] Found {displaceComponents.Length} component(s)");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] Found {displaceComponents.Length} component(s)");
         
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
         return true;
     }
 }
@@ -1821,19 +1839,19 @@ public class DisplaceComponentCleanup : IVRCSDKPreprocessAvatarCallback
 
     public bool OnPreprocessAvatar(GameObject avatarGameObject)
     {
-        Debug.Log("========================================");
-        Debug.Log("[DisplaceComponent] CLEANUP CALLBACK");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] CLEANUP CALLBACK");
+        DisplaceComponentLogger.Detail("========================================");
 
         var displaceComponents = avatarGameObject.GetComponentsInChildren<DisplaceComponent>(true);
         
         if (displaceComponents.Length == 0)
         {
-            Debug.Log("[DisplaceComponent] No components to remove");
+            DisplaceComponentLogger.Detail("[DisplaceComponent] No components to remove");
             return true;
         }
 
-        Debug.Log($"[DisplaceComponent] Removing {displaceComponents.Length} instance(s)");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] Removing {displaceComponents.Length} instance(s)");
         
         int removedCount = 0;
         foreach (var component in displaceComponents)
@@ -1843,13 +1861,13 @@ public class DisplaceComponentCleanup : IVRCSDKPreprocessAvatarCallback
                 GameObject go = component.gameObject;
                 Object.DestroyImmediate(component);
                 removedCount++;
-                Debug.Log($"[DisplaceComponent] Removed from: {go.name}");
+                DisplaceComponentLogger.Detail($"[DisplaceComponent] Removed from: {go.name}");
             }
         }
 
-        Debug.Log($"[DisplaceComponent] Cleanup complete - removed {removedCount}");
-        Debug.Log("[DisplaceComponent] Will be restored after build via OnPostprocessAvatar");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] Cleanup complete - removed {removedCount}");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] Will be restored after build via OnPostprocessAvatar");
+        DisplaceComponentLogger.Detail("========================================");
 
         return true;
     }
@@ -1886,9 +1904,9 @@ public static class DisplaceComponentMenu
             return;
         }
 
-        Debug.Log("========================================");
-        Debug.Log("[DisplaceComponent] MANUAL TEST");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] MANUAL TEST");
+        DisplaceComponentLogger.Detail("========================================");
 
         int successCount = 0;
         foreach (var component in displaceComponents)
@@ -1899,8 +1917,8 @@ public static class DisplaceComponentMenu
             }
         }
 
-        Debug.Log($"[DisplaceComponent] TEST COMPLETE: {successCount}/{displaceComponents.Length}");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] TEST COMPLETE: {successCount}/{displaceComponents.Length}");
+        DisplaceComponentLogger.Detail("========================================");
 
         EditorUtility.DisplayDialog(
             "Displace Component",
@@ -1943,9 +1961,9 @@ public static class DisplaceComponentMenu
             return;
         }
 
-        Debug.Log("========================================");
-        Debug.Log("[DisplaceComponent] MANUAL RESTORE");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail("[DisplaceComponent] MANUAL RESTORE");
+        DisplaceComponentLogger.Detail("========================================");
 
         int restoredCount = 0;
         foreach (var component in displaceComponents)
@@ -1954,8 +1972,8 @@ public static class DisplaceComponentMenu
             restoredCount++;
         }
 
-        Debug.Log($"[DisplaceComponent] RESTORED: {restoredCount}");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] RESTORED: {restoredCount}");
+        DisplaceComponentLogger.Detail("========================================");
 
         EditorUtility.DisplayDialog(
             "Displace Component",
@@ -1989,19 +2007,19 @@ public static class DisplaceComponentMenu
     {
         var displaceComponents = Object.FindObjectsOfType<DisplaceComponent>();
         
-        Debug.Log("========================================");
-        Debug.Log($"[DisplaceComponent] FOUND: {displaceComponents.Length}");
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
+        DisplaceComponentLogger.Detail($"[DisplaceComponent] FOUND: {displaceComponents.Length}");
+        DisplaceComponentLogger.Detail("========================================");
         
         foreach (var dc in displaceComponents)
         {
-            Debug.Log($"GameObject: {dc.gameObject.name}");
-            Debug.Log($"  Link From: {(dc.linkFrom != null ? dc.linkFrom.name : "NULL")}");
-            Debug.Log($"  Link To: {dc.linkToBone}");
-            Debug.Log($"  Components: {dc.componentsToMove?.Count ?? 0}");
+            DisplaceComponentLogger.Detail($"GameObject: {dc.gameObject.name}");
+            DisplaceComponentLogger.Detail($"  Link From: {(dc.linkFrom != null ? dc.linkFrom.name : "NULL")}");
+            DisplaceComponentLogger.Detail($"  Link To: {dc.linkToBone}");
+            DisplaceComponentLogger.Detail($"  Components: {dc.componentsToMove?.Count ?? 0}");
         }
         
-        Debug.Log("========================================");
+        DisplaceComponentLogger.Detail("========================================");
     }
 
     [MenuItem(MENU_ROOT + "About", false, 1929)]

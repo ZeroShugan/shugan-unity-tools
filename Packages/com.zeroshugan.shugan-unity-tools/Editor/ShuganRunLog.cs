@@ -52,6 +52,13 @@ namespace ZeroShugan.ShuganUnityTools
 
         public bool IsOpen { get { lock (_lock) return _writer != null; } }
 
+        /// <summary>The run log opened last and not yet ended, so a detail line (ShuganLog.Detail) can land
+        /// in it without the Console.</summary>
+        public static ShuganRunLog Active { get; private set; }
+
+        /// <summary>True while our own Console lines are folded into this log.</summary>
+        public bool CapturesConsole => _capturingConsole;
+
         ShuganRunLog() { }
 
         // ─── Creation ──────────────────────────────────────────────────────────
@@ -90,9 +97,11 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception ex)
             {
-                UnityEngine.Debug.LogWarning("[Shugan] Could not open a run log folder: " + ex.Message);
+                ShuganLog.Warn("Shugan", "Could not open a run log folder: " + ex.Message);
                 log._writer = null;
             }
+            Active = log;
+            ShuganLog.FlushPending(log);
             return log;
         }
 
@@ -208,6 +217,7 @@ namespace ZeroShugan.ShuganUnityTools
         void OnConsoleMessage(string condition, string stackTrace, LogType type)
         {
             if (_inConsoleCallback) return;   // our own failure path must not recurse
+            condition = ShuganLog.Plain(condition);   // the coloured tags are for the Console only
             bool interesting = type == LogType.Error || type == LogType.Exception ||
                                type == LogType.Assert || type == LogType.Warning ||
                                IsOwnMessage(condition);
@@ -242,6 +252,7 @@ namespace ZeroShugan.ShuganUnityTools
         public void End()
         {
             EndConsoleCapture();
+            if (Active == this) Active = null;
             lock (_lock)
             {
                 if (_writer == null) return;
@@ -287,7 +298,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception ex)
             {
-                UnityEngine.Debug.LogWarning("[Shugan] Log rotation skipped: " + ex.Message);
+                ShuganLog.Warn("Shugan", "Log rotation skipped: " + ex.Message);
             }
         }
 

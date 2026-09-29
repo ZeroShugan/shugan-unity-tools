@@ -408,6 +408,7 @@ namespace ZeroShugan.ShuganUnityTools
                         string restoredFbx = AssetDatabase.GetAssetPath(_sourceFbxAsset);
                         ResyncArmatureAfterRun(_avatarObject, restoredFbx);
                         RepairHumanoidAfterSkeletonChange(restoredFbx);
+                        RemapToesAfterRestore(restoredFbx);
                         foreach (var other in OtherOpenSceneUsers(restoredFbx, _avatarObject))
                             ReportArmatureResult(ArmatureSync.Sync(other, restoredFbx, _armatureBefore, UnlinkedPrefabMode));
                         if (_restoreRemoveObjects)
@@ -563,6 +564,8 @@ namespace ZeroShugan.ShuganUnityTools
                     }
                     // End of pipeline: ensure the FINAL scene avatar's FBX has humanoid foot/toes mapped.
                     if (_autoMapFeet) AutoMapHumanoidFeet();
+                    // Not optional like the auto-map: a Toes slot below the helper freezes the helper.
+                    FixToesUnderFootHelpersAfterRun();
                     // The auto-map reimports the FBX. That should leave the meshes alone — say so rather
                     // than assume it.
                     if (_exportMode == ExportMode.Replace && _resultInstance != null)
@@ -602,6 +605,7 @@ namespace ZeroShugan.ShuganUnityTools
             _depVRCFury = HasVRCFury();
             _autoRigScriptResolvedPath = ResolveAutoRigScriptPath();
             _depAutoRigScript = !string.IsNullOrEmpty(_autoRigScriptResolvedPath);
+            ResolvePrefabSlots();
 
             _scroll = EditorGUILayout.BeginScrollView(_scroll);
 
@@ -904,6 +908,7 @@ namespace ZeroShugan.ShuganUnityTools
         {
             local  = LocalPyVersion();
             latest = _latestPyVersion;
+            if (Previewing(NoticePreview.Update)) { local = local ?? "0.0.0"; latest = PreviewLatestVersion; return true; }
             if (local == null || latest == null) return false;
             return Version.TryParse(local.TrimStart('v', 'V'), out var lv) &&
                    Version.TryParse(latest.TrimStart('v', 'V'), out var rv) &&
@@ -915,22 +920,14 @@ namespace ZeroShugan.ShuganUnityTools
         void DrawPaidScriptVersionRow()
         {
             string local = LocalPyVersion();
-            if (PyUpdateAvailable(out _, out string latest))
+            if (PyUpdateAvailable(out string shownLocal, out string latest))
             {
-                EditorGUILayout.HelpBox(
-                    $"AutoRig Feet bundle update available: v{latest} (you have v{local}). " +
-                    "This covers the Blender script and the FX feet prefabs. Download the latest " +
-                    "version from the store where you purchased it, then re-import the .unitypackage.",
-                    MessageType.Warning);
-                EditorGUILayout.BeginHorizontal();
-                Color c = GUI.color;
-                GUI.color = new Color(0.5f, 0.9f, 0.5f);
-                if (GUILayout.Button("Get the update", EditorStyles.miniButton, GUILayout.Width(110)))
-                    Application.OpenURL(string.IsNullOrEmpty(_latestPyStoreUrl)
-                        ? StoreBoothUrl : _latestPyStoreUrl);
-                GUI.color = c;
-                GUILayout.FlexibleSpace();
-                EditorGUILayout.EndHorizontal();
+                string url = string.IsNullOrEmpty(_latestPyStoreUrl) ? StoreBoothUrl : _latestPyStoreUrl;
+                Notice($"AutoRig Feet bundle update available: v{latest} (you have v{shownLocal}).",
+                    "It covers the Blender script and the FX feet prefabs. Download it from the store where you "
+                    + "bought it, then re-import the .unitypackage.",
+                    MessageType.Warning,
+                    Link("Get the update", url, new Color(0.5f, 0.9f, 0.5f)));
             }
             else if (local != null)
             {
@@ -957,7 +954,8 @@ namespace ZeroShugan.ShuganUnityTools
         // Returns true when it drew something, so the caller can skip the separator under it.
         bool DrawDependencyStatus()
         {
-            bool anyMissing = !_depBlender || !_depVRCFury || !_depAutoRigScript;
+            var missingPrefabs = MissingPrefabSlots();
+            bool anyMissing = ShowBlenderMissing || !_depVRCFury || ShowScriptMissing || missingPrefabs.Length > 0;
             if (!anyMissing)
             {
                 if (!PyUpdateAvailable(out _, out _)) return false;
@@ -967,95 +965,38 @@ namespace ZeroShugan.ShuganUnityTools
 
             GUILayout.Label("Requirements", EditorStyles.boldLabel);
 
-            // Blender
-            if (!_depBlender) DrawMissingDep("Blender 4.0+",
-                required: true,
-                notFoundExtra: () =>
-                {
-                    EditorGUILayout.BeginHorizontal();
-                    Color c = GUI.color;
+            if (ShowBlenderMissing)
+                Notice("Blender 4.0+ not found.",
+                    "If it is installed, point the tool at its blender.exe; otherwise install it from one of the links.",
+                    MessageType.Warning,
+                    Act("Choose blender.exe…", "Pick blender.exe from a file dialog.", ChooseBlender),
+                    Act("Auto-detect", "Look in Steam and the usual install folders again.", DetectBlenderFromNotice),
+                    Gap,
+                    Link("Steam", "https://store.steampowered.com/app/365670/Blender/", new Color(0.6f, 0.8f, 1f)),
+                    Link("blender.org", "https://www.blender.org/download/", new Color(1f, 0.6f, 0.2f)),
+                    Link("Portable ↓", "https://www.blender.org/download/lts/", new Color(0.6f, 1f, 0.6f)));
 
-                    GUI.color = new Color(0.6f, 0.8f, 1f);
-                    if (GUILayout.Button("Steam", EditorStyles.miniButton, GUILayout.Width(52)))
-                        Application.OpenURL("https://store.steampowered.com/app/365670/Blender/");
+            if (!_depVRCFury)
+                Notice("VRCFury not found (optional).", "It is needed for the FX feet prefabs and the menu toggles.",
+                    MessageType.Info,
+                    Link("Get VRCFury", "https://vrcfury.com/", new Color(0.8f, 0.6f, 1f)));
 
-                    GUI.color = new Color(1f, 0.6f, 0.2f);
-                    if (GUILayout.Button("blender.org", EditorStyles.miniButton, GUILayout.Width(80)))
-                        Application.OpenURL("https://www.blender.org/download/");
+            if (ShowScriptMissing)
+                Notice("AutoRig Feet script (paid) not found.",
+                    "It is sold as part of the Shugan AutoRig Feet bundle: get it from a store, then import the "
+                    + ".unitypackage. Expected at " + DefaultAutoRigScriptPath + ".",
+                    MessageType.Warning,
+                    Act("Choose the .py…", "Already have it somewhere else? Pick shugan_autorig_feet.py.", ChooseScript),
+                    Gap,
+                    Link("Booth", StoreBoothUrl, new Color(1f, 0.45f, 0.45f)),
+                    Link("Gumroad", StoreGumroadUrl, new Color(1f, 0.5f, 1f)),
+                    Link("Blender Market", StoreBlenderMarketUrl, new Color(1f, 0.65f, 0.3f)));
 
-                    GUI.color = new Color(0.6f, 1f, 0.6f);
-                    if (GUILayout.Button("Portable ↓", EditorStyles.miniButton, GUILayout.Width(72)))
-                        Application.OpenURL("https://www.blender.org/download/lts/");
-
-                    GUI.color = c;
-                    GUILayout.Label("(set path in Advanced)", EditorStyles.miniLabel);
-                    EditorGUILayout.EndHorizontal();
-                });
-
-            // VRCFury
-            if (!_depVRCFury) DrawMissingDep("VRCFury",
-                required: false,
-                notFoundExtra: () =>
-                {
-                    EditorGUILayout.BeginHorizontal();
-                    Color c = GUI.color;
-                    GUI.color = new Color(0.8f, 0.6f, 1f);
-                    if (GUILayout.Button("Get VRCFury", EditorStyles.miniButton, GUILayout.Width(90)))
-                        Application.OpenURL("https://vrcfury.com/");
-                    GUI.color = c;
-                    GUILayout.Label("(optional — needed for FX prefabs)", EditorStyles.miniLabel);
-                    EditorGUILayout.EndHorizontal();
-                });
-
-            // AutoRig Feet Script (paid bundle)
-            if (!_depAutoRigScript) DrawMissingDep("AutoRig Feet Script (paid)",
-                required: true,
-                notFoundExtra: () =>
-                {
-                    EditorGUILayout.HelpBox(
-                        "This Blender script is sold separately as part of the Shugan AutoRig Feet bundle. " +
-                        "Get it from one of the stores below, then import the .unitypackage into your project.",
-                        MessageType.Info);
-
-                    EditorGUILayout.BeginHorizontal();
-                    Color c = GUI.color;
-
-                    GUI.color = Color.red;
-                    if (GUILayout.Button("Get on Booth", EditorStyles.miniButton, GUILayout.Width(90)))
-                        Application.OpenURL(StoreBoothUrl);
-
-                    GUI.color = Color.magenta;
-                    if (GUILayout.Button("Get on Gumroad", EditorStyles.miniButton, GUILayout.Width(110)))
-                        Application.OpenURL(StoreGumroadUrl);
-
-                    GUI.color = new Color(1f, 0.5f, 0f);
-                    if (GUILayout.Button("Get on Blender Market", EditorStyles.miniButton, GUILayout.Width(140)))
-                        Application.OpenURL(StoreBlenderMarketUrl);
-
-                    GUI.color = c;
-                    EditorGUILayout.EndHorizontal();
-
-                    EditorGUILayout.LabelField(
-                        $"Expected: {DefaultAutoRigScriptPath}", EditorStyles.miniLabel);
-                    EditorGUILayout.LabelField(
-                        "(override path in Advanced Settings → Paid Blender Scripts)",
-                        EditorStyles.miniLabel);
-                });
+            if (missingPrefabs.Length > 0) DrawMissingPrefabs(missingPrefabs);
 
             // Installed paid-script version + store-update notice (VCC can't update this one).
             if (_depAutoRigScript) DrawPaidScriptVersionRow();
             return true;
-        }
-
-        void DrawMissingDep(string label, bool required, Action notFoundExtra)
-        {
-            EditorGUILayout.BeginHorizontal();
-            Color c = GUI.color;
-            GUI.color = required ? Color.red : Color.yellow;
-            GUILayout.Label($"✗  {label}", EditorStyles.miniLabel, GUILayout.Width(200));
-            GUI.color = c;
-            EditorGUILayout.EndHorizontal();
-            notFoundExtra?.Invoke();
         }
 
         // ─── Main section ──────────────────────────────────────────────────────
@@ -1714,7 +1655,7 @@ namespace ZeroShugan.ShuganUnityTools
                 _runReport.AddIssue("U_SHAPEKEY_FIXED", "info",
                     $"Set {fixedCount} feet-affecting shape key(s) to 0 on the new avatar{extra} "
                     + "(the original was left unchanged).");
-                UnityEngine.Debug.Log($"[AutoRig Feet] Zeroed {fixedCount} feet shape key(s) on the duplicate.");
+                ShuganLog.Detail("AutoRig Feet", $"Zeroed {fixedCount} feet shape key(s) on the duplicate.");
             }
         }
 
@@ -1803,6 +1744,13 @@ namespace ZeroShugan.ShuganUnityTools
                 for (int i = 0; i < node.childCount; i++)
                 {
                     var c = node.GetChild(i);
+                    // The toe rig and the helper are ours, never the avatar's toe. Toes_<side> hangs from the
+                    // helper next to the avatar's own toe bone, as shallow as it, so it has to be left out by name.
+                    if (ArmatureSync.IsOurBone(c.name))
+                    {
+                        if (HumanoidRigMapping.IsFootHelper(c.name)) Walk(c, depth);
+                        continue;
+                    }
                     string n = c.name.ToLowerInvariant();
                     bool isEnd = n.EndsWith("_end") || n.EndsWith(".end") || n.EndsWith(" end");
                     if (!isEnd && depth < bestDepth && c.GetComponent<Renderer>() == null &&
@@ -3019,7 +2967,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception ex)
             {
-                UnityEngine.Debug.LogWarning("[AutoRig Feet] Could not open " + fileName + ": " + ex.Message);
+                ShuganLog.Warn("AutoRig Feet", "Could not open " + fileName + ": " + ex.Message);
             }
         }
 
@@ -3255,8 +3203,8 @@ namespace ZeroShugan.ShuganUnityTools
                 }
                 catch (Exception ex)
                 {
-                    UnityEngine.Debug.LogWarning(
-                        "[AutoRig Feet Distributor] Restored, but could not reopen the scene: " + ex.Message);
+                    ShuganLog.Warn("AutoRig Feet",
+                        "Restored, but could not reopen the scene: " + ex.Message);
                 }
             }
 
@@ -3268,7 +3216,7 @@ namespace ZeroShugan.ShuganUnityTools
             _avatarObject    = null;      // the object it pointed at may no longer exist
             RefreshRigState();
 
-            UnityEngine.Debug.Log("[AutoRig Feet Distributor] Restored " + g.assetPath
+            ShuganLog.Info("AutoRig Feet", "Restored " + g.assetPath
                 + " from " + e.fileName
                 + (safety != null ? "  (previous file kept as " + Path.GetFileName(safety) + ")" : ""));
             SetStatus("Restored " + g.assetName + " from the "
@@ -4201,10 +4149,11 @@ namespace ZeroShugan.ShuganUnityTools
             EditorGUI.BeginChangeCheck();
             _footHelper = EditorGUILayout.ToggleLeft(
                 new GUIContent("Add a helper bone under each foot  (ARF Helper_L / _R)",
-                    "A copy of the foot bone that takes over the foot's weights and becomes the parent of the "
-                    + "toes. VRChat's IK moves the foot; the helper follows it and can be animated on top — "
-                    + "rotate it to flex the whole foot without fighting the IK. At rest nothing looks "
-                    + "different."),
+                    "A copy of the foot bone that takes over the foot's weights and carries the toe rig. VRChat's "
+                    + "IK moves the foot; the helper follows it and can be animated on top — rotate it to flex "
+                    + "the foot without fighting the IK. At rest nothing looks different.\n\nIt is a branch of "
+                    + "the foot: the avatar's own toe bone and the foot's other children stay where they were, "
+                    + "and the toe stays humanoid."),
                 _footHelper);
             if (EditorGUI.EndChangeCheck())
                 ArfPrefs.SetBool(PrefFootHelper, _footHelper);
@@ -4878,7 +4827,7 @@ namespace ZeroShugan.ShuganUnityTools
                 if (result.Changed) fixedUp++;
             }
             if (fixedUp > 0)
-                UnityEngine.Debug.Log($"[AutoRig Feet Distributor] Re-synced {fixedUp} avatar(s) in the scene "
+                ShuganLog.Info("AutoRig Feet", $"Re-synced {fixedUp} avatar(s) in the scene "
                                       + "with the restored FBX.");
         }
 
@@ -5036,7 +4985,7 @@ namespace ZeroShugan.ShuganUnityTools
                 }
                 catch (Exception e)
                 {
-                    UnityEngine.Debug.LogWarning("[AutoRig Feet] Could not save blendshape_weights.json: " + e.Message);
+                    ShuganLog.Warn("AutoRig Feet", "Could not save blendshape_weights.json: " + e.Message);
                 }
             }
 
@@ -5363,8 +5312,8 @@ namespace ZeroShugan.ShuganUnityTools
                 {
                     if (IsInstanceOfPrefabAsset(existing.gameObject, prefabRef))
                     {
-                        UnityEngine.Debug.Log(
-                            $"[AutoRig Feet Distributor] '{existing.name}' is already on '{_resultInstance.name}' "
+                        ShuganLog.Detail("AutoRig Feet",
+                            $"'{existing.name}' is already on '{_resultInstance.name}' "
                             + "as a prefab instance — kept as it is.");
                         continue;
                     }
@@ -5373,8 +5322,8 @@ namespace ZeroShugan.ShuganUnityTools
                     string why = broken
                         ? "was an instance of an older version of that prefab"
                         : "was on the avatar without a prefab link";
-                    UnityEngine.Debug.LogWarning(
-                        $"[AutoRig Feet Distributor] '{existing.name}' under '{_resultInstance.name}' {why} — "
+                    ShuganLog.Warn("AutoRig Feet",
+                        $"'{existing.name}' under '{_resultInstance.name}' {why} — "
                         + $"replaced with the '{prefabRef.name}' prefab.");
                     _runReport?.AddIssue("U_PREFAB_RELINKED", "info",
                         $"\"{existing.name}\" {why}, so it was replaced with the \"{prefabRef.name}\" prefab.",
@@ -5449,14 +5398,14 @@ namespace ZeroShugan.ShuganUnityTools
                 string before = _resultInstance.name;
                 Undo.RecordObject(_resultInstance, "AutoRig Feet — Rename Result");
                 _resultInstance.name = final;
-                UnityEngine.Debug.Log(
-                    "[AutoRig Feet Distributor] Renamed result: " + before + " → " + final);
+                ShuganLog.Detail("AutoRig Feet",
+                    "Renamed result: " + before + " → " + final);
             }
             catch (Exception ex)
             {
                 // Cosmetic only — never fail a completed rig over a name.
-                UnityEngine.Debug.LogWarning(
-                    "[AutoRig Feet Distributor] Could not rename the result: " + ex.Message);
+                ShuganLog.Warn("AutoRig Feet",
+                    "Could not rename the result: " + ex.Message);
             }
         }
 
@@ -5846,7 +5795,7 @@ namespace ZeroShugan.ShuganUnityTools
             {
                 if (_resultInstance == null)
                 {
-                    UnityEngine.Debug.LogWarning("[AutoRig Feet] Humanoid auto-map skipped: no result avatar.");
+                    ShuganLog.Warn("AutoRig Feet", "Humanoid auto-map skipped: no result avatar.");
                     return;
                 }
                 if (!HumanoidRigMapping.TryResolveRigFbx(_resultInstance, out string fbxPath))
@@ -5856,7 +5805,7 @@ namespace ZeroShugan.ShuganUnityTools
                         + "(couldn't resolve the final avatar's FBX).",
                         "Open Tools > Shugan > Humanoid Rig Mapping to map the Foot/Toes slots "
                         + "manually if animations need them.");
-                    UnityEngine.Debug.LogWarning("[AutoRig Feet] Humanoid auto-map skipped: couldn't resolve the avatar's FBX.");
+                    ShuganLog.Warn("AutoRig Feet", "Humanoid auto-map skipped: couldn't resolve the avatar's FBX.");
                     return;
                 }
                 // Redirect the mapping log into THIS run's folder. It used to land in
@@ -5865,7 +5814,7 @@ namespace ZeroShugan.ShuganUnityTools
                 var res = HumanoidRigMapping.EnsureFeetAndToesMapped(
                     fbxPath, replaceLowConfidence: false, removeJaw: false, logSource: "autorig",
                     logFolderOverride: _runLogger != null ? _runLogger.FolderAssetPath : null);
-                UnityEngine.Debug.Log($"[AutoRig Feet] Humanoid auto-map ({System.IO.Path.GetFileName(fbxPath)}): {res.message}");
+                ShuganLog.Detail("AutoRig Feet", $"Humanoid auto-map ({System.IO.Path.GetFileName(fbxPath)}): {res.message}");
                 if (!res.avatarValid || !res.feetToesComplete)
                     _runReport.AddIssue("U_HUMANOID_MAP", "warning",
                         "The new toe bones were rigged, but they couldn't be fully auto-mapped "
@@ -5878,7 +5827,51 @@ namespace ZeroShugan.ShuganUnityTools
                 _runReport.AddIssue("U_HUMANOID_MAP", "warning",
                     "The Humanoid auto-map step failed: " + e.Message,
                     "Open Tools > Shugan > Humanoid Rig Mapping to map the Foot/Toes slots manually.");
-                UnityEngine.Debug.LogWarning("[AutoRig Feet] Humanoid auto-map skipped: " + e.Message);
+                ShuganLog.Warn("AutoRig Feet", "Humanoid auto-map skipped: " + e.Message);
+            }
+        }
+
+        // The helper can't be animated with a humanoid Toes slot below it (HumanoidRigMapping.
+        // FixToesUnderFootHelpers): a rig from before script 3.19, or Unity's Automap on Toes_a1. The auto-map
+        // does this too; this covers a run with it switched off. Non-fatal.
+        void FixToesUnderFootHelpersAfterRun()
+        {
+            try
+            {
+                if (_resultInstance == null || !HumanoidRigMapping.TryResolveRigFbx(_resultInstance, out string fbxPath))
+                    return;
+                string note = HumanoidRigMapping.FixToesUnderFootHelpers(fbxPath);
+                if (note != null) _runReport.AddIssue("U_HUMANOID_TOES_UNDER_HELPER", "info", note);
+            }
+            catch (Exception e)
+            {
+                _runReport.AddIssue("U_HUMANOID_MAP", "warning",
+                    "The humanoid Toes slots could not be checked against the foot helper: " + e.Message,
+                    "Open the FBX's Rig → Configure: Left/Right Toes must not be a bone below ARF Helper_L/_R, or "
+                    + "the helper can't be animated.");
+            }
+        }
+
+        // A restore takes the helper out. A rig from before script 3.19 had its Toes slots cleared for the helper;
+        // they are mapped again the way a first run maps them.
+        // A file put back from the Backups tab doesn't come here: it carries its own import settings.
+        void RemapToesAfterRestore(string fbxPath)
+        {
+            if (!_autoMapFeet || string.IsNullOrEmpty(fbxPath)) return;
+            try
+            {
+                var res = HumanoidRigMapping.EnsureFeetAndToesMapped(
+                    fbxPath, replaceLowConfidence: false, removeJaw: false, logSource: "restore",
+                    logFolderOverride: _runLogger != null ? _runLogger.FolderAssetPath : null);
+                if (res.slotsMapped > 0)
+                    _runReport.AddIssue("U_HUMANOID_TOES_REMAPPED", "info",
+                        "The humanoid Foot/Toes slots were filled in again after the restore: " + res.message);
+            }
+            catch (Exception e)
+            {
+                _runReport.AddIssue("U_HUMANOID_MAP", "warning",
+                    "The humanoid Toes slots could not be mapped again after the restore: " + e.Message,
+                    "Open Tools > Shugan > Humanoid Rig Mapping to map them.");
             }
         }
 
@@ -5925,7 +5918,7 @@ namespace ZeroShugan.ShuganUnityTools
             if (_runLogger == null) return;
             _runLogger.Section("BLENDER PROCESS ENDED");
             if (!string.IsNullOrEmpty(_runLogPath))
-                UnityEngine.Debug.Log("[AutoRig Feet] Run log:\n" + _runLogPath);
+                ShuganLog.Info("AutoRig Feet", "Run log:\n" + _runLogPath);
         }
 
         void WriteEnvironmentJson(string kind)
@@ -6860,8 +6853,8 @@ namespace ZeroShugan.ShuganUnityTools
                         "This scene has never been saved, so it could not be backed up.",
                         "Save the scene once (Ctrl+S) and run again if you want a restore point for it. "
                         + "Your FBX is still backed up as usual.");
-                    UnityEngine.Debug.LogWarning(
-                        "[AutoRig Feet Distributor] Scene has no path yet — scene backup skipped.");
+                    ShuganLog.Warn("AutoRig Feet",
+                        "Scene has no path yet — scene backup skipped.");
                     return;
                 }
 
@@ -6873,8 +6866,8 @@ namespace ZeroShugan.ShuganUnityTools
                 {
                     string pre = ShuganBackups.BackupAsset(scene.path, "_presave", stamp);
                     if (pre != null)
-                        UnityEngine.Debug.Log(
-                            "[AutoRig Feet Distributor] Scene backup (before your unsaved changes): " + pre);
+                        ShuganLog.Detail("AutoRig Feet",
+                            "Scene backup (before your unsaved changes): " + pre);
 
                     // 2. Save, so the next backup captures the state the run will actually modify.
                     UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene);
@@ -6882,7 +6875,7 @@ namespace ZeroShugan.ShuganUnityTools
 
                 string post = ShuganBackups.BackupAsset(scene.path, "", stamp);
                 if (post != null)
-                    UnityEngine.Debug.Log("[AutoRig Feet Distributor] Scene backup: " + post);
+                    ShuganLog.Detail("AutoRig Feet", "Scene backup: " + post);
 
                 _runReport.AddIssue("U_SCENE_BACKED_UP", "info",
                     dirty
@@ -6897,8 +6890,8 @@ namespace ZeroShugan.ShuganUnityTools
                 _runReport.AddIssue("U_SCENE_BACKUP_FAILED", "warning",
                     "The scene could not be backed up: " + ex.Message,
                     "The run continues, and your FBX backup is unaffected.");
-                UnityEngine.Debug.LogWarning(
-                    "[AutoRig Feet Distributor] Scene backup failed: " + ex.Message);
+                ShuganLog.Warn("AutoRig Feet",
+                    "Scene backup failed: " + ex.Message);
             }
         }
 
@@ -6928,8 +6921,8 @@ namespace ZeroShugan.ShuganUnityTools
 
             if (!overwritesSource)
             {
-                UnityEngine.Debug.Log(
-                    "[AutoRig Feet Distributor] Full FBX backup skipped: this run writes to "
+                ShuganLog.Detail("AutoRig Feet",
+                    "Full FBX backup skipped: this run writes to "
                     + Path.GetFileName(_exportPath) + " and does not modify the source FBX.");
                 return;
             }
@@ -6940,7 +6933,7 @@ namespace ZeroShugan.ShuganUnityTools
             string dest = ShuganBackups.BackupAsset(AssetDatabase.GetAssetPath(_sourceFbxAsset));
             _lastFbxBackup = dest;
             if (dest != null)
-                UnityEngine.Debug.Log($"[AutoRig Feet Distributor] Backup: {dest}");
+                ShuganLog.Detail("AutoRig Feet", $"Backup: {dest}");
         }
 
         // ─── Path helpers ──────────────────────────────────────────────────────
@@ -7030,7 +7023,7 @@ namespace ZeroShugan.ShuganUnityTools
 
         void DrawReadinessHints(bool ready)
         {
-            if (ready) return;
+            if (ready && !Previewing(NoticePreview.Blender | NoticePreview.Script)) return;
             if (_avatarObject == null)
                 EditorGUILayout.HelpBox(
                     "Click an avatar root in the scene, or drag it into Target Avatar.", MessageType.Info);
@@ -7042,15 +7035,17 @@ namespace ZeroShugan.ShuganUnityTools
                     "FBX not detected. Expand Advanced Settings → Source FBX.", MessageType.Warning);
             else if (_meshNames.Length == 0)
                 EditorGUILayout.HelpBox("No meshes found in the FBX.", MessageType.Warning);
-            else if (!File.Exists(ArfPrefs.GetString(BlenderBridge.PrefBlenderPath, "")))
-                EditorGUILayout.HelpBox(
-                    "Blender not found — expand Advanced Settings to configure or auto-detect it.",
-                    MessageType.Warning);
-            else if (!_depAutoRigScript)
-                EditorGUILayout.HelpBox(
-                    "AutoRig_Feet.py not installed — see the 'AutoRig Feet Script (paid)' row above for store links, " +
-                    "or set a custom path in Advanced Settings → Paid Blender Scripts.",
-                    MessageType.Warning);
+            else if (ShowBlenderMissing)
+                Notice(null, "Blender not found. Point the tool at blender.exe, or let it look again.",
+                    MessageType.Warning,
+                    Act("Choose blender.exe…", "Pick blender.exe from a file dialog.", ChooseBlender),
+                    Act("Auto-detect", "Look in Steam and the usual install folders again.", DetectBlenderFromNotice));
+            else if (ShowScriptMissing)
+                Notice(null, "The paid AutoRig Feet script is not installed. Import the bundle, or point the "
+                    + "tool at the .py if it is somewhere else.",
+                    MessageType.Warning,
+                    Act("Choose the .py…", "Pick shugan_autorig_feet.py from a file dialog.", ChooseScript),
+                    Link("Get the bundle", StoreBoothUrl, new Color(1f, 0.45f, 0.45f)));
         }
 
         void BrowseExportFolder()
@@ -7078,7 +7073,7 @@ namespace ZeroShugan.ShuganUnityTools
             SetStatus(msg, MessageType.Error);
             _state = State.Error;
             SyncRecordStage();
-            UnityEngine.Debug.LogError("[AutoRig Feet Distributor] " + msg);
+            ShuganLog.Error("AutoRig Feet", "" + msg);
 
             // A run that had started logging must not end with an open log and no report. This
             // catches the post-Blender steps — the FBX swap and prefab wiring throw into SetError,

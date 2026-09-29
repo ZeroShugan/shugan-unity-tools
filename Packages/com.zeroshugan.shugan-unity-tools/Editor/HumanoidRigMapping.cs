@@ -55,7 +55,8 @@ namespace ZeroShugan.ShuganUnityTools
             public bool   avatarValid;       // resulting humanoid avatar is valid + human
             public int    slotsMapped;       // foot/toe slots this call set
             public bool   jawRemoved;
-            public bool   feetToesComplete;  // all of LeftFoot/RightFoot/LeftToes/RightToes are mapped
+            public bool   feetToesComplete;  // both feet mapped, and each Toes slot unless only a bone below the helper was left
+            public int    toesUnderHelper;   // Toes slots this call took off a bone below the foot helper
             public string message;
         }
 
@@ -272,6 +273,13 @@ namespace ZeroShugan.ShuganUnityTools
             _slots.Add(MakeSlot(H_RFOOT, unityMap, rFoot, isToe: false));
             _slots.Add(MakeSlot(H_LTOES, unityMap, lToes, isToe: true,  foot: lFoot));
             _slots.Add(MakeSlot(H_RTOES, unityMap, rToes, isToe: true,  foot: rFoot));
+            // A toe below the foot helper can't be humanoid (FixToesUnderFootHelpers).
+            foreach (var slot in _slots.Where(x => x.humanName == H_LTOES || x.humanName == H_RTOES))
+                if (IsUnderFootHelper(slot.ourBone != null ? _scorer.FindBone(slot.ourBone) : null))
+                {
+                    slot.ourBone = null;
+                    slot.action  = "LEAVE EMPTY (toe is below the foot helper)";
+                }
 
             _jawBone = unityMap != null && unityMap.TryGetValue(H_JAW, out string jb) && !string.IsNullOrEmpty(jb) ? jb : null;
 
@@ -384,6 +392,12 @@ namespace ZeroShugan.ShuganUnityTools
                 picks[H_LTOES] = scorer.BestToe(picks[H_LFOOT], "L");
                 picks[H_RTOES] = scorer.BestToe(picks[H_RFOOT], "R");
 
+                // A toe below the foot helper can't be humanoid (FixToesUnderFootHelpers): a rig from before
+                // script 3.19 hung the avatar's toe from the helper.
+                var heldToes = new HashSet<string>();
+                foreach (string k in new[] { H_LTOES, H_RTOES })
+                    if (IsUnderFootHelper(picks[k])) { picks[k] = null; heldToes.Add(k); }
+
                 log.AppendLine("\n-- ranked candidates (name=score) --");
                 log.AppendLine("LeftFoot:  " + RankStr(scorer.RankFeet("L")));
                 log.AppendLine("RightFoot: " + RankStr(scorer.RankFeet("R")));
@@ -399,6 +413,7 @@ namespace ZeroShugan.ShuganUnityTools
                 int changed = 0;
                 foreach (var kv in picks)
                 {
+                    if (heldToes.Contains(kv.Key)) { log.AppendLine($"{kv.Key}: the toe is below the foot helper → left empty"); continue; }
                     if (kv.Value == null) { log.AppendLine($"{kv.Key}: no candidate → skip"); continue; }
                     int idx = human.FindIndex(h => h.humanName == kv.Key);
                     string unityBone = idx >= 0 ? human[idx].boneName : "";
@@ -438,6 +453,9 @@ namespace ZeroShugan.ShuganUnityTools
                 {
                     int movedOff = MoveSlotsOffFootHelpers(human, helperModel);
                     if (movedOff > 0) log.AppendLine($"helper: {movedOff} slot(s) moved off the foot helper onto the foot");
+                    result.toesUnderHelper = FixToesUnderFootHelpers(human, helperModel, scorer);
+                    if (result.toesUnderHelper > 0)
+                        log.AppendLine($"helper: {result.toesUnderHelper} Toes slot(s) taken off bones below the foot helper");
                 }
 
                 // ── THE FIX: write a COMPLETE skeleton[] so every referenced boneName resolves. ──
@@ -454,6 +472,7 @@ namespace ZeroShugan.ShuganUnityTools
 
                 var finalMap = human.GroupBy(h => h.humanName).ToDictionary(g => g.Key, g => g.First().boneName);
                 result.feetToesComplete = new[] { H_LFOOT, H_RFOOT, H_LTOES, H_RTOES }
+                    .Where(k => !heldToes.Contains(k))
                     .All(k => finalMap.TryGetValue(k, out var b) && !string.IsNullOrEmpty(b));
 
                 log.AppendLine("\n-- final foot/toe map --");
@@ -531,6 +550,10 @@ namespace ZeroShugan.ShuganUnityTools
             if (helperSlots > 0)
                 notes.Add(helperSlots + " foot slot(s) mapped to the foot helper bone were moved back to the foot");
 
+            int toesHeld = FixToesUnderFootHelpers(human, model, Scorer.FromFbx(fbxPath));
+            if (toesHeld > 0)
+                notes.Add(toesHeld + " Toes slot(s) on a bone below the foot helper were moved to the foot's own toe or cleared");
+
             var skeleton = BuildSkeleton(model.GetComponentsInChildren<Transform>(true));
             bool skeletonChanged = desc.skeleton == null || desc.skeleton.Length != skeleton.Length;
             if (notes.Count == 0 && !skeletonChanged) return null;
@@ -592,11 +615,11 @@ namespace ZeroShugan.ShuganUnityTools
                     ? Path.Combine(abs, "humanoid_mapping.txt")
                     : Path.Combine(abs, $"{baseName}_{source}_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
                 File.WriteAllText(file, log.ToString());
-                UnityEngine.Debug.Log($"[Humanoid Rig Mapping] Log saved:\n{folder}/{Path.GetFileName(file)}");
+                ShuganLog.Info("Humanoid Rig Mapping", $"Log saved:\n{folder}/{Path.GetFileName(file)}");
             }
             catch (Exception e)
             {
-                UnityEngine.Debug.LogWarning("[Humanoid Rig Mapping] Could not write log: " + e.Message);
+                ShuganLog.Warn("Humanoid Rig Mapping", "Could not write log: " + e.Message);
             }
         }
 
@@ -676,6 +699,72 @@ namespace ZeroShugan.ShuganUnityTools
                 moved++;
             }
             return moved;
+        }
+
+        /// <summary>
+        /// Take every Toes slot off a bone that sits below the foot helper: onto the foot's own toe bone when it
+        /// hangs outside the helper, else the slot is cleared. Returns how many slots changed.
+        ///
+        /// Unity's humanoid holds every bone BETWEEN two mapped bones at its rest pose, before any layer, mask or
+        /// blend mode is applied. Measured in a lab copy: a 60° clip on "ARF Helper_L" moved it 0° with the toe
+        /// below it mapped (override layer, additive layer, an "all but feet" mask, no humanoid clip at all), and
+        /// the full 60° once the toe was out of the humanoid. Two things put a Toes slot there: a rig from before
+        /// script 3.19, which hung the avatar's toe from the helper, and Unity's own Automap, which maps the Toes
+        /// onto Toes_a1_&lt;side&gt;. From 3.19 the helper is a branch of the foot that carries only the toe rig,
+        /// so the avatar's toe stays mapped.
+        /// </summary>
+        static int FixToesUnderFootHelpers(List<HumanBone> human, GameObject model, Scorer scorer)
+        {
+            if (model == null) return 0;
+            var byName = model.GetComponentsInChildren<Transform>(true)
+                              .GroupBy(t => t.name).ToDictionary(g => g.Key, g => g.First());
+            int changed = 0;
+            foreach (var (slot, side) in new[] { (H_LTOES, "L"), (H_RTOES, "R") })
+            {
+                int i = human.FindIndex(h => h.humanName == slot);
+                if (i < 0 || string.IsNullOrEmpty(human[i].boneName)) continue;
+                if (!byName.TryGetValue(human[i].boneName, out var bone) || !IsUnderFootHelper(bone)) continue;
+
+                var own = scorer?.BestToe(scorer.BestFoot(side), side);
+                if (own != null && !IsUnderFootHelper(own))
+                {
+                    var hb = human[i]; hb.boneName = own.name; human[i] = hb;
+                }
+                else human.RemoveAt(i);
+                changed++;
+            }
+            return changed;
+        }
+
+        /// <summary>True when the bone is the foot helper or hangs anywhere below it.</summary>
+        static bool IsUnderFootHelper(Transform t)
+        {
+            for (; t != null; t = t.parent)
+                if (IsFootHelper(t.name)) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// For AutoRig Feet after a rig: apply the Toes rule to the FBX's importer and reimport, whether or not
+        /// the foot/toe auto-map is switched on. Null when nothing needed changing, else what was done.
+        /// </summary>
+        public static string FixToesUnderFootHelpers(string fbxPath)
+        {
+            var importer = AssetImporter.GetAtPath(fbxPath) as ModelImporter;
+            var model    = AssetDatabase.LoadAssetAtPath<GameObject>(fbxPath);
+            if (importer == null || model == null || importer.animationType != ModelImporterAnimationType.Human)
+                return null;
+            var desc  = importer.humanDescription;
+            var human = desc.human != null ? desc.human.ToList() : new List<HumanBone>();
+            int changed = FixToesUnderFootHelpers(human, model, Scorer.FromFbx(fbxPath));
+            if (changed == 0) return null;
+            desc.human = human.ToArray();
+            importer.humanDescription = desc;
+            importer.SaveAndReimport();
+            var avatar = AssetDatabase.LoadAllAssetsAtPath(fbxPath).OfType<Avatar>().FirstOrDefault();
+            return changed + " humanoid Toes slot(s) on a bone below the foot helper were moved to the foot's own "
+                   + "toe or cleared, so the helper can be animated"
+                   + (avatar != null && avatar.isValid ? "." : " (the avatar is not valid: open Rig → Configure).");
         }
 
         /// <summary>The helper bone AutoRig Feet 3.16+ puts under each foot. Never a candidate for any

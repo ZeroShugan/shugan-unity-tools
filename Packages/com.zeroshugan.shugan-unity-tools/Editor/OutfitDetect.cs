@@ -74,7 +74,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception e)
             {
-                UnityEngine.Debug.LogWarning("[AutoRig Feet] Outfit detection failed: " + e.Message);
+                ShuganLog.Warn("AutoRig Feet", "Outfit detection failed: " + e.Message);
             }
 
             Cache[key] = (hash, result);

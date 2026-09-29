@@ -187,6 +187,18 @@ public class DisplaceComponent : MonoBehaviour
         #endif
     }
 
+    /// <summary>A step: into the build log, and into the Console only with Tools → Shugan → Verbose Console
+    /// Logs. Warnings and errors still go to the Console.</summary>
+    private static void Detail(string message)
+    {
+        SafeLog(message);
+        #if UNITY_EDITOR
+        // ShuganLog.PrefVerbose; that class is in the Editor assembly, out of reach from here.
+        if (!EditorPrefs.GetBool("ShuganTools_VerboseConsole", false)) return;
+        #endif
+        Debug.Log(message);
+    }
+
     #if UNITY_EDITOR
     private void OnEnable()
     {
@@ -200,23 +212,23 @@ public class DisplaceComponent : MonoBehaviour
 
         if (Application.isPlaying && !isProcessingBuild)
         {
-            Debug.Log($"========================================");
-            Debug.Log($"[DisplaceComponent] 🎮 PLAY MODE - Component Active on: {gameObject.name}");
-            Debug.Log($"[DisplaceComponent]    Mode: {operationMode}");
-            Debug.Log($"[DisplaceComponent]    Field Mappings: {fieldMappings?.Count ?? 0}");
-            Debug.Log($"[DisplaceComponent]    Full Path: {GetFullPath(transform)}");
-            Debug.Log($"========================================");
+            Detail($"========================================");
+            Detail($"[DisplaceComponent] 🎮 PLAY MODE - Component Active on: {gameObject.name}");
+            Detail($"[DisplaceComponent]    Mode: {operationMode}");
+            Detail($"[DisplaceComponent]    Field Mappings: {fieldMappings?.Count ?? 0}");
+            Detail($"[DisplaceComponent]    Full Path: {GetFullPath(transform)}");
+            Detail($"========================================");
 
             // If this is the first active component, find and process ALL components (including inactive)
             if (!hasProcessedAllInScene)
             {
-                Debug.Log($"[DisplaceComponent] 🔍 First active component - searching for ALL DisplaceComponents (including inactive)...");
+                Detail($"[DisplaceComponent] 🔍 First active component - searching for ALL DisplaceComponents (including inactive)...");
                 ProcessAllComponentsInScene();
             }
             else if (!hasPerformedDisplacement)
             {
                 // Fallback: process just this component if it wasn't processed yet
-                Debug.Log($"[DisplaceComponent] Processing individual component...");
+                Detail($"[DisplaceComponent] Processing individual component...");
                 PerformDisplacement();
             }
         }
@@ -270,14 +282,14 @@ public class DisplaceComponent : MonoBehaviour
     /// </summary>
     private void ProcessAllComponentsInScene()
     {
-        Debug.Log($"[DisplaceComponent] ========================================");
-        Debug.Log($"[DisplaceComponent] 🔍 PROCESSING ALL COMPONENTS IN SCENE");
-        Debug.Log($"[DisplaceComponent] ========================================");
+        Detail($"[DisplaceComponent] ========================================");
+        Detail($"[DisplaceComponent] 🔍 PROCESSING ALL COMPONENTS IN SCENE");
+        Detail($"[DisplaceComponent] ========================================");
 
         // Find ALL DisplaceComponents, including those on inactive GameObjects
         DisplaceComponent[] allComponents = FindObjectsOfType<DisplaceComponent>(includeInactive: true);
 
-        Debug.Log($"[DisplaceComponent] Found {allComponents.Length} DisplaceComponent(s) total (active + inactive)");
+        Detail($"[DisplaceComponent] Found {allComponents.Length} DisplaceComponent(s) total (active + inactive)");
 
         int processedCount = 0;
         int skippedCount = 0;
@@ -293,7 +305,7 @@ public class DisplaceComponent : MonoBehaviour
             // Skip if already processed
             if (component.hasPerformedDisplacement)
             {
-                Debug.Log($"[DisplaceComponent] [{processedCount + skippedCount + 1}/{allComponents.Length}] Already processed: {component.gameObject.name} - SKIPPING");
+                Detail($"[DisplaceComponent] [{processedCount + skippedCount + 1}/{allComponents.Length}] Already processed: {component.gameObject.name} - SKIPPING");
                 skippedCount++;
                 continue;
             }
@@ -301,16 +313,16 @@ public class DisplaceComponent : MonoBehaviour
             // Skip if processing a build
             if (component.isProcessingBuild)
             {
-                Debug.Log($"[DisplaceComponent] [{processedCount + skippedCount + 1}/{allComponents.Length}] Build processing: {component.gameObject.name} - SKIPPING");
+                Detail($"[DisplaceComponent] [{processedCount + skippedCount + 1}/{allComponents.Length}] Build processing: {component.gameObject.name} - SKIPPING");
                 skippedCount++;
                 continue;
             }
 
             string activeState = component.gameObject.activeInHierarchy ? "ACTIVE" : "INACTIVE";
-            Debug.Log($"[DisplaceComponent] ----------------------------------------");
-            Debug.Log($"[DisplaceComponent] [{processedCount + skippedCount + 1}/{allComponents.Length}] Processing: {component.gameObject.name} ({activeState})");
-            Debug.Log($"[DisplaceComponent]   Path: {GetFullPath(component.transform)}");
-            Debug.Log($"[DisplaceComponent]   Mode: {component.operationMode}");
+            Detail($"[DisplaceComponent] ----------------------------------------");
+            Detail($"[DisplaceComponent] [{processedCount + skippedCount + 1}/{allComponents.Length}] Processing: {component.gameObject.name} ({activeState})");
+            Detail($"[DisplaceComponent]   Path: {GetFullPath(component.transform)}");
+            Detail($"[DisplaceComponent]   Mode: {component.operationMode}");
 
             // Process the component directly
             bool success = component.PerformDisplacement();
@@ -318,7 +330,7 @@ public class DisplaceComponent : MonoBehaviour
             if (success)
             {
                 processedCount++;
-                Debug.Log($"[DisplaceComponent]   ✓ SUCCESS");
+                Detail($"[DisplaceComponent]   ✓ SUCCESS");
             }
             else
             {
@@ -326,12 +338,12 @@ public class DisplaceComponent : MonoBehaviour
             }
         }
 
-        Debug.Log($"[DisplaceComponent] ========================================");
-        Debug.Log($"[DisplaceComponent] 🎯 SCENE PROCESSING COMPLETE");
-        Debug.Log($"[DisplaceComponent]   Total found: {allComponents.Length}");
-        Debug.Log($"[DisplaceComponent]   Processed: {processedCount}");
-        Debug.Log($"[DisplaceComponent]   Skipped: {skippedCount}");
-        Debug.Log($"[DisplaceComponent] ========================================");
+        Detail($"[DisplaceComponent] ========================================");
+        Detail($"[DisplaceComponent] 🎯 SCENE PROCESSING COMPLETE");
+        Detail($"[DisplaceComponent]   Total found: {allComponents.Length}");
+        Detail($"[DisplaceComponent]   Processed: {processedCount}");
+        Detail($"[DisplaceComponent]   Skipped: {skippedCount}");
+        Detail($"[DisplaceComponent] ========================================");
 
         // Mark that we've processed all components in the scene
         hasProcessedAllInScene = true;
@@ -347,13 +359,13 @@ public class DisplaceComponent : MonoBehaviour
             return false;
         }
 
-        Debug.Log($"[DisplaceComponent] PerformBuildTimeDisplacement called on: {gameObject.name}");
+        Detail($"[DisplaceComponent] PerformBuildTimeDisplacement called on: {gameObject.name}");
         isProcessingBuild = true;
         bool success = PerformDisplacement();
         
         if (success)
         {
-            Debug.Log($"[DisplaceComponent] Build-time displacement completed on {gameObject.name}");
+            Detail($"[DisplaceComponent] Build-time displacement completed on {gameObject.name}");
         }
         else
         {
@@ -369,13 +381,13 @@ public class DisplaceComponent : MonoBehaviour
     public void RestoreBuildTimeState()
     {
         #if UNITY_EDITOR
-        Debug.Log($"[DisplaceComponent] RestoreBuildTimeState called on: {gameObject.name}");
-        Debug.Log($"[DisplaceComponent]   - isProcessingBuild: {isProcessingBuild}");
-        Debug.Log($"[DisplaceComponent]   - displacementStates count: {displacementStates.Count}");
+        Detail($"[DisplaceComponent] RestoreBuildTimeState called on: {gameObject.name}");
+        Detail($"[DisplaceComponent]   - isProcessingBuild: {isProcessingBuild}");
+        Detail($"[DisplaceComponent]   - displacementStates count: {displacementStates.Count}");
 
         if (!isProcessingBuild && displacementStates.Count == 0)
         {
-            Debug.Log($"[DisplaceComponent] No build-time state to restore on {gameObject.name}");
+            Detail($"[DisplaceComponent] No build-time state to restore on {gameObject.name}");
             return;
         }
 
@@ -385,7 +397,7 @@ public class DisplaceComponent : MonoBehaviour
         isProcessingBuild = false;
         hasPerformedDisplacement = false;
 
-        Debug.Log($"[DisplaceComponent] Build-time state restored and flags cleared on {gameObject.name}");
+        Detail($"[DisplaceComponent] Build-time state restored and flags cleared on {gameObject.name}");
         #endif
     }
 
@@ -553,13 +565,13 @@ public class DisplaceComponent : MonoBehaviour
 
     private bool PerformDisplacement()
     {
-        Debug.Log($"[DisplaceComponent] PerformDisplacement called on: {gameObject.name}");
-        Debug.Log($"[DisplaceComponent]   - Operation Mode: {operationMode}");
-        Debug.Log($"[DisplaceComponent]   - hasPerformedDisplacement: {hasPerformedDisplacement}");
+        Detail($"[DisplaceComponent] PerformDisplacement called on: {gameObject.name}");
+        Detail($"[DisplaceComponent]   - Operation Mode: {operationMode}");
+        Detail($"[DisplaceComponent]   - hasPerformedDisplacement: {hasPerformedDisplacement}");
 
         if (hasPerformedDisplacement)
         {
-            Debug.Log($"[DisplaceComponent] Already performed operation, skipping");
+            Detail($"[DisplaceComponent] Already performed operation, skipping");
             return false;
         }
 
@@ -582,7 +594,7 @@ public class DisplaceComponent : MonoBehaviour
             #if UNITY_EDITOR
             if (Application.isPlaying && !isProcessingBuild)
             {
-                Debug.Log($"[DisplaceComponent] Play mode operation complete, self-destructing");
+                Detail($"[DisplaceComponent] Play mode operation complete, self-destructing");
                 SelfDestruct();
             }
             #else
@@ -595,9 +607,9 @@ public class DisplaceComponent : MonoBehaviour
 
     private bool PerformComponentDisplacement()
     {
-        Debug.Log($"[DisplaceComponent] PerformComponentDisplacement called on: {gameObject.name}");
-        Debug.Log($"[DisplaceComponent]   - linkFrom: {(linkFrom != null ? linkFrom.name : "NULL")}");
-        Debug.Log($"[DisplaceComponent]   - componentsToMove count: {componentsToMove?.Count ?? 0}");
+        Detail($"[DisplaceComponent] PerformComponentDisplacement called on: {gameObject.name}");
+        Detail($"[DisplaceComponent]   - linkFrom: {(linkFrom != null ? linkFrom.name : "NULL")}");
+        Detail($"[DisplaceComponent]   - componentsToMove count: {componentsToMove?.Count ?? 0}");
 
         if (linkFrom == null)
         {
@@ -618,8 +630,8 @@ public class DisplaceComponent : MonoBehaviour
             return false;
         }
 
-        Debug.Log($"[DisplaceComponent] Target object found: {targetObject.name}");
-        Debug.Log($"[DisplaceComponent] Starting displacement of {componentsToMove.Count} component(s)...");
+        Detail($"[DisplaceComponent] Target object found: {targetObject.name}");
+        Detail($"[DisplaceComponent] Starting displacement of {componentsToMove.Count} component(s)...");
 
         int successCount = 0;
         foreach (var componentRef in componentsToMove)
@@ -630,11 +642,11 @@ public class DisplaceComponent : MonoBehaviour
                 continue;
             }
 
-            Debug.Log($"[DisplaceComponent]   Displacing: {componentRef.component.GetType().Name}");
+            Detail($"[DisplaceComponent]   Displacing: {componentRef.component.GetType().Name}");
             if (DisplaceOneComponent(componentRef.component, targetObject))
             {
                 successCount++;
-                Debug.Log($"[DisplaceComponent]     ✓ Success");
+                Detail($"[DisplaceComponent]     ✓ Success");
             }
             else
             {
@@ -642,11 +654,11 @@ public class DisplaceComponent : MonoBehaviour
             }
         }
 
-        Debug.Log($"[DisplaceComponent] Component displacement complete: {successCount}/{componentsToMove.Count} succeeded");
+        Detail($"[DisplaceComponent] Component displacement complete: {successCount}/{componentsToMove.Count} succeeded");
 
         if (successCount > 0)
         {
-            Debug.Log($"[DisplaceComponent] Successfully displaced {successCount} component(s) from '{linkFrom.name}' to '{targetObject.name}'");
+            Detail($"[DisplaceComponent] Successfully displaced {successCount} component(s) from '{linkFrom.name}' to '{targetObject.name}'");
         }
 
         return successCount > 0;
@@ -671,7 +683,7 @@ public class DisplaceComponent : MonoBehaviour
             }
             
             #if UNITY_EDITOR
-            Debug.Log($"[DisplaceComponent]       Copying component...");
+            Detail($"[DisplaceComponent]       Copying component...");
             bool copySuccess = ComponentUtility.CopyComponent(component);
             if (!copySuccess)
             {
@@ -679,7 +691,7 @@ public class DisplaceComponent : MonoBehaviour
                 return false;
             }
             
-            Debug.Log($"[DisplaceComponent]       Pasting to target...");
+            Detail($"[DisplaceComponent]       Pasting to target...");
             bool pasteSuccess = ComponentUtility.PasteComponentAsNew(targetObject);
             
             if (pasteSuccess)
@@ -689,7 +701,7 @@ public class DisplaceComponent : MonoBehaviour
                 
                 displacementStates.Add(state);
                 
-                Debug.Log($"[DisplaceComponent]       Component pasted successfully, storing state");
+                Detail($"[DisplaceComponent]       Component pasted successfully, storing state");
                 
                 if (!Application.isPlaying)
                 {
@@ -697,7 +709,7 @@ public class DisplaceComponent : MonoBehaviour
                     EditorUtility.SetDirty(linkFrom);
                 }
                 
-                Debug.Log($"[DisplaceComponent]       Destroying original component...");
+                Detail($"[DisplaceComponent]       Destroying original component...");
                 if (Application.isPlaying)
                 {
                     Destroy(component);
@@ -707,7 +719,7 @@ public class DisplaceComponent : MonoBehaviour
                     DestroyImmediate(component);
                 }
                 
-                Debug.Log($"[DisplaceComponent]       Original component destroyed");
+                Detail($"[DisplaceComponent]       Original component destroyed");
                 return true;
             }
             else
@@ -787,7 +799,7 @@ public class DisplaceComponent : MonoBehaviour
             Transform target = baseTarget.transform.Find(offsetPath.path);
             if (target != null)
             {
-                Debug.Log($"[DisplaceComponent] Found target using path: {offsetPath.path}");
+                Detail($"[DisplaceComponent] Found target using path: {offsetPath.path}");
                 return target.gameObject;
             }
         }
@@ -800,7 +812,7 @@ public class DisplaceComponent : MonoBehaviour
     {
         Animator animator = null;
 
-        Debug.Log($"[DisplaceComponent]     GetBoneTransform: linkFrom = {(linkFrom != null ? linkFrom.name : "NULL")}");
+        Detail($"[DisplaceComponent]     GetBoneTransform: linkFrom = {(linkFrom != null ? linkFrom.name : "NULL")}");
 
         if (linkFrom != null)
         {
@@ -812,7 +824,7 @@ public class DisplaceComponent : MonoBehaviour
                 if (anim != null)
                 {
                     animator = anim;  // Keep updating to get topmost
-                    Debug.Log($"[DisplaceComponent]     GetBoneTransform: Found animator on: {animator.gameObject.name}");
+                    Detail($"[DisplaceComponent]     GetBoneTransform: Found animator on: {animator.gameObject.name}");
                 }
                 current = current.parent;
             }
@@ -821,13 +833,13 @@ public class DisplaceComponent : MonoBehaviour
         if (animator == null)
         {
             animator = FindObjectOfType<Animator>();
-            Debug.Log($"[DisplaceComponent]     GetBoneTransform: Using FindObjectOfType, found: {(animator != null ? animator.gameObject.name : "NULL")}");
+            Detail($"[DisplaceComponent]     GetBoneTransform: Using FindObjectOfType, found: {(animator != null ? animator.gameObject.name : "NULL")}");
         }
 
         if (animator != null && animator.isHuman)
         {
             Transform boneTransform = animator.GetBoneTransform(bone);
-            Debug.Log($"[DisplaceComponent]     GetBoneTransform: animator.GetBoneTransform({bone}) returned: {(boneTransform != null ? boneTransform.name : "NULL")}");
+            Detail($"[DisplaceComponent]     GetBoneTransform: animator.GetBoneTransform({bone}) returned: {(boneTransform != null ? boneTransform.name : "NULL")}");
             return boneTransform;
         }
         else
@@ -856,7 +868,7 @@ public class DisplaceComponent : MonoBehaviour
                 // Skip "Array" - it's Unity's SerializedProperty notation, not a real field
                 if (part == "Array")
                 {
-                    Debug.Log($"[DisplaceComponent]   Skipping 'Array' notation at part {i}");
+                    Detail($"[DisplaceComponent]   Skipping 'Array' notation at part {i}");
                     continue;
                 }
 
@@ -866,7 +878,7 @@ public class DisplaceComponent : MonoBehaviour
                     string indexStr = part.Substring(5, part.Length - 6); // Extract "0" from "data[0]"
                     int index = int.Parse(indexStr);
 
-                    Debug.Log($"[DisplaceComponent]   Accessing array/list element at index {index}");
+                    Detail($"[DisplaceComponent]   Accessing array/list element at index {index}");
 
                     // Current object should be an IList
                     if (currentObject is System.Collections.IList list)
@@ -874,7 +886,7 @@ public class DisplaceComponent : MonoBehaviour
                         if (index < list.Count)
                         {
                             currentObject = list[index];
-                            Debug.Log($"[DisplaceComponent]   Got list element at index {index}, type: {currentObject.GetType().Name}");
+                            Detail($"[DisplaceComponent]   Got list element at index {index}, type: {currentObject.GetType().Name}");
                         }
                         else
                         {
@@ -908,7 +920,7 @@ public class DisplaceComponent : MonoBehaviour
                     // This is the final field to set
                     finalField = field;
                     field.SetValue(currentObject, value);
-                    Debug.Log($"[DisplaceComponent]   Set field '{fieldPath}' to {(value != null ? value.name : "null")} via reflection");
+                    Detail($"[DisplaceComponent]   Set field '{fieldPath}' to {(value != null ? value.name : "null")} via reflection");
                     return true;
                 }
                 else
@@ -920,7 +932,7 @@ public class DisplaceComponent : MonoBehaviour
                         Debug.LogWarning($"[DisplaceComponent] Null value encountered at '{part}' in path '{fieldPath}'");
                         return false;
                     }
-                    Debug.Log($"[DisplaceComponent]   Navigated to field '{part}', type: {currentObject.GetType().Name}");
+                    Detail($"[DisplaceComponent]   Navigated to field '{part}', type: {currentObject.GetType().Name}");
                 }
             }
 
@@ -950,7 +962,7 @@ public class DisplaceComponent : MonoBehaviour
                 // Skip "Array" - it's Unity's SerializedProperty notation, not a real field
                 if (part == "Array")
                 {
-                    Debug.Log($"[DisplaceComponent]   Skipping 'Array' notation at part {i}");
+                    Detail($"[DisplaceComponent]   Skipping 'Array' notation at part {i}");
                     continue;
                 }
 
@@ -960,7 +972,7 @@ public class DisplaceComponent : MonoBehaviour
                     string indexStr = part.Substring(5, part.Length - 6); // Extract "0" from "data[0]"
                     int index = int.Parse(indexStr);
 
-                    Debug.Log($"[DisplaceComponent]   Accessing array/list element at index {index}");
+                    Detail($"[DisplaceComponent]   Accessing array/list element at index {index}");
 
                     // Current object should be an IList
                     if (currentObject is System.Collections.IList list)
@@ -968,7 +980,7 @@ public class DisplaceComponent : MonoBehaviour
                         if (index < list.Count)
                         {
                             currentObject = list[index];
-                            Debug.Log($"[DisplaceComponent]   Got list element at index {index}, type: {currentObject.GetType().Name}");
+                            Detail($"[DisplaceComponent]   Got list element at index {index}, type: {currentObject.GetType().Name}");
                         }
                         else
                         {
@@ -1001,7 +1013,7 @@ public class DisplaceComponent : MonoBehaviour
                 {
                     // This is the final field to set
                     field.SetValue(currentObject, value);
-                    Debug.Log($"[DisplaceComponent]   Set string field '{fieldPath}' to \"{value}\" via reflection");
+                    Detail($"[DisplaceComponent]   Set string field '{fieldPath}' to \"{value}\" via reflection");
                     return true;
                 }
                 else
@@ -1013,7 +1025,7 @@ public class DisplaceComponent : MonoBehaviour
                         Debug.LogWarning($"[DisplaceComponent] Null value encountered at '{part}' in path '{fieldPath}'");
                         return false;
                     }
-                    Debug.Log($"[DisplaceComponent]   Navigated to field '{part}', type: {currentObject.GetType().Name}");
+                    Detail($"[DisplaceComponent]   Navigated to field '{part}', type: {currentObject.GetType().Name}");
                 }
             }
 
@@ -1172,14 +1184,14 @@ public class DisplaceComponent : MonoBehaviour
 
         Animator animator = avatarRoot.GetComponent<Animator>();
 
-        Debug.Log($"[DisplaceComponent] ========== SEARCH OBJECT DEBUG ==========");
-        Debug.Log($"[DisplaceComponent] Searching for object: '{objectName}'");
-        Debug.Log($"[DisplaceComponent] Avatar Root: {avatarRoot.name}");
+        Detail($"[DisplaceComponent] ========== SEARCH OBJECT DEBUG ==========");
+        Detail($"[DisplaceComponent] Searching for object: '{objectName}'");
+        Detail($"[DisplaceComponent] Avatar Root: {avatarRoot.name}");
 
         // PRIORITY 1: Search within humanoid bone children
         if (animator != null && animator.isHuman)
         {
-            Debug.Log($"[DisplaceComponent] Priority search: Looking within humanoid bone children...");
+            Detail($"[DisplaceComponent] Priority search: Looking within humanoid bone children...");
 
             // Get all humanoid bones
             List<Transform> boneTransforms = new List<Transform>();
@@ -1194,7 +1206,7 @@ public class DisplaceComponent : MonoBehaviour
                 }
             }
 
-            Debug.Log($"[DisplaceComponent] Found {boneTransforms.Count} humanoid bones to search within");
+            Detail($"[DisplaceComponent] Found {boneTransforms.Count} humanoid bones to search within");
 
             // Search within each bone's children
             foreach (Transform boneTransform in boneTransforms)
@@ -1202,30 +1214,30 @@ public class DisplaceComponent : MonoBehaviour
                 Transform found = FindChildByName(boneTransform, objectName);
                 if (found != null)
                 {
-                    Debug.Log($"[DisplaceComponent] ✓ FOUND (Priority): '{objectName}' under bone '{boneTransform.name}'");
-                    Debug.Log($"[DisplaceComponent] Full Path: {GetFullPath(found)}");
-                    Debug.Log($"[DisplaceComponent] ===========================================");
+                    Detail($"[DisplaceComponent] ✓ FOUND (Priority): '{objectName}' under bone '{boneTransform.name}'");
+                    Detail($"[DisplaceComponent] Full Path: {GetFullPath(found)}");
+                    Detail($"[DisplaceComponent] ===========================================");
                     return found;
                 }
             }
 
-            Debug.Log($"[DisplaceComponent] Not found in humanoid bone children");
+            Detail($"[DisplaceComponent] Not found in humanoid bone children");
         }
 
         // PRIORITY 2: Search entire hierarchy under avatar root
-        Debug.Log($"[DisplaceComponent] Fallback search: Looking in entire hierarchy...");
+        Detail($"[DisplaceComponent] Fallback search: Looking in entire hierarchy...");
         Transform result = FindChildByName(avatarRoot.transform, objectName);
 
         if (result != null)
         {
-            Debug.Log($"[DisplaceComponent] ✓ FOUND (Fallback): '{objectName}'");
-            Debug.Log($"[DisplaceComponent] Full Path: {GetFullPath(result)}");
-            Debug.Log($"[DisplaceComponent] ===========================================");
+            Detail($"[DisplaceComponent] ✓ FOUND (Fallback): '{objectName}'");
+            Detail($"[DisplaceComponent] Full Path: {GetFullPath(result)}");
+            Detail($"[DisplaceComponent] ===========================================");
             return result;
         }
 
-        Debug.Log($"[DisplaceComponent] ❌ NOT FOUND: '{objectName}'");
-        Debug.Log($"[DisplaceComponent] ===========================================");
+        Detail($"[DisplaceComponent] ❌ NOT FOUND: '{objectName}'");
+        Detail($"[DisplaceComponent] ===========================================");
         return null;
     }
 
@@ -1349,9 +1361,9 @@ public class DisplaceComponent : MonoBehaviour
 
     private bool PerformFieldFilling()
     {
-        Debug.Log($"[DisplaceComponent] PerformFieldFilling called on: {gameObject.name}");
-        Debug.Log($"[DisplaceComponent]   - fieldMappings count: {fieldMappings?.Count ?? 0}");
-        Debug.Log($"[DisplaceComponent]   - Application.isPlaying: {Application.isPlaying}");
+        Detail($"[DisplaceComponent] PerformFieldFilling called on: {gameObject.name}");
+        Detail($"[DisplaceComponent]   - fieldMappings count: {fieldMappings?.Count ?? 0}");
+        Detail($"[DisplaceComponent]   - Application.isPlaying: {Application.isPlaying}");
 
         if (fieldMappings == null || fieldMappings.Count == 0)
         {
@@ -1397,7 +1409,7 @@ public class DisplaceComponent : MonoBehaviour
                     // Check if we should skip (already filled)
                     if (mapping.skipIfAlreadyFilled && !string.IsNullOrEmpty(property.stringValue))
                     {
-                        Debug.Log($"[DisplaceComponent]   ⊘ Skipped (already filled): \"{property.stringValue}\"");
+                        Detail($"[DisplaceComponent]   ⊘ Skipped (already filled): \"{property.stringValue}\"");
                         continue;
                     }
 
@@ -1408,13 +1420,13 @@ public class DisplaceComponent : MonoBehaviour
                     if (!string.IsNullOrEmpty(mapping.textValue))
                     {
                         valueToFill = mapping.textValue;
-                        Debug.Log($"[DisplaceComponent]   Processing string field (text value): {mapping.targetComponent.GetType().Name}.{mapping.fieldPath} -> \"{valueToFill}\"");
+                        Detail($"[DisplaceComponent]   Processing string field (text value): {mapping.targetComponent.GetType().Name}.{mapping.fieldPath} -> \"{valueToFill}\"");
                         SafeLog($"    String field (text): {mapping.targetComponent.GetType().Name}.{mapping.fieldPath} = \"{valueToFill}\"");
                     }
                     // Priority 2: Use search path if text value is empty but search path is not
                     else if (!string.IsNullOrEmpty(mapping.searchPath))
                     {
-                        Debug.Log($"[DisplaceComponent]   Processing string field (search path): {mapping.targetComponent.GetType().Name}.{mapping.fieldPath} -> searching for '{mapping.searchPath}'");
+                        Detail($"[DisplaceComponent]   Processing string field (search path): {mapping.targetComponent.GetType().Name}.{mapping.fieldPath} -> searching for '{mapping.searchPath}'");
                         SafeLog($"    String field (search): {mapping.targetComponent.GetType().Name}.{mapping.fieldPath} searching '{mapping.searchPath}'");
 
                         valueToFill = FindObjectPathByName(mapping.searchPath);
@@ -1426,7 +1438,7 @@ public class DisplaceComponent : MonoBehaviour
                             continue;
                         }
 
-                        Debug.Log($"[DisplaceComponent]   Found path: \"{valueToFill}\"");
+                        Detail($"[DisplaceComponent]   Found path: \"{valueToFill}\"");
                         SafeLog($"      Found path: \"{valueToFill}\"");
                     }
                     else
@@ -1443,7 +1455,7 @@ public class DisplaceComponent : MonoBehaviour
                         if (SetStringFieldValueByReflection(mapping.targetComponent, mapping.fieldPath, valueToFill))
                         {
                             successCount++;
-                            Debug.Log($"[DisplaceComponent]   ✓ Filled with: \"{valueToFill}\" (play mode)");
+                            Detail($"[DisplaceComponent]   ✓ Filled with: \"{valueToFill}\" (play mode)");
                         }
                     }
                     else
@@ -1461,16 +1473,16 @@ public class DisplaceComponent : MonoBehaviour
 
                         successCount++;
 
-                        Debug.Log($"[DisplaceComponent]   ✓ Filled with: \"{valueToFill}\"");
+                        Detail($"[DisplaceComponent]   ✓ Filled with: \"{valueToFill}\"");
                     }
                 }
                 // Object reference field (Transform/GameObject)
                 else if (property.propertyType == SerializedPropertyType.ObjectReference)
                 {
-                    Debug.Log($"[DisplaceComponent]   Processing object field: {mapping.targetComponent.GetType().Name}.{mapping.fieldPath}");
-                    Debug.Log($"[DisplaceComponent]     Component GameObject: {mapping.targetComponent.gameObject.name}");
-                    Debug.Log($"[DisplaceComponent]     Component full path: {GetFullPath(mapping.targetComponent.transform)}");
-                    Debug.Log($"[DisplaceComponent]     Application.isPlaying: {Application.isPlaying}");
+                    Detail($"[DisplaceComponent]   Processing object field: {mapping.targetComponent.GetType().Name}.{mapping.fieldPath}");
+                    Detail($"[DisplaceComponent]     Component GameObject: {mapping.targetComponent.gameObject.name}");
+                    Detail($"[DisplaceComponent]     Component full path: {GetFullPath(mapping.targetComponent.transform)}");
+                    Detail($"[DisplaceComponent]     Application.isPlaying: {Application.isPlaying}");
 
                     SafeLog($"    Object field: {mapping.targetComponent.GetType().Name}.{mapping.fieldPath}");
                     SafeLog($"      Component on: {mapping.targetComponent.gameObject.name}");
@@ -1485,7 +1497,7 @@ public class DisplaceComponent : MonoBehaviour
                     UnityEngine.Object currentValue = property.objectReferenceValue;
                     if (mapping.skipIfAlreadyFilled && currentValue != null)
                     {
-                        Debug.Log($"[DisplaceComponent]   ⊘ Skipped (already filled): {currentValue.name}");
+                        Detail($"[DisplaceComponent]   ⊘ Skipped (already filled): {currentValue.name}");
                         continue;
                     }
 
@@ -1494,7 +1506,7 @@ public class DisplaceComponent : MonoBehaviour
                     // Priority 1: Use searchObjectName if provided
                     if (!string.IsNullOrEmpty(mapping.searchObjectName))
                     {
-                        Debug.Log($"[DisplaceComponent]     Using search by name: '{mapping.searchObjectName}'");
+                        Detail($"[DisplaceComponent]     Using search by name: '{mapping.searchObjectName}'");
                         SafeLog($"      Searching for object: '{mapping.searchObjectName}'");
 
                         targetTransform = FindObjectByName(mapping.searchObjectName);
@@ -1504,13 +1516,13 @@ public class DisplaceComponent : MonoBehaviour
                             SafeLog($"      ✗ Object NOT FOUND: '{mapping.searchObjectName}'");
                             continue;
                         }
-                        Debug.Log($"[DisplaceComponent]     Found object: {targetTransform.name} at path: {GetFullPath(targetTransform)}");
+                        Detail($"[DisplaceComponent]     Found object: {targetTransform.name} at path: {GetFullPath(targetTransform)}");
                         SafeLog($"      Found: {targetTransform.name}");
                     }
                     // Priority 2: Use targetBone as fallback
                     else
                     {
-                        Debug.Log($"[DisplaceComponent]     Using humanoid bone: {mapping.targetBone}");
+                        Detail($"[DisplaceComponent]     Using humanoid bone: {mapping.targetBone}");
                         SafeLog($"      Using bone: {mapping.targetBone}");
 
                         targetTransform = GetBoneTransform(mapping.targetBone);
@@ -1520,7 +1532,7 @@ public class DisplaceComponent : MonoBehaviour
                             SafeLog($"      ✗ Bone NOT FOUND: {mapping.targetBone}");
                             continue;
                         }
-                        Debug.Log($"[DisplaceComponent]     Found bone: {targetTransform.name} at path: {GetFullPath(targetTransform)}");
+                        Detail($"[DisplaceComponent]     Found bone: {targetTransform.name} at path: {GetFullPath(targetTransform)}");
                         SafeLog($"      Found bone: {targetTransform.name}");
                     }
 
@@ -1545,24 +1557,24 @@ public class DisplaceComponent : MonoBehaviour
                     if (Application.isPlaying)
                     {
                         // In play mode, use reflection to set the value directly
-                        Debug.Log($"[DisplaceComponent]     Attempting reflection set:");
-                        Debug.Log($"[DisplaceComponent]       Component: {mapping.targetComponent.GetType().Name}");
-                        Debug.Log($"[DisplaceComponent]       Field path: {mapping.fieldPath}");
-                        Debug.Log($"[DisplaceComponent]       Value: {valueToSet.name} (Type: {valueToSet.GetType().Name})");
+                        Detail($"[DisplaceComponent]     Attempting reflection set:");
+                        Detail($"[DisplaceComponent]       Component: {mapping.targetComponent.GetType().Name}");
+                        Detail($"[DisplaceComponent]       Field path: {mapping.fieldPath}");
+                        Detail($"[DisplaceComponent]       Value: {valueToSet.name} (Type: {valueToSet.GetType().Name})");
 
                         if (SetFieldValueByReflection(mapping.targetComponent, mapping.fieldPath, valueToSet))
                         {
                             state.filledValue = valueToSet;
                             fieldFillStates.Add(state);
                             successCount++;
-                            Debug.Log($"[DisplaceComponent]   ✓ Filled with: {valueToSet.name} (play mode) - SUCCESS!");
+                            Detail($"[DisplaceComponent]   ✓ Filled with: {valueToSet.name} (play mode) - SUCCESS!");
 
                             // Verify the value was actually set by reading it back
                             SerializedObject verifyObj = new SerializedObject(mapping.targetComponent);
                             SerializedProperty verifyProp = verifyObj.FindProperty(mapping.fieldPath);
                             if (verifyProp != null && verifyProp.objectReferenceValue != null)
                             {
-                                Debug.Log($"[DisplaceComponent]   ✓ VERIFIED: Field now contains: {verifyProp.objectReferenceValue.name}");
+                                Detail($"[DisplaceComponent]   ✓ VERIFIED: Field now contains: {verifyProp.objectReferenceValue.name}");
                             }
                             else
                             {
@@ -1590,7 +1602,7 @@ public class DisplaceComponent : MonoBehaviour
                         fieldFillStates.Add(state);
                         successCount++;
 
-                        Debug.Log($"[DisplaceComponent]   ✓ Filled with: {targetTransform.name}");
+                        Detail($"[DisplaceComponent]   ✓ Filled with: {targetTransform.name}");
                     }
                 }
                 else
@@ -1605,7 +1617,7 @@ public class DisplaceComponent : MonoBehaviour
             }
         }
 
-        Debug.Log($"[DisplaceComponent] Field filling complete: {successCount}/{fieldMappings.Count} succeeded");
+        Detail($"[DisplaceComponent] Field filling complete: {successCount}/{fieldMappings.Count} succeeded");
         return successCount > 0;
         #else
         return false;
@@ -1614,9 +1626,9 @@ public class DisplaceComponent : MonoBehaviour
 
     private void RestoreFieldValues()
     {
-        Debug.Log($"[DisplaceComponent] RestoreFieldValues called on: {gameObject.name}");
-        Debug.Log($"[DisplaceComponent]   - fieldFillStates count: {fieldFillStates.Count}");
-        Debug.Log($"[DisplaceComponent]   - fieldMappings count: {fieldMappings?.Count ?? 0}");
+        Detail($"[DisplaceComponent] RestoreFieldValues called on: {gameObject.name}");
+        Detail($"[DisplaceComponent]   - fieldFillStates count: {fieldFillStates.Count}");
+        Detail($"[DisplaceComponent]   - fieldMappings count: {fieldMappings?.Count ?? 0}");
 
         #if UNITY_EDITOR
         int restoredCount = 0;
@@ -1640,13 +1652,13 @@ public class DisplaceComponent : MonoBehaviour
                     // Only restore string fields (object references are handled by fieldFillStates)
                     if (property.propertyType == SerializedPropertyType.String)
                     {
-                        Debug.Log($"[DisplaceComponent]   Restoring text field: {mapping.targetComponent.GetType().Name}.{mapping.fieldPath}");
+                        Detail($"[DisplaceComponent]   Restoring text field: {mapping.targetComponent.GetType().Name}.{mapping.fieldPath}");
 
                         property.stringValue = mapping.originalTextValue;
                         so.ApplyModifiedProperties();
                         restoredCount++;
 
-                        Debug.Log($"[DisplaceComponent]   ✓ Restored to: \"{mapping.originalTextValue}\"");
+                        Detail($"[DisplaceComponent]   ✓ Restored to: \"{mapping.originalTextValue}\"");
 
                         // Clear the stored original value
                         mapping.originalTextValue = "";
@@ -1670,7 +1682,7 @@ public class DisplaceComponent : MonoBehaviour
 
             try
             {
-                Debug.Log($"[DisplaceComponent]   Restoring object field: {state.targetComponent.GetType().Name}.{state.fieldPath}");
+                Detail($"[DisplaceComponent]   Restoring object field: {state.targetComponent.GetType().Name}.{state.fieldPath}");
 
                 SerializedObject so = new SerializedObject(state.targetComponent);
                 SerializedProperty property = so.FindProperty(state.fieldPath);
@@ -1686,7 +1698,7 @@ public class DisplaceComponent : MonoBehaviour
                 restoredCount++;
 
                 string originalName = state.originalValue != null ? state.originalValue.name : "null";
-                Debug.Log($"[DisplaceComponent]   ✓ Restored to: {originalName}");
+                Detail($"[DisplaceComponent]   ✓ Restored to: {originalName}");
             }
             catch (System.Exception e)
             {
@@ -1694,17 +1706,17 @@ public class DisplaceComponent : MonoBehaviour
             }
         }
 
-        Debug.Log($"[DisplaceComponent] Restored {restoredCount} field(s) total");
+        Detail($"[DisplaceComponent] Restored {restoredCount} field(s) total");
         fieldFillStates.Clear();
         #endif
     }
 
     private void RestoreOriginalState()
     {
-        Debug.Log($"[DisplaceComponent] RestoreOriginalState called on: {gameObject.name}");
-        Debug.Log($"[DisplaceComponent]   - Operation Mode: {operationMode}");
-        Debug.Log($"[DisplaceComponent]   - displacementStates count: {displacementStates.Count}");
-        Debug.Log($"[DisplaceComponent]   - fieldFillStates count: {fieldFillStates.Count}");
+        Detail($"[DisplaceComponent] RestoreOriginalState called on: {gameObject.name}");
+        Detail($"[DisplaceComponent]   - Operation Mode: {operationMode}");
+        Detail($"[DisplaceComponent]   - displacementStates count: {displacementStates.Count}");
+        Detail($"[DisplaceComponent]   - fieldFillStates count: {fieldFillStates.Count}");
 
         // Handle based on operation mode
         if (operationMode == OperationMode.FillFields)
@@ -1716,7 +1728,7 @@ public class DisplaceComponent : MonoBehaviour
         // Displace mode restoration
         if (displacementStates.Count == 0)
         {
-            Debug.Log($"[DisplaceComponent] No displacement states to restore");
+            Detail($"[DisplaceComponent] No displacement states to restore");
             return;
         }
 
@@ -1726,11 +1738,11 @@ public class DisplaceComponent : MonoBehaviour
         {
             try
             {
-                Debug.Log($"[DisplaceComponent]   Restoring component: {state.componentTypeName}");
+                Detail($"[DisplaceComponent]   Restoring component: {state.componentTypeName}");
                 
                 if (state.newComponent != null && state.originalGameObject != null)
                 {
-                    Debug.Log($"[DisplaceComponent]     Copying from target back to original...");
+                    Detail($"[DisplaceComponent]     Copying from target back to original...");
                     bool copySuccess = ComponentUtility.CopyComponent(state.newComponent);
                     if (!copySuccess)
                     {
@@ -1745,7 +1757,7 @@ public class DisplaceComponent : MonoBehaviour
                         Component[] components = state.originalGameObject.GetComponents(state.newComponent.GetType());
                         Component restoredComponent = components[components.Length - 1];
                         
-                        Debug.Log($"[DisplaceComponent]     Component pasted back, restoring order...");
+                        Detail($"[DisplaceComponent]     Component pasted back, restoring order...");
                         
                         if (state.componentIndex >= 0)
                         {
@@ -1755,7 +1767,7 @@ public class DisplaceComponent : MonoBehaviour
                             {
                                 ComponentUtility.MoveComponentUp(restoredComponent);
                             }
-                            Debug.Log($"[DisplaceComponent]     Moved up {movesNeeded} positions");
+                            Detail($"[DisplaceComponent]     Moved up {movesNeeded} positions");
                         }
                         
                         if (restoredComponent is Behaviour behaviour)
@@ -1769,7 +1781,7 @@ public class DisplaceComponent : MonoBehaviour
                             EditorUtility.SetDirty(state.targetGameObject);
                         }
                         
-                        Debug.Log($"[DisplaceComponent]     Destroying component from target...");
+                        Detail($"[DisplaceComponent]     Destroying component from target...");
                         if (Application.isPlaying)
                         {
                             Destroy(state.newComponent);
@@ -1780,7 +1792,7 @@ public class DisplaceComponent : MonoBehaviour
                         }
                         
                         restoredCount++;
-                        Debug.Log($"[DisplaceComponent]     ✓ Component fully restored");
+                        Detail($"[DisplaceComponent]     ✓ Component fully restored");
                     }
                     else
                     {
@@ -1798,20 +1810,20 @@ public class DisplaceComponent : MonoBehaviour
             }
         }
         
-        Debug.Log($"[DisplaceComponent] Restored {restoredCount}/{displacementStates.Count} component(s) to original locations");
+        Detail($"[DisplaceComponent] Restored {restoredCount}/{displacementStates.Count} component(s) to original locations");
         
         displacementStates.Clear();
         isExitingPlayMode = false;
         hasPerformedDisplacement = false;
         
-        Debug.Log($"[DisplaceComponent] State cleared on: {gameObject.name}");
+        Detail($"[DisplaceComponent] State cleared on: {gameObject.name}");
         #endif
     }
 
     private void SelfDestruct()
     {
         #if UNITY_EDITOR
-        Debug.Log($"[DisplaceComponent] Self-destructing on: {gameObject.name}");
+        Detail($"[DisplaceComponent] Self-destructing on: {gameObject.name}");
         if (!Application.isPlaying)
         {
             DestroyImmediate(this);

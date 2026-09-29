@@ -69,7 +69,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception e)
             {
-                UnityEngine.Debug.LogWarning("[AutoRig Feet] Could not start the AutoRig Feet record: " + e.Message);
+                ShuganLog.Warn("AutoRig Feet", "Could not start the AutoRig Feet record: " + e.Message);
                 _rec = null;
                 _recRun = null;
             }
@@ -633,7 +633,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception e)
             {
-                UnityEngine.Debug.LogWarning("[AutoRig Feet] Searching for other users of " + assetPath + " failed: " + e.Message);
+                ShuganLog.Warn("AutoRig Feet", "Searching for other users of " + assetPath + " failed: " + e.Message);
             }
             return users;
         }
@@ -765,7 +765,7 @@ namespace ZeroShugan.ShuganUnityTools
                     "Everything that was replaced had a backup made first; see the Backups tab.");
                 FinishRunReport();
                 SetStatus("Restore to original failed: " + e.Message, MessageType.Error);
-                UnityEngine.Debug.LogError("[AutoRig Feet] Restore to original failed: " + e);
+                ShuganLog.Error("AutoRig Feet", "Restore to original failed: " + e);
             }
             Repaint();
         }

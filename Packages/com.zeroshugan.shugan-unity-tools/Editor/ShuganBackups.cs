@@ -95,7 +95,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception ex)
             {
-                UnityEngine.Debug.LogWarning("[Shugan] Backup failed for " + assetPath + ": " + ex.Message);
+                ShuganLog.Warn("Shugan", "Backup failed for " + assetPath + ": " + ex.Message);
                 return null;
             }
         }
@@ -119,7 +119,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception ex)
             {
-                UnityEngine.Debug.LogWarning("[Shugan] Backup .meta not written: " + ex.Message);
+                ShuganLog.Warn("Shugan", "Backup .meta not written: " + ex.Message);
             }
         }
 
@@ -247,7 +247,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception ex)
             {
-                UnityEngine.Debug.LogWarning("[Shugan] Backup scan failed: " + ex.Message);
+                ShuganLog.Warn("Shugan", "Backup scan failed: " + ex.Message);
             }
 
             var list = new List<AssetGroup>(groups.Values);

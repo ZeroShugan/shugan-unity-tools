@@ -32,6 +32,9 @@ namespace ZeroShugan.ShuganUnityTools
     {
         public const string ObjectName = "ARF Foot Shape (keep last)";
         public const string MenuPath   = "Animation/Feet/Fix/Foot Shape";
+        // Shared with the FX feet prefabs, so the fix follows whether the feet system (gesture or Index
+        // controller) is in use.
+        public const string GlobalParameter = "Gesture_Feet_OR_IndexControllerBOOL";
 
         // Foot Shrink: one toggle per shrink key that works on the feet (the creator's key that flattens the skin
         // under shoes or socks), each in its own menu entry. They sit just above the Foot Shape toggle.
@@ -179,11 +182,11 @@ namespace ZeroShugan.ShuganUnityTools
         public static GameObject CreateOrUpdate(GameObject avatarRoot,
                                                 IList<(string key, float value)> actions,
                                                 out string error)
-            => CreateOrUpdate(avatarRoot, ObjectName, MenuPath, actions, out error);
+            => CreateOrUpdate(avatarRoot, ObjectName, MenuPath, actions, out error, GlobalParameter);
 
         public static GameObject CreateOrUpdate(GameObject avatarRoot, string objectName, string menuPath,
                                                 IList<(string key, float value)> actions,
-                                                out string error)
+                                                out string error, string globalParameter = null)
         {
             error = null;
             if (avatarRoot == null) { error = "No avatar selected."; return null; }
@@ -222,6 +225,8 @@ namespace ZeroShugan.ShuganUnityTools
                 if (toggle == null) throw new Exception("CreateToggle returned nothing.");
 
                 Call(toggle, "SetMenuPath", new[] { typeof(string) }, new object[] { menuPath });
+                if (!string.IsNullOrEmpty(globalParameter))
+                    Call(toggle, "SetGlobalParameter", new[] { typeof(string) }, new object[] { globalParameter });
 
                 object set = Call(toggle, "GetActions", Type.EmptyTypes, new object[0]);
                 if (set == null) throw new Exception("GetActions returned nothing.");

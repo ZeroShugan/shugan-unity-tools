@@ -376,7 +376,7 @@ namespace ZeroShugan.ShuganUnityTools
                     break;
                 }
             }
-            catch (Exception e) { UnityEngine.Debug.LogWarning("[AutoRig Feet] Outfit foot check failed: " + e.Message); }
+            catch (Exception e) { ShuganLog.Warn("AutoRig Feet", "Outfit foot check failed: " + e.Message); }
 
             _outfitFootWarning[ck] = problem;
             return problem;
@@ -459,7 +459,7 @@ namespace ZeroShugan.ShuganUnityTools
                 if (_exportMode == ExportMode.Replace)
                 {
                     string dest = ShuganBackups.BackupAsset(fbx);
-                    if (dest != null) UnityEngine.Debug.Log("[AutoRig Feet] Outfit backup: " + dest);
+                    if (dest != null) ShuganLog.Detail("AutoRig Feet", "Outfit backup: " + dest);
                     RecordOutfitOriginal(fbx, dest);
                 }
                 _outfitJobs.Add(job);
@@ -623,7 +623,7 @@ namespace ZeroShugan.ShuganUnityTools
             if (_outfitRestoreMode)
             {
                 string dest = ShuganBackups.BackupAsset(job.fbxPath);
-                if (dest != null) UnityEngine.Debug.Log("[AutoRig Feet] Outfit backup before restore: " + dest);
+                if (dest != null) ShuganLog.Detail("AutoRig Feet", "Outfit backup before restore: " + dest);
             }
             ReplaceFileSafely(job.exportAbs, ToAbsPath(job.fbxPath));
             AssetDatabase.ImportAsset(job.fbxPath, ImportAssetOptions.ForceUpdate);

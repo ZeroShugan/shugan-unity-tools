@@ -105,7 +105,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception e)
             {
-                Debug.LogWarning("[AutoRig Feet] The AutoRig Feet record of " + fbxAssetPath + " could not be read: " + e.Message);
+                ShuganLog.Warn("AutoRig Feet", "The AutoRig Feet record of " + fbxAssetPath + " could not be read: " + e.Message);
                 return null;
             }
         }
@@ -128,7 +128,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception e)
             {
-                Debug.LogWarning("[AutoRig Feet] The AutoRig Feet record of " + fbx + " could not be written: " + e.Message);
+                ShuganLog.Warn("AutoRig Feet", "The AutoRig Feet record of " + fbx + " could not be written: " + e.Message);
             }
         }
 
@@ -150,7 +150,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception e)
             {
-                Debug.LogWarning("[AutoRig Feet] Scanning AutoRig Feet records failed: " + e.Message);
+                ShuganLog.Warn("AutoRig Feet", "Scanning AutoRig Feet records failed: " + e.Message);
             }
             return list;
         }

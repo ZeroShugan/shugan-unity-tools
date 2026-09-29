@@ -238,7 +238,7 @@ namespace ZeroShugan.ShuganUnityTools
             }
             catch (Exception ex)
             {
-                UnityEngine.Debug.LogWarning("[Shugan] Could not open the report preview: " + ex.Message);
+                ShuganLog.Warn("Shugan", "Could not open the report preview: " + ex.Message);
                 return null;
             }
         }

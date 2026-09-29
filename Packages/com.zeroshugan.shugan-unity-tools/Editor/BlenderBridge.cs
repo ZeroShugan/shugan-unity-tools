@@ -1024,7 +1024,7 @@ print('[BlenderBridge] Restore complete.')
             catch (Exception e)
             {
                 // A file that exists but is not a runnable Blender (wrong file picked, blocked by antivirus).
-                UnityEngine.Debug.LogError("[BlenderBridge] Blender could not be started: " + e.Message);
+                ShuganLog.Error("BlenderBridge", "Blender could not be started: " + e.Message);
                 proc.Dispose();
                 return null;
             }

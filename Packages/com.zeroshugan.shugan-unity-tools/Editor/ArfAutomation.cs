@@ -70,7 +70,7 @@ namespace ZeroShugan.ShuganUnityTools
         {
             if (!Active) { EditorUtility.DisplayDialog(title, message, "OK"); return; }
             AskLog.Add(key + "=notified");
-            UnityEngine.Debug.LogWarning("[AutoRig Feet] " + title + ": " + message);
+            ShuganLog.Warn("AutoRig Feet", "" + title + ": " + message);
         }
     }
 }
