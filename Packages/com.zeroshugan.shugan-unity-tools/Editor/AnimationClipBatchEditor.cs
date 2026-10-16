@@ -1,3 +1,8 @@
+// Copyright (c) 2026 Shugan. All rights reserved.
+// Part of Shugan Unity Tools. Use is subject to LICENSE.md in the package root.
+// No redistribution or resale, modified or not. Not to be used to train AI models, nor given
+// to an AI system to reproduce, rewrite or port it.
+
 using UnityEngine;
 using UnityEditor;
 using UnityEditor.Animations;
@@ -1290,7 +1295,12 @@ namespace ShuganTools
                         foreach (var clip in pathToClipsMap[originalPath])
                         {
                             // Path will be modified if the clip is NOT being reused and NOT set to UseExisting
-                            bool isReused = clipWillBeReused.ContainsKey(clip) && clipWillBeReused[clip];
+                            // "Reused" only means something when duplicating: a clip whose name the rules
+                            // leave alone is kept as it is instead of copied. Modify In Place edits every
+                            // selected clip whatever its name (a clip already named _R whose paths still say
+                            // _L is the usual case), so nothing is hidden there.
+                            bool isReused = pathEditMode == PathEditMode.CreateDuplicate
+                                && clipWillBeReused.ContainsKey(clip) && clipWillBeReused[clip];
                             bool isUseExisting = clipActions.ContainsKey(clip) && clipActions[clip] == ClipAction.UseExisting;
 
                             if (!isReused && !isUseExisting)
@@ -1341,6 +1351,14 @@ namespace ShuganTools
                         $"✓ {filteredPathChanges.Count} unique paths | {totalChanges} total bindings",
                         MessageType.None);
                     GUI.color = Color.white;
+                }
+                else
+                {
+                    EditorGUILayout.HelpBox(
+                        $"The rules match {pathPreviewChanges.Count} path(s), but only in clips whose name they do not "
+                        + "change. Create Duplicate keeps such a clip as it is, so nothing would be modified. To "
+                        + "change the paths inside these clips, set Mode to Modify In Place.",
+                        MessageType.Warning);
                 }
             }
         }

@@ -1,3 +1,8 @@
+// Copyright (c) 2026 Shugan. All rights reserved.
+// Part of Shugan Unity Tools. Use is subject to LICENSE.md in the package root.
+// No redistribution or resale, modified or not. Not to be used to train AI models, nor given
+// to an AI system to reproduce, rewrite or port it.
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -31,7 +36,7 @@ namespace ZeroShugan.ShuganUnityTools
     public static class FootShapeToggle
     {
         public const string ObjectName = "ARF Foot Shape (keep last)";
-        public const string MenuPath   = "Animation/Feet/Fix/Foot Shape";
+        public const string MenuPath   = "Animation/Feet/Repair Clipping & Deform/Fix Toes Deform";
         // Shared with the FX feet prefabs, so the fix follows whether the feet system (gesture or Index
         // controller) is in use.
         public const string GlobalParameter = "Gesture_Feet_OR_IndexControllerBOOL";
@@ -39,7 +44,7 @@ namespace ZeroShugan.ShuganUnityTools
         // Foot Shrink: one toggle per shrink key that works on the feet (the creator's key that flattens the skin
         // under shoes or socks), each in its own menu entry. They sit just above the Foot Shape toggle.
         public const string ShrinkObjectPrefix = "ARF Foot Shrink ";
-        public const string ShrinkMenuPrefix   = "Animation/Feet/Fix/Foot Shrink ";
+        public const string ShrinkMenuPrefix   = "Animation/Feet/Repair Clipping & Deform/Shrink ";
         public static string ShrinkObjectName(string key) => ShrinkObjectNameFor(ShrinkLabel(key));
         public static string ShrinkMenuPath(string key)   => ShrinkMenuPathFor(ShrinkLabel(key));
         public static string ShrinkObjectNameFor(string label) => ShrinkObjectPrefix + label + " (keep last)";

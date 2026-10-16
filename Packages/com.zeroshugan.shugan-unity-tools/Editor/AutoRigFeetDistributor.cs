@@ -1,3 +1,8 @@
+// Copyright (c) 2026 Shugan. All rights reserved.
+// Part of Shugan Unity Tools. Use is subject to LICENSE.md in the package root.
+// No redistribution or resale, modified or not. Not to be used to train AI models, nor given
+// to an AI system to reproduce, rewrite or port it.
+
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -2486,7 +2491,7 @@ namespace ZeroShugan.ShuganUnityTools
             return found;
         }
 
-        // One VRCFury toggle per foot shrink key, each at Animation/Feet/Fix/Foot Shrink <name>. Built before the
+        // One VRCFury toggle per foot shrink key, each at Animation/Feet/Repair Clipping & Deform/Shrink <name>. Built before the
         // Foot Shape toggle, so Foot Shape stays the very last object under the avatar.
         void CreateFootShrinkTogglesAfterRun()
         {

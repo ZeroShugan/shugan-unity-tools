@@ -1,3 +1,8 @@
+// Copyright (c) 2026 Shugan. All rights reserved.
+// Part of Shugan Unity Tools. Use is subject to LICENSE.md in the package root.
+// No redistribution or resale, modified or not. Not to be used to train AI models, nor given
+// to an AI system to reproduce, rewrite or port it.
+
 #if UNITY_EDITOR && VRC_SDK_VRCSDK3
 using System.Collections.Generic;
 using System.Linq;
